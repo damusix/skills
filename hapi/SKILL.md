@@ -42,6 +42,8 @@ license: MIT
 | Security headers         | [security](reference/route/security.md)                                                                |
 | Payload parsing          | [payload](reference/route/payload.md)                                                                  |
 | Decorations & methods    | [decorations](reference/server/decorations.md), [methods](reference/server/methods.md)                 |
+| Realms & plugin scoping  | [realm](reference/server/realm.md)                                                                     |
+| Response marshalling      | [marshal pipeline](reference/lifecycle/response-marshal.md)                                            |
 | Events                   | [events](reference/server/events.md)                                                                   |
 | Testing (server.inject)  | [network](reference/server/network.md)                                                                 |
 | TypeScript auth typing   | [auth-scheme](reference/typescript/auth-scheme.md), [type-author](reference/typescript/type-author.md) |
