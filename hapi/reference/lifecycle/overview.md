@@ -109,7 +109,7 @@ When a lifecycle method returns or throws an error:
 - **From Response validation**: skips to **onPreResponse**.
 - **From `onPreResponse`**: skips to **Response transmission** (no re-entry to prevent loops).
 
-All errors are converted to Boom objects. Non-Boom errors default to status code 500.
+All errors are converted to [Boom](boom.md) objects. Non-Boom errors default to status code 500.
 
 
 ### Abort Signals

@@ -38,13 +38,22 @@ license: MIT
 | ------------------------ | ------------------------------------------------------------------------------------------------------ |
 | Request/response objects | [request](reference/lifecycle/request-object.md), [response](reference/lifecycle/response-object.md)   |
 | Response toolkit (h)     | [toolkit](reference/lifecycle/response-toolkit.md)                                                     |
-| Caching & CORS           | [cache-cors](reference/route/cache-cors.md), [server cache](reference/server/cache.md)                 |
+| Sessions (yar)           | [sessions](reference/server/sessions.md)                                                                                                                                        |
+| Caching & CORS           | [cache-cors](reference/route/cache-cors.md), [server cache](reference/server/cache.md), [catbox-memory engine](reference/server/catbox-memory.md), [catbox-fs engine](reference/server/catbox-fs.md), [catbox-redis engine](reference/server/catbox-redis.md) |
 | Security headers         | [security](reference/route/security.md)                                                                |
 | Payload parsing          | [payload](reference/route/payload.md)                                                                  |
 | Decorations & methods    | [decorations](reference/server/decorations.md), [methods](reference/server/methods.md)                 |
+| MIME types (mimos)       | [mimos](reference/server/mimos.md)                                                                     |
 | Realms & plugin scoping  | [realm](reference/server/realm.md)                                                                     |
 | Response marshalling      | [marshal pipeline](reference/lifecycle/response-marshal.md)                                            |
+| File serving (inert)     | [overview](reference/file-serving/overview.md), [file handler](reference/file-serving/file-handler.md), [directory handler](reference/file-serving/directory-handler.md) |
+| Basic authentication     | [basic auth](reference/auth/basic.md)                                                                   |
+| Error handling (Boom)    | [boom errors](reference/lifecycle/boom.md)                                                              |
+| Error filtering (Bounce) | [bounce utility](reference/lifecycle/bounce.md)                                                         |
+| WebSockets (nes)         | [overview](reference/websockets/overview.md), [subscriptions](reference/websockets/subscriptions.md), [client](reference/websockets/client.md) |
 | Events                   | [events](reference/server/events.md)                                                                   |
 | Testing (server.inject)  | [network](reference/server/network.md)                                                                 |
 | TypeScript auth typing   | [auth-scheme](reference/typescript/auth-scheme.md), [type-author](reference/typescript/type-author.md) |
+| JWT authentication       | [jwt overview](reference/jwt-auth/overview.md), [validate function](reference/jwt-auth/validate.md), [token API](reference/jwt-auth/token-api.md) |
 | TypeScript plugins       | [plugin-scaffold](reference/typescript/plugin-scaffold.md)                                             |
+| Views & templates        | [vision overview](reference/views/overview.md), [engines](reference/views/engines.md), [context & layouts](reference/views/context.md) |

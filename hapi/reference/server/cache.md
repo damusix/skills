@@ -95,7 +95,7 @@ Provisions a new cache engine at runtime. Uses the same options as the server `c
 **Gotchas:**
 - If the server is already initialized or started, the provisioned cache is automatically started to match the server state.
 - The `name` field is how you reference this cache engine in `server.cache({ cache: 'name' })`.
-- The default cache (no name) uses `@hapi/catbox-memory`.
+- The default cache (no name) uses `@hapi/catbox-memory`. See [catbox-memory engine reference](catbox-memory.md) for constructor options and behavior details.
 
 
 ### catbox Integration Overview
@@ -107,8 +107,9 @@ hapi's caching layer is built on **catbox**, which provides a unified API over m
 
 | Package                  | Backend                     |
 | ------------------------ | --------------------------- |
-| `@hapi/catbox-memory`    | In-process memory (default) |
-| `@hapi/catbox-redis`     | Redis                       |
+| `@hapi/catbox-memory`    | In-process memory (default) -- see [catbox-memory engine reference](catbox-memory.md) |
+| `@hapi/catbox-fs`        | Filesystem -- see [catbox-fs engine reference](catbox-fs.md) |
+| `@hapi/catbox-redis`     | Redis -- see [catbox-redis reference](catbox-redis.md) |
 | `@hapi/catbox-memcached` | Memcached                   |
 
 **Configuring at server creation:**
@@ -152,3 +153,5 @@ hapi's caching layer is built on **catbox**, which provides a unified API over m
 | `set(id, value, ttl)` | `await cache.set(key, value, ttl)` | Store a value. `ttl` is optional (uses policy default).            |
 | `drop(id)`            | `await cache.drop(key)`            | Remove a value from cache.                                         |
 | `stats`               | `cache.stats`                      | Object with cache statistics (hits, misses, etc.).                 |
+
+**See also:** The [@hapi/yar session plugin](sessions.md) uses catbox for server-side session storage when session data exceeds `maxCookieSize`.

@@ -657,3 +657,13 @@ init();
 5. **`verify()` has no request access:** The `verify` method only receives `request.auth` (credentials + artifacts), not the full request. Design your credentials/artifacts to contain everything needed for re-verification.
 
 6. **Payload auth must return `h.continue`:** The `payload()` and `response()` methods must return `h.continue` on success, not `h.authenticated()`.
+
+
+### Related: @hapi/jwt Plugin
+
+
+For JWT-based authentication, use the [@hapi/jwt](../jwt-auth/overview.md) plugin instead of writing a custom scheme. It registers a `'jwt'` scheme automatically via `server.register()` and handles token extraction, signature verification, and claim validation. See:
+
+- [JWT overview](../jwt-auth/overview.md) -- registration, strategy options, keys, and verify configuration
+- [JWT validate function](../jwt-auth/validate.md) -- the application-level validation callback
+- [JWT token API](../jwt-auth/token-api.md) -- standalone token generation and verification utilities

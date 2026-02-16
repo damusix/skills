@@ -221,6 +221,21 @@ authenticate: function (request, h) {
 ```
 
 
+#### `h.file(path, [options])` -- Serve a static file (requires @hapi/inert)
+
+
+Added by the [@hapi/inert](../file-serving/overview.md) plugin. Transmits a file from the file system. Returns a standard response object.
+
+```js
+const handler = function (request, h) {
+
+    return h.file('document.pdf', { mode: 'attachment' });
+};
+```
+
+See [inert overview](../file-serving/overview.md) for full options and usage.
+
+
 #### `h.state(name, value, [options])` -- Set a cookie
 
 
@@ -251,6 +266,19 @@ const ext = function (request, h) {
     return h.continue;
 };
 ```
+
+
+#### `h.view(template, [context, [options]])` -- Template response (via @hapi/vision)
+
+
+Added by the [@hapi/vision](../views/overview.md) plugin. Returns a response object with variety `'view'`. The template is rendered during the [marshal pipeline](response-marshal.md).
+
+    const handler = function (request, h) {
+
+        return h.view('profile', { user: request.auth.credentials });
+    };
+
+See [vision overview](../views/overview.md) for full details, [engines](../views/engines.md) for engine configuration, and [context](../views/context.md) for context resolution and layouts.
 
 
 ### TypeScript Interface

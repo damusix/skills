@@ -168,3 +168,8 @@ The auth types support augmentation for type-safe strategy and scope values:
 - When using `mode: 'try'`, always check `request.auth.isAuthenticated` before trusting credentials.
 - Dynamic scope resolution happens after payload processing, so `{payload.*}` references work.
 - The `access` array uses OR logic between rules, but within a single rule, `scope` and `entity` are AND-ed.
+
+### See Also
+
+- [server auth](../server/auth.md) -- scheme, strategy, and default registration
+- [@hapi/jwt](../jwt-auth/overview.md) -- JWT authentication plugin with built-in token extraction, signature verification, and claim validation

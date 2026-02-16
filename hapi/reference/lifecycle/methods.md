@@ -172,7 +172,7 @@ Pre-handler methods (route `pre` option) and the route handler are both lifecycl
 ### Error Transformation
 
 
-Errors use the [Boom](https://hapi.dev/family/boom/api) library. Key properties of a Boom error:
+Errors use the [Boom](boom.md) library. Key properties of a Boom error:
 
 ```js
 {

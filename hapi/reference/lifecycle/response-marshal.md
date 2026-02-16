@@ -24,7 +24,7 @@ Every handler return passes through `Response.wrap()` (`lib/response.js:73-86`):
 |---|---|
 | Already a `Response` | Returned as-is |
 | `Symbol` (`h.continue`, etc.) | Returned as-is |
-| `Error` | Wrapped via `Boom.boomify()` |
+| `Error` | Wrapped via [`Boom.boomify()`](boom.md) |
 | Anything else | Wrapped in `new Response(source, request)` |
 
 

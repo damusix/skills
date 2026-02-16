@@ -117,6 +117,16 @@ For arrow function handlers, access bind context via `h.context`:
         }
     });
 
+### Plugin-Registered Handler Types
+
+
+Plugins can register handler types via `server.decorate('handler', name, method)`. The [@hapi/inert](../file-serving/overview.md) plugin registers two handler types:
+
+- `handler: { file: ... }` — serves a single static file. See [file handler](../file-serving/file-handler.md).
+- `handler: { directory: ... }` — serves files from a directory tree. See [directory handler](../file-serving/directory-handler.md).
+- `handler: { view: ... }` — renders a template. Registered by [@hapi/vision](../views/overview.md). See [vision overview](../views/overview.md).
+
+
 ### Gotchas
 
 
