@@ -63,7 +63,7 @@ server.event([
 ### Emitting Events — server.events.emit(criteria, data)
 
 
-Fires an event to all subscribed listeners. Does not wait for listeners to complete.
+Fires an event to all subscribed listeners. `emit()` is **synchronous** — it calls each listener in order and **rethrows the first error** thrown by any listener. It does not return listener results (use `gauge()` for that). (podium/lib/index.js:87-98)
 
 ```typescript
 // Simple emit
@@ -151,8 +151,10 @@ server.events.once('myEvent', (data) => {
 ```typescript
 const pending = server.events.once('myEvent');
 server.events.emit('myEvent', 'hello');
-const data = await pending;    // 'hello'
+const [data] = await pending;    // 'hello'
 ```
+
+The promise resolves with an **array** of listener arguments (matching the `(...args)` signature). Destructure to get the first argument. (podium/lib/index.js:250-253)
 
 
 ### Gauge — await server.events.gauge(criteria, data)
@@ -360,6 +362,26 @@ server.events.on('stop', () => {
 ```
 
 
+### Few — await server.events.few(criteria)
+
+
+Subscribes to an event and returns a promise that resolves after `count` emissions. The `criteria` must be an object (not a string) and must include a `count` property. (podium/lib/index.js:256-264)
+
+```typescript
+server.event('batch');
+
+const results = server.events.few({ name: 'batch', count: 3 });
+server.events.emit('batch', 'a');
+server.events.emit('batch', 'b');
+server.events.emit('batch', 'c');
+
+const data = await results;
+// [ ['a'], ['b'], ['c'] ]
+```
+
+Each item in the resolved array is itself an array of listener arguments (same as the `once()` await form). Uses `@hapi/teamwork` internally.
+
+
 ### Event Lifecycle Order
 
 
@@ -371,11 +393,13 @@ server.events.on('stop', () => {
 ### Other Event Methods
 
 
-| Method                                         | Description                                                |
-| ---------------------------------------------- | ---------------------------------------------------------- |
-| `server.events.removeListener(name, listener)` | Remove a specific listener.                                |
-| `server.events.removeAllListeners(name)`       | Remove all listeners for an event.                         |
-| `server.events.hasListeners(name)`             | Returns `boolean` — whether listeners exist for the event. |
+| Method                                         | Description                                                                              |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `server.events.addListener(criteria, listener, context)` | Alias for `on()`. Returns `this` for chaining.                             |
+| `server.events.off(name, listener)`            | Alias for `removeListener()`.                                                            |
+| `server.events.removeListener(name, listener)` | Remove a specific listener. Returns `this` for chaining.                                 |
+| `server.events.removeAllListeners(name)`       | Remove all listeners for an event. Returns `this` for chaining.                          |
+| `server.events.hasListeners(name)`             | Returns `boolean` — whether listeners exist for the event.                               |
 
 
 ### TypeScript Event Types
@@ -403,7 +427,9 @@ Key types from `lib/types/server/events.d.ts`:
 
 
 - Events **must** be registered with `server.event()` before calling `emit()`, `on()`, or `once()` on them. Unregistered event names throw.
-- `server.events.emit()` does **not** wait for listeners. Use `server.events.gauge()` if you need to collect results or wait for completion.
+- `server.events.emit()` is **synchronous** and rethrows the first listener error. Subsequent listeners still run, but only the first error propagates. Use `server.events.gauge()` if you need to collect all results or handle errors per-listener.
+- `server.events.once()` without a listener resolves with an **array** of arguments, not a single value. Always destructure: `const [data] = await server.events.once('event')`.
+- `server.events.few()` requires an object criteria with `count`. A string criteria throws.
 - The `'request'` event has three channels: `'app'`, `'error'`, and `'internal'`. Without a channels filter, you receive all three.
 - When using `channels` filter on subscriptions, events emitted **without** a channel designation are excluded.
 - The `filter` option works on tags attached during `emit()`. It does not filter on channels (use `channels` for that).
