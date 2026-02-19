@@ -2,6 +2,8 @@
 name: hapi
 description: "Use when building hapi.js servers, routes, plugins, or auth schemes. Covers lifecycle, validation, caching, TypeScript, and all server APIs."
 license: MIT
+metadata:
+  author: Danilo Alonso
 ---
 
 # Hapi

@@ -2,7 +2,7 @@
 name: htmx
 description: Complete reference for HTMX — the HTML-first library for modern browser features without JavaScript. Use when tasks involve hx-* attributes, HTMX AJAX requests, swap strategies, server-sent events, WebSockets, or hypermedia-driven UIs.
 metadata:
-  author: alonso
+  author: Danilo Alonso
   version: "2.0"
   references: attributes, requests, swapping, events-api, patterns, extensions
 ---
