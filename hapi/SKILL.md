@@ -55,6 +55,7 @@ metadata:
 | WebSockets (nes)         | [overview](reference/websockets/overview.md), [subscriptions](reference/websockets/subscriptions.md), [client](reference/websockets/client.md) |
 | Events                   | [events](reference/server/events.md)                                                                   |
 | Testing (server.inject)  | [network](reference/server/network.md)                                                                 |
+| TypeScript overview       | [typescript](reference/typescript.md)                                                                  |
 | TypeScript auth typing   | [auth-scheme](reference/typescript/auth-scheme.md), [type-author](reference/typescript/type-author.md) |
 | JWT authentication       | [jwt overview](reference/jwt-auth/overview.md), [validate function](reference/jwt-auth/validate.md), [token API](reference/jwt-auth/token-api.md) |
 | TypeScript plugins       | [plugin-scaffold](reference/typescript/plugin-scaffold.md)                                             |
