@@ -4,7 +4,7 @@ description: Complete reference for HTMX — the HTML-first library for modern b
 metadata:
   author: Danilo Alonso
   version: "2.0"
-  references: attributes, requests, swapping, events-api, patterns, extensions
+  references: attributes, requests, swapping, events-api, patterns, extensions, gotchas
 ---
 
 # HTMX Skill
@@ -38,6 +38,7 @@ Use this skill for HTMX implementation and integration. Read only the reference 
 - Events, JS API, configuration, extensions, debugging: `references/events-api.md`
 - Common UI patterns and examples: `references/patterns.md`
 - Official extensions (WS, SSE, Idiomorph, response-targets, head-support, preload): `references/extensions.md`
+- Gotchas, pitfalls, and practical guidance: `references/gotchas.md`
 - Cross-file index and routing: `references/REFERENCE.md`
 
 ## Task Routing
@@ -48,4 +49,5 @@ Use this skill for HTMX implementation and integration. Read only the reference 
 - Handling events, JS interop, or config -> `references/events-api.md`
 - Building common UI patterns (search, infinite scroll, modals, etc.) -> `references/patterns.md`
 - Using WebSockets, SSE, morphing, preloading, response targeting, or head merging -> `references/extensions.md`
+- Avoiding common pitfalls, accessibility, error handling, architecture decisions -> `references/gotchas.md`
 - Cross-cutting concerns or architecture -> `references/REFERENCE.md` then domain-specific files

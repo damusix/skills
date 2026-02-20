@@ -13,6 +13,7 @@ Use this index to pick the smallest reference file that matches the task.
 | Events & API | `references/events-api.md` | Lifecycle events, JS API methods, configuration options, extensions, debugging, scripting |
 | Patterns | `references/patterns.md` | Common UI patterns: active search, infinite scroll, click to load, edit row, modals, lazy loading, tabs, file upload, progress bar |
 | Extensions | `references/extensions.md` | Official extensions: WebSockets (`ws`), SSE (`sse`), Idiomorph (`morph`), response targets, head support, preload |
+| Gotchas | `references/gotchas.md` | Common pitfalls, silent failures, accessibility, error handling, architecture decisions, version migration |
 
 ## Common Task Routing
 
@@ -25,6 +26,9 @@ Use this index to pick the smallest reference file that matches the task.
 - Implement a common UI pattern (search box, infinite scroll, modals): read `references/patterns.md`
 - Integrate with third-party JS libraries: read `references/events-api.md` (scripting section)
 - Security hardening (CSRF, CSP, XSS prevention): read `references/requests.md` (security section)
+- Avoiding common pitfalls and silent failures: read `references/gotchas.md`
+- Accessibility best practices for HTMX: read `references/gotchas.md` (accessibility section)
+- Deciding if HTMX is the right fit for a project: read `references/gotchas.md`
 
 ## Suggested Reading Order
 
