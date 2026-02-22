@@ -215,6 +215,70 @@ All header field names must be **lowercase** to match Node.js normalized headers
 
 Validation rules defined at the route level **override** server defaults (they are NOT merged). If you define `validate.params` on both the server and route, the route's `validate.params` wins entirely.
 
+### Descriptive validation errors
+
+By default, validation failures return a generic message with no details about which field failed or why:
+
+    // What the client receives by default
+    { "statusCode": 400, "error": "Bad Request", "message": "Invalid request payload input" }
+
+To get useful, field-level error messages, re-throw the validation error in `failAction`:
+
+    // Per-route
+    server.route({
+        method: 'POST',
+        path: '/user',
+        options: {
+            validate: {
+                payload: Joi.object({
+                    username: Joi.string().required(),
+                    password: Joi.string().min(8)
+                }),
+                failAction: (request, h, err) => {
+                    throw err;
+                }
+            },
+            handler: (request, h) => 'ok'
+        }
+    });
+
+    // Client now receives:
+    // { "statusCode": 400, "error": "Bad Request",
+    //   "message": "\"username\" is required",
+    //   "validation": { "source": "payload", "keys": ["username"] } }
+
+To apply globally:
+
+    const server = Hapi.server({
+        port: 3000,
+        routes: {
+            validate: {
+                failAction: (request, h, err) => {
+                    throw err;
+                }
+            }
+        }
+    });
+
+For response validation failures (your handler returns data that doesn't match `route.options.response.schema`), the default is a generic 500 with no details. Use `failAction: 'log'` to let the response through while logging the schema violation:
+
+    options: {
+        response: {
+            schema: myResponseSchema,
+            failAction: 'log'
+        }
+    }
+
+**Security note:** Descriptive errors expose your schema structure and echo user input. For public-facing APIs, consider limiting details to non-production environments:
+
+    failAction: (request, h, err) => {
+        if (process.env.NODE_ENV === 'production') {
+            throw Boom.badRequest('Invalid request');
+        }
+
+        throw err;
+    }
+
 ### Gotchas
 
 
@@ -222,3 +286,4 @@ Validation rules defined at the route level **override** server defaults (they a
 - Validating large payloads with modifications causes memory duplication (original is kept in `request.orig`).
 - Changes to `query` via validation will NOT be reflected in `request.url`.
 - When using type casting (e.g., `Joi.number()`), earlier-validated inputs are cast but later ones are still raw strings.
+- Default validation errors are intentionally generic — they hide field names and reasons. Use `failAction` to expose details (see above).

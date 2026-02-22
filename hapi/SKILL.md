@@ -53,6 +53,7 @@ metadata:
 | Error handling (Boom)    | [boom errors](reference/lifecycle/boom.md)                                                              |
 | Error filtering (Bounce) | [bounce utility](reference/lifecycle/bounce.md)                                                         |
 | WebSockets (nes)         | [overview](reference/websockets/overview.md), [subscriptions](reference/websockets/subscriptions.md), [client](reference/websockets/client.md) |
+| Startup & shutdown       | [startup lifecycle](reference/server/startup-lifecycle.md)                                              |
 | Events                   | [events](reference/server/events.md)                                                                   |
 | Testing (server.inject)  | [network](reference/server/network.md)                                                                 |
 | TypeScript overview       | [typescript](reference/typescript.md)                                                                  |
