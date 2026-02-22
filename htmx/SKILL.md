@@ -1,13 +1,9 @@
 ---
 name: htmx
-description: Complete reference for HTMX — the HTML-first library for modern browser features without JavaScript. Use when tasks involve hx-* attributes, HTMX AJAX requests, swap strategies, server-sent events, WebSockets, or hypermedia-driven UIs.
-metadata:
-  author: Danilo Alonso
-  version: "2.0"
-  references: attributes, requests, swapping, events-api, patterns, extensions, gotchas
+description: "Use when tasks involve hx-* attributes, HTMX AJAX requests, swap strategies, server-sent events, WebSockets, or hypermedia-driven UIs."
 ---
 
-# HTMX Skill
+# HTMX
 
 
 Use this skill for HTMX implementation and integration. Read only the reference file(s) needed for the task.
@@ -21,14 +17,14 @@ Use this skill for HTMX implementation and integration. Read only the reference 
 
 ## Critical Rules
 
-- HTMX expects **HTML responses** from the server, not JSON.
-- Most attributes **inherit** to child elements. **Not inherited:** `hx-trigger`, `hx-on*`, `hx-swap-oob`, `hx-preserve`, `hx-history-elt`, `hx-validate`. Use `hx-disinherit` or `unset` to stop inheritance of other attributes.
-- Default swap strategy is `innerHTML`. Always confirm the intended swap method.
-- Non-GET requests automatically include the closest enclosing form's values.
-- Use `hx-boost="true"` for progressive enhancement — pages must work without JS.
-- Escape all user-supplied content server-side to prevent XSS.
-- HTMX adds/removes CSS classes during the request lifecycle — use these for transitions and indicators.
-- All `hx-*` attributes can also be written as `data-hx-*` for HTML validation compliance.
+1. **HTML responses** - HTMX expects HTML responses from the server, not JSON
+2. **Attribute inheritance** - Most attributes inherit to children. **Not inherited:** `hx-trigger`, `hx-on*`, `hx-swap-oob`, `hx-preserve`, `hx-history-elt`, `hx-validate`. Use `hx-disinherit` or `unset` to stop inheritance
+3. **Default swap is innerHTML** - Always confirm the intended swap method
+4. **Form values auto-included** - Non-GET requests automatically include the closest enclosing form's values
+5. **Progressive enhancement** - Use `hx-boost="true"` — pages must work without JS
+6. **Escape user content** - Escape all user-supplied content server-side to prevent XSS
+7. **CSS lifecycle classes** - HTMX adds/removes CSS classes during requests — use for transitions and indicators
+8. **data-prefix supported** - All `hx-*` attributes can also be written as `data-hx-*` for HTML validation compliance
 
 ## Reference Map
 

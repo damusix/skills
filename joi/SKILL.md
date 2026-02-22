@@ -1,9 +1,6 @@
 ---
 name: joi
-description: "Use when building joi schemas, custom validators, extensions, or working with joi's validation pipeline. Covers all types, references, templates, errors, and the extension API."
-license: BSD-3-Clause
-metadata:
-  author: Danilo Alonso
+description: "Use when building joi schemas, validating input data, defining custom types, conditional validation with .when(), cross-field references, custom error messages, or writing joi extensions. Standalone package that integrates with the @hapijs ecosystem."
 ---
 
 # Joi

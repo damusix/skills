@@ -1,10 +1,6 @@
 ---
 name: google-zx-scripting
-description: "Use when writing shell scripts, automation, build tools, file processing, or ad-hoc CLI tasks with Google's zx library. Covers command execution, process control, file operations, and scripting patterns."
-metadata:
-  author: Danilo Alonso
-  version: "1.0"
-  references: core-api, scripting-patterns, processing-recipes
+description: "Use when writing shell scripts, automation, build tools, file processing, CLI tools, deployment scripts, data pipelines, or batch operations with Google's zx library. Also covers piping, streams, parallel execution, retries, cross-platform scripting, built-in fs utilities, and minimist argument parsing."
 ---
 
 # Google ZX Scripting
