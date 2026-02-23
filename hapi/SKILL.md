@@ -1,6 +1,6 @@
 ---
 name: hapi
-description: "Use when building @hapijs/hapi servers, routes, plugins, auth schemes, HTTP APIs, request lifecycle, caching, stale-while-revalidate, server methods, views, startup sequences, or response marshalling."
+description: "Use when building @hapi/hapi servers, routes, plugins, auth schemes, HTTP APIs, request lifecycle, caching, stale-while-revalidate, server methods, views, startup sequences, or response marshalling."
 ---
 
 # Hapi

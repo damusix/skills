@@ -1,6 +1,6 @@
 ---
 name: joi
-description: "Use when building joi schemas, validating input data, defining custom types, conditional validation with .when(), cross-field references, custom error messages, or writing joi extensions. Standalone package that integrates with the @hapijs ecosystem."
+description: "Use when building joi schemas, validating input data, defining custom types, conditional validation with .when(), cross-field references, custom error messages, or writing joi extensions. Standalone package that integrates with the @hapi ecosystem."
 ---
 
 # Joi
