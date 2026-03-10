@@ -125,6 +125,85 @@ Scope strings can reference request properties using `{property}` syntax:
 
 A request to `PUT /user/42` requires the credential to have `user-42` in its scope array.
 
+### Modifying Scope Before Authorization
+
+
+Route scope checking runs during the authorization step. The `onCredentials` extension fires between authentication and authorization, making it the right place to modify credential scope dynamically:
+
+    server.ext('onCredentials', async (request, h) => {
+
+        const userId = request.auth.credentials.userId;
+        const permissions = await getPermissionsFromDb(userId);
+
+        request.auth.credentials.scope = permissions;
+
+        return h.continue;
+    });
+
+Use this when scope cannot be determined during authentication alone (e.g., permissions stored separately from identity).
+
+
+### Dynamic Authorization
+
+
+Route-level scope config is **static** -- compiled once at route registration and fixed for the lifetime of the route. For authorization that depends on request data or database lookups, handle it in `onPostAuth` or a route `pre` handler.
+
+**Global approach (`onPostAuth`):**
+
+    server.ext('onPostAuth', async (request, h) => {
+
+        const resource = await db.getResource(request.params.id);
+        const requiredScope = resource.isPublished ? 'read' : 'draft:read';
+
+        if (!request.auth.credentials.scope?.includes(requiredScope)) {
+            throw Boom.forbidden(`Requires scope: ${requiredScope}`);
+        }
+
+        return h.continue;
+    });
+
+**Per-route approach (`pre` handler):**
+
+    server.route({
+        method: 'PUT',
+        path: '/resource/{id}',
+        options: {
+            auth: { strategy: 'jwt', mode: 'required' },
+            pre: [
+                {
+                    assign: 'authorize',
+                    method: async (request, h) => {
+
+                        const resource = await db.getResource(request.params.id);
+                        const needed = resource.ownerId === request.auth.credentials.userId
+                            ? 'write:own'
+                            : 'write:all';
+
+                        if (!request.auth.credentials.scope?.includes(needed)) {
+                            throw Boom.forbidden('Insufficient scope');
+                        }
+
+                        return resource;
+                    }
+                }
+            ],
+            handler: (request, h) => request.pre.authorize
+        }
+    });
+
+Use `onPostAuth` for cross-cutting rules. Use `pre` for route-specific authorization that needs resource data.
+
+
+### Built-in Access Check
+
+
+To check a request against the route's static scope and entity config:
+
+    const hasAccess = request.route.auth.access(request);  // boolean
+
+This runs the full scope and entity validation against the route's compiled auth config. It cannot be used with dynamic scope rules -- for those, see **Dynamic Authorization** above.
+
+
 ### Entity
 
 

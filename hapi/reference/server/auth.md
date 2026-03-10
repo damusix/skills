@@ -470,6 +470,31 @@ server.route({
 ```
 
 
+### Credential Injection via `onPreAuth`
+
+
+If `request.auth.credentials` is set before the authentication step runs, hapi skips all strategy execution and uses the injected credentials directly:
+
+```javascript
+server.ext('onPreAuth', async (request, h) => {
+
+    const token = request.headers['x-custom-token'];
+    const user = await verifyTokenYourself(token);
+
+    if (user) {
+        request.auth.credentials = {
+            user,
+            scope: user.permissions
+        };
+    }
+
+    return h.continue;
+});
+```
+
+Authorization (scope and entity checks) still runs against the injected credentials. This is useful for custom authentication flows that don't fit the scheme/strategy model or for integrating with external auth systems.
+
+
 ### Complete Example: Custom Auth Scheme
 
 
@@ -657,6 +682,8 @@ init();
 5. **`verify()` has no request access:** The `verify` method only receives `request.auth` (credentials + artifacts), not the full request. Design your credentials/artifacts to contain everything needed for re-verification.
 
 6. **Payload auth must return `h.continue`:** The `payload()` and `response()` methods must return `h.continue` on success, not `h.authenticated()`.
+
+7. **Credential injection bypasses strategies:** Setting `request.auth.credentials` in `onPreAuth` causes hapi to skip all strategy `authenticate()` calls. Authorization still runs normally against the injected credentials.
 
 
 ### Related: @hapi/jwt Plugin
