@@ -105,6 +105,8 @@ Useful in production to reduce validation overhead:
 
 Set to `0` to disable all validation. Set to `100` (default) to validate everything.
 
+`sample` cannot be used when `modify` is `true` — they are mutually exclusive.
+
 ### `failAction`
 
 

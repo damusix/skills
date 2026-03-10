@@ -51,7 +51,7 @@ Called once after wrapping (`lib/response.js:497-515`). Transitions `_state` fro
 For **stream** responses with `passThrough: true` (the default), `_passThrough()` runs:
 
 - Copies upstream HTTP `statusCode` if none set locally
-- Passes through all headers from the stream, filtering hop-by-hop headers (`connection`, `keep-alive`, `proxy-authenticate`, etc.)
+- Passes through all headers from the stream, filtering hop-by-hop headers: `connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`, `transfer-encoding`, `upgrade`
 - Local headers override pass-through headers for all **except** `set-cookie` (which is appended)
 
 

@@ -4,7 +4,7 @@
 ### `route.options.cache`
 
 
-Default: `{ privacy: 'default', statuses: [200], otherwise: 'no-cache' }`.
+Default: `{ privacy: 'default', statuses: [200, 204], otherwise: 'no-cache' }`.
 
 Only applies to `GET` routes. Controls HTTP caching directives in the response via the `Cache-Control` header. Set to `false` to disable the default `Cache-Control: no-cache` header entirely.
 
@@ -13,7 +13,7 @@ Only applies to `GET` routes. Controls HTTP caching directives in the response v
 | `privacy`   | `'default'`  | `'default'` (no flag), `'public'`, or `'private'`.                                  |
 | `expiresIn` | none         | Relative expiration in milliseconds. Cannot coexist with `expiresAt`.               |
 | `expiresAt` | none         | Time of day in `'HH:MM'` (24h) when cache expires. Cannot coexist with `expiresIn`. |
-| `statuses`  | `[200]`      | Array of HTTP status codes that may include caching directives.                     |
+| `statuses`  | `[200, 204]` | Array of HTTP status codes that may include caching directives.                     |
 | `otherwise` | `'no-cache'` | `Cache-Control` header value when caching is disabled for the response.             |
 
     // Cache for 1 hour, public

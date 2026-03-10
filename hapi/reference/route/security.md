@@ -35,6 +35,8 @@ Set to `true` to enable all defaults, or to an object for fine control.
 | `true`                                                         | `max-age=15768000`                             |
 | `15768000` (number)                                            | `max-age=15768000`                             |
 | `{ maxAge: 31536000, includeSubDomains: true, preload: true }` | `max-age=31536000; includeSubDomains; preload` |
+
+Both `includeSubDomains` (camelCase) and `includeSubdomains` (lowercase) are accepted.
 | `false`                                                        | Header omitted                                 |
 
     security: {

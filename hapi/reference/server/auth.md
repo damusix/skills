@@ -287,7 +287,7 @@ The `scope` property in a route's `auth.access` config defines which credential 
 
 **Basic scope:** A plain string requires the scope to be present in `credentials.scope`.
 
-**Dynamic scope with `+` prefix:** The `+` prefix requires the scope to be present at the time of the request. This is functionally equivalent to a basic scope string but explicitly marks it as a required dynamic scope.
+**Required scope with `+` prefix:** The `+` prefix means the scope MUST be present. When multiple `+` scopes are listed, ALL must match (AND logic). This differs from plain (unprefixed) scopes where only ONE must match (OR logic).
 
 **Forbidden scope with `!` prefix:** The `!` prefix means the scope must NOT be present in `credentials.scope`. If the credential has a forbidden scope, access is denied.
 
@@ -302,10 +302,10 @@ server.route({
             strategy: 'default',
             access: {
                 scope: [
-                    'admin',              // must have 'admin'
-                    '+supervisor',        // must have 'supervisor' (dynamic required)
-                    '!guest',             // must NOT have 'guest'
-                    'user-{params.id}'    // must have 'user-<id>' where <id> is the route param
+                    'admin',              // selection: need 'admin' OR 'user-<id>'
+                    '+supervisor',        // required: MUST have 'supervisor'
+                    '!guest',             // forbidden: must NOT have 'guest'
+                    'user-{params.id}'    // selection: need 'admin' OR 'user-<id>'
                 ]
             }
         },
@@ -317,7 +317,13 @@ server.route({
 });
 ```
 
-When multiple scopes are listed in the array, **all** of them must be satisfied (logical AND). To express OR logic, use multiple `access` entries:
+Scope matching rules within a single access entry:
+
+- **`+` required** scopes: ALL must be present (AND)
+- **plain** (unprefixed) scopes: at least ONE must match (OR)
+- **`!` forbidden** scopes: NONE must be present (AND-NOT)
+
+To express OR logic between full scope sets, use multiple `access` entries:
 
 ```javascript
 auth: {
@@ -336,11 +342,11 @@ This grants access if the credential has `admin` OR the matching `user-{params.i
 
 The `entity` property in a route's `auth.access` config restricts which type of credential can access the route:
 
-| Value    | Requirement                                              |
-| -------- | -------------------------------------------------------- |
-| `'user'` | `credentials.user` must be set                           |
-| `'app'`  | `credentials.app` must be set                            |
-| `'any'`  | Either `credentials.user` or `credentials.app` (default) |
+| Value    | Requirement                                                  |
+| -------- | ------------------------------------------------------------ |
+| `'user'` | `credentials.user` must be present                           |
+| `'app'`  | `credentials.user` must NOT be present (absence = app entity)|
+| `'any'`  | No entity restriction (default)                              |
 
 ```javascript
 server.route({
