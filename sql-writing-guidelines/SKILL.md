@@ -6,8 +6,6 @@ description: "Use when writing or reviewing T-SQL, creating stored procedures, d
 # SQL Writing Guidelines
 
 
-A methodology for writing SQL Server applications that are type-safe, access-controlled, and structurally enforced. These patterns produce databases where business rules live in the schema itself — not just in application code.
-
 ## When to Use
 
 - Starting a new SQL Server application database from scratch
@@ -21,13 +19,11 @@ A methodology for writing SQL Server applications that are type-safe, access-con
 
 ## The Two Access Rules
 
-These are the foundation everything else builds on:
+1. **All reads go through views.** Never SELECT directly from tables. Views filter by role, enforce row-level security, flatten joins, and evolve independently of tables.
 
-1. **All reads go through views.** Application code and procedures never SELECT directly from tables. Views are the read API — they can filter by role, enforce row-level security, flatten joins, and evolve independently of the underlying tables.
+2. **All mutations go through stored procedures.** No ad-hoc INSERT, UPDATE, or DELETE. Procedures validate inputs, manage transactions, check business rules, and return structured errors.
 
-2. **All mutations go through stored procedures.** No ad-hoc INSERT, UPDATE, or DELETE. Procedures are the write API — they validate inputs, manage transactions, check business rules, and return structured errors.
-
-This separation means tables are an implementation detail. You can restructure tables, split them, merge them — and as long as the views and procedures maintain their contracts, nothing upstream breaks. Views and procedures become your stable interface; tables become free to change.
+Tables become an implementation detail — restructure them freely as long as views and procedures maintain their contracts.
 
 ## Custom Type Systems
 
@@ -41,17 +37,11 @@ Never use bare built-in types (`VARCHAR`, `INT`, `DATETIME`, `BIT`) for columns.
 
 Every column uses a named type. `Email` instead of `VARCHAR(100)`. `_Timestamp` instead of `DATETIME2`. `_Bool` instead of `BIT`.
 
-Custom types serve two purposes:
+**Consistency.** Change the type definition once, not per-table.
 
-**Consistency.** Every API key in the schema has the same size and constraints — not `VARCHAR(128)` in one table and `VARCHAR(256)` in another. The type definition is the single source of truth. If you need to change the size, you change it once.
+**Semantic inference.** `ApiKey` tells you what the data *is*; `VARCHAR(128)` tells you nothing. The schema becomes self-documenting and queryable — find every API key by searching for columns typed `ApiKey`.
 
-**Semantic inference.** The type tells you what the data *is*, regardless of what the column is called. A column named `ServiceSecret` typed as `ApiKey` immediately communicates that it's an API key — you can infer its meaning, validation rules, and handling requirements from the type alone, even when the column name serves a different descriptive purpose. `VARCHAR(128)` tells you nothing; `ApiKey` tells you everything.
-
-Consider a system that tracks parties (people and organizations). Even though a party number is just an integer, you create `PartyNo` as a custom type. Now anywhere in your procedures, views, tables, and functions that uses `PartyNo`, you know exactly what this integer refers to. There is no ambiguity — it's not a generic `_Int` that could be anything; it's a `PartyNo` that explicitly identifies a party.
-
-This makes the schema self-documenting and queryable. You can find every API key in the system by searching for columns typed `ApiKey`, every party reference by searching for `PartyNo` — column names vary, but the type is the invariant.
-
-**NOT NULL by default.** Define custom types as `NOT NULL`. Columns should not be nullable unless there is an explicit business reason. NULLs introduce three-valued logic, cause silent row exclusions in joins, and weaken constraint enforcement. If a value is optional, that should be a deliberate design choice, not the default.
+**NOT NULL by default.** Define custom types as `NOT NULL`. Nullable only with an explicit business reason — optional is a deliberate design choice, not the default.
 
 **Organize types by domain:** group them into categories (identity, web/auth, civic, financial, generic primitives) and maintain a central manifest (YAML or similar) as the source of truth. Types will be unique per system — a property management app will have `PartyNo`, `EntrataID`, `LeaseNo`; a financial app will have `AccountNo`, `TransactionNo`, `RoutingNumber`. The pattern is universal; the specific types are yours to define.
 
@@ -67,7 +57,7 @@ Procedures are classified by their relationship to transactions, signaled by a s
 | `_utx` | **Transaction participant** — called inside a `_trx`'s transaction | Validates `@@TRANCOUNT > 0` (rejects if NOT inside a transaction) |
 | `_ut` | **Utility** — no transaction requirement | No check |
 
-This hierarchy prevents nested transaction bugs. A `_trx` refuses to run inside another transaction (which would silently change ROLLBACK semantics in SQL Server). A `_utx` refuses to run outside one (because its work must be atomic with its caller). The suffix makes the contract visible in the name.
+A `_trx` refuses to run inside another transaction; a `_utx` refuses to run outside one. The suffix makes the contract visible in the name.
 
 **Composition pattern:** a `_trx` opens the transaction, calls one or more `_utx` procedures for subtasks, then commits or rolls back the whole unit. The `_utx` procedures trust their caller to manage the boundary.
 
@@ -92,7 +82,7 @@ SQL's built-in constraints (FOREIGN KEY, CHECK, UNIQUE) are powerful but limited
     CONSTRAINT SavingsAccount_IsAccountType
         CHECK (dbo.Account_IsType_fn(AccountNo, 'Savings') = 1)
 
-This enforces at the schema level that a SavingsAccount row can only exist if its corresponding Account record has `Type = 'Savings'`. No application code needed — the database itself rejects invalid data.
+This enforces at the schema level that a SavingsAccount row can only reference an Account with `Type = 'Savings'`. The database rejects invalid data.
 
 **Use functional constraints for:**
 - Type discriminator enforcement across base/subtype tables
@@ -117,7 +107,7 @@ When entities share common attributes but have specialized ones, use **primary k
             CHECK (dbo.Account_IsType_fn(AccountNo, 'Savings') = 1)
     );
 
-The polymorphic alternative (one table with nullable columns for each subtype) creates nullable sprawl, makes per-type NOT NULL constraints impossible, and obscures which columns belong to which type. Primary key inheritance solves all of this — each subtype has its own table with clean NOT NULL constraints, and foreign keys from other tables can reference either the base (any type) or the subtype (specific type).
+Primary key inheritance gives each subtype its own table with clean NOT NULL constraints. Foreign keys can reference either the base (any type) or the subtype (specific type).
 
 For the full pattern — base table setup, IsType function, referencing base vs subtype, creating subtypes in procedures, and views over subtypes — read [Base/Subtype Inheritance](references/basetype-subtype.md).
 
@@ -130,9 +120,7 @@ Tables in a parent-child hierarchy use composite primary keys that grow wider as
     OrderLine      (CustomerNo, OrderNo, LineNo)
     OrderShipment  (CustomerNo, OrderNo, LineNo, ShipmentNo)
 
-A key like `(CustomerNo=42, OrderNo=3, LineNo=1, ShipmentNo=2)` tells you the full address — which customer, which order, which line — without joining anything.
-
-**Max-plus-one functions** replace IDENTITY columns. Each table gets a dedicated scalar function (`NextOrderNo_fn`, `NextLineNo_fn`) that returns `ISNULL(MAX(col), 0) + 1` scoped to the parent key. This gives keys a logical sequence within their parent — if `OrderNo = 7` for Customer 42, you know they've placed at least 7 orders. Keys live closer together physically on disk (clustered composite keys group parent-child data contiguously), produce human-readable paths, and allow historical inference from key values alone.
+**Max-plus-one functions** replace IDENTITY columns. Each table gets a scalar function (`NextOrderNo_fn`, `NextLineNo_fn`) returning `ISNULL(MAX(col), 0) + 1` scoped to the parent key. Clustered composite keys group parent-child data contiguously on disk and produce human-readable paths.
 
 For the full pattern — max-plus-one functions, temporal children, sibling tables, insert procedures, and disk locality — read [Hierarchical Composite Keys](references/hierarchical-keys.md).
 
@@ -152,7 +140,7 @@ Constraints should read as **predicates** — natural-language statements about 
     CONSTRAINT Customer_Email_IsUnique
         UNIQUE (Email)
 
-`FK_Rental_Customer` describes the *mechanism* (it's a foreign key). `Customer_Rents_Vehicle` describes the *meaning* (customers rent vehicles). When a constraint violation appears in an error log, the predicate-style name tells you exactly what business rule was violated without looking up the schema.
+`FK_Rental_Customer` describes the *mechanism*. `Customer_Rents_Vehicle` describes the *meaning*. When a constraint violation appears in an error log, the predicate name tells you exactly what business rule was violated.
 
 ## Role-Scoped Views
 
@@ -171,8 +159,6 @@ Views are prefixed with the role they serve, making permissions self-documenting
         OR IS_ROLEMEMBER('db_securityadmin') = 1
         -- Everyone else: only rows they own or are assigned to
         OR OwnerID = USER_ID()
-
-This means the application doesn't implement access control — the view does. A customer literally cannot see data outside their scope, regardless of what query the application sends.
 
 For view templates, read [View Patterns](references/view-patterns.md).
 
@@ -210,6 +196,13 @@ Build a library of meta functions that query `sys.*` catalog views:
 - Constraint existence: `ForeignKeyExists_fn`, `CheckConstraintExists_fn`, `DefaultConstraintExists_fn`, `UniqueConstraintExists_fn`, `PrimaryKeyExists_fn`
 - Index inspection: `IndexExists_fn`, `IndexIsUnique_fn`, `IndexIsClustered_fn`, `IndexIncludesColumn_fn`, `GetIndexType_fn`
 - Utilities: `GetDefaultConstraintName_fn` (for dropping auto-generated constraints)
+
+**Validation workflow:** after writing a migration, verify before committing:
+
+1. **Run once** — confirm no errors
+2. **Verify objects exist** — `SELECT dbo.TableExists_fn('NewTable')`, `SELECT dbo.ColumnExists_fn('Customer', 'IsVerified')`
+3. **Verify constraints** — `SELECT dbo.ForeignKeyExists_fn('Customer_Rents_Vehicle')`, `SELECT dbo.CheckConstraintExists_fn('SavingsAccount_IsAccountType')`
+4. **Run again** — confirm idempotency (no errors on re-run, no duplicate objects)
 
 For migration templates, read [Migration Patterns](references/migration-patterns.md).
 
