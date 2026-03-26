@@ -100,6 +100,9 @@ CREATE CLUSTERED INDEX CIX_OrderLines_OrderID
 > [!WARNING] Anti-pattern
 > Using `NEWID()` (random GUID) as a clustered index key causes near-constant page splits and severe fragmentation. Replace with `NEWSEQUENTIALID()` or use `int`/`bigint` IDENTITY instead.
 
+> [!WARNING] NEWID() on any indexed GUID column
+> Even when a `UNIQUEIDENTIFIER` column is **not** the clustered key, `NEWID()` still causes fragmentation on any nonclustered B-tree index covering that column. Always prefer `NEWSEQUENTIALID()` as the default for GUID columns that have any index (clustered or nonclustered). If you move the clustered index to a composite key like `(SensorID, ReadingTime)`, still change the GUID default from `NEWID()` to `NEWSEQUENTIALID()` to prevent nonclustered index fragmentation.
+
 ---
 
 ## 4. Nonclustered Indexes
@@ -406,6 +409,14 @@ CREATE NONCLUSTERED INDEX IX_Orders_Customer_Date
 
 SQL Server can sometimes intersect two nonclustered indexes with a hash join, but this is almost always worse than a single well-designed covering index. If you see index intersection in execution plans, redesign the index.
 
+### Design notes checklist
+
+When designing indexes and recommending maintenance strategies, always address these operational concerns:
+
+1. **Edition-dependent features**: `ONLINE = ON` for index rebuilds requires **Enterprise Edition** (or Developer). On Standard Edition, rebuilds take a Schema Modification lock that blocks all queries. Mention this when recommending any index that will need regular maintenance.
+2. **Filtered index parameterization**: Filtered indexes require literal predicates or `OPTION (RECOMPILE)` to be selected by the optimizer. Note this when recommending filtered indexes.
+3. **Fill factor for random-key indexes**: Recommend an explicit fill factor (70–80%) for indexes on non-monotonic keys to reduce page splits between rebuilds.
+
 ### Duplicate and redundant indexes
 
 ```sql
@@ -554,6 +565,9 @@ ALTER INDEX ALL ON dbo.Orders REORGANIZE;
 - Applies fill factor.
 - Updates statistics automatically (equivalent to `FULLSCAN` of the index pages).
 - Resets LOB/row-overflow page chains.
+
+> [!WARNING] Enterprise Edition required for online rebuild
+> `ONLINE = ON` requires **Enterprise Edition** (or Developer Edition for testing). On **Standard Edition**, `ALTER INDEX ... REBUILD` takes a **Schema Modification (Sch-M) lock** that blocks ALL concurrent queries for the duration of the rebuild. This is a critical operational consideration when designing indexes for high-volume tables — always note this limitation in design documentation so DBAs can plan maintenance windows accordingly.
 
 ```sql
 -- Offline rebuild

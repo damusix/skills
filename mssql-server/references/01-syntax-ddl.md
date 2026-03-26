@@ -411,17 +411,22 @@ ALTER TABLE dbo.Orders ADD TaxRate DECIMAL(5,2) NOT NULL
     CONSTRAINT DF_Orders_TaxRate DEFAULT 0;
 ```
 
-### 2. NEWID() as a clustered PK key causes fragmentation
+### 2. NEWID() as a GUID default causes fragmentation
 
 `UNIQUEIDENTIFIER` with `NEWID()` as a clustered PK produces ~99% logical fragmentation. Use `NEWSEQUENTIALID()` (SQL Server 2005+) for clustered keys, or use an `INT IDENTITY` with a separate `UNIQUEIDENTIFIER` column for external use.
+
+Even when the GUID is **not** the clustered key, `NEWID()` still causes nonclustered index fragmentation on any index covering that column. Always use `NEWSEQUENTIALID()` as the default for any indexed GUID column.
 
 ```sql
 -- BAD
 ID UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY CLUSTERED
 
--- GOOD
+-- GOOD (GUID as clustered PK)
 ID UNIQUEIDENTIFIER NOT NULL ROWGUIDCOL DEFAULT NEWSEQUENTIALID() PRIMARY KEY CLUSTERED
--- OR better: INT IDENTITY PK (clustered) + UNIQUEIDENTIFIER (nonclustered UNIQUE) for external reference
+
+-- BEST (separate clustered PK + nonclustered GUID — still use NEWSEQUENTIALID)
+OrderID   INT               NOT NULL IDENTITY(1,1) PRIMARY KEY CLUSTERED,
+PublicRef UNIQUEIDENTIFIER  NOT NULL DEFAULT NEWSEQUENTIALID() UNIQUE NONCLUSTERED
 ```
 
 ### 3. Wide clustered indexes waste page space

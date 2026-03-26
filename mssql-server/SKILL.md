@@ -1,6 +1,9 @@
 ---
 name: mssql-server
 description: >
+  Writes, optimizes, and debugs T-SQL queries. Explains SQL Server internals,
+  troubleshoots performance issues, and guides database administration tasks
+  including backup/restore, high availability, security, and index design.
   Use when the user asks about T-SQL syntax, SQL Server administration,
   query performance, stored procedures, indexes, locking, transactions,
   backup/restore, high availability, security, or any MSSQL-related
