@@ -1,4 +1,4 @@
-## @hapi/catbox-fs Engine Reference
+## `@hapi/catbox-fs` Engine Reference
 
 
 Filesystem-based cache adapter for catbox. Stores cached values on the local filesystem, making the cache **persistent across process restarts** unlike the default in-memory adapter. Values are serialized with `JSON.stringify` (or copied for Buffers) and written to disk, with a cleanup timer to evict expired entries.

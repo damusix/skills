@@ -1,4 +1,4 @@
-## @hapi/yar Session Management Reference
+## `@hapi/yar` Session Management Reference
 
 
 Yar is a hapi plugin for cookie-based session management. It decorates every `request` with a `request.yar` interface for reading and writing session data, and decorates `server` with `server.yar` for session revocation. Sessions are encrypted via `@hapi/iron` and stored either entirely in the cookie or in a server-side catbox cache.
@@ -156,7 +156,7 @@ Normally yar's built-in `onPreResponse` handler calls `commit` automatically. Us
 This only works when server-side cache storage is enabled (i.e., when `maxCookieSize` would cause overflow or is set to `0`).
 
 
-### Cookie Encryption via @hapi/iron
+### Cookie Encryption via `@hapi/iron`
 
 
 Yar uses hapi's built-in state management with `encoding: 'iron'`, which delegates encryption to `@hapi/iron`. Iron provides authenticated encryption:

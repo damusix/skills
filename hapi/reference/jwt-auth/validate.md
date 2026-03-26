@@ -1,4 +1,4 @@
-## @hapi/jwt Validate Function Reference
+## `@hapi/jwt` Validate Function Reference
 
 
 The `validate` function is the application-level callback in a JWT strategy. It runs after token decoding and verification succeed, giving you control over whether to accept the token and what credentials to expose to route handlers.

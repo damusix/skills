@@ -1,4 +1,4 @@
-## @hapi/catbox-memory Engine Reference
+## `@hapi/catbox-memory` Engine Reference
 
 
 In-process memory cache adapter for catbox. This is the **default cache engine** used by hapi when no other provider is configured. It stores values in a `Map`, serializes non-Buffer values via `JSON.stringify`, and runs a single cleanup timer to evict expired entries.

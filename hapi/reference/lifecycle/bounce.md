@@ -1,4 +1,4 @@
-## @hapi/bounce Error Filtering Reference
+## `@hapi/bounce` Error Filtering Reference
 
 
 Bounce is a selective error rethrow utility -- **not a plugin**. It filters caught errors by type, letting you handle application errors while rethrowing system errors (or vice versa). This prevents accidentally swallowing `EvalError`, `RangeError`, `ReferenceError`, `SyntaxError`, `TypeError`, and `URIError` when you only intended to catch operational errors.

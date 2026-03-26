@@ -1,4 +1,4 @@
-## @hapi/nes Subscriptions Reference
+## `@hapi/nes` Subscriptions Reference
 
 
 Nes subscriptions provide real-time publish/subscribe channels over WebSocket. The server declares named subscription paths, clients subscribe to them, and the server publishes messages that are delivered to all matching subscribers.

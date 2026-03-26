@@ -1,4 +1,4 @@
-## @hapi/jwt Token Utility API Reference
+## `@hapi/jwt` Token Utility API Reference
 
 
 The `Jwt.token` namespace provides standalone utilities for generating, decoding, and verifying JWTs **without** requiring a hapi server. These are pure functions you can use anywhere -- in scripts, microservices, testing, or alongside the hapi auth scheme.

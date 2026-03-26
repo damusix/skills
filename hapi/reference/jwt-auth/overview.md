@@ -1,7 +1,7 @@
-## @hapi/jwt Authentication Scheme Reference
+## `@hapi/jwt` Authentication Scheme Reference
 
 
-@hapi/jwt is a hapi plugin that implements a JWT (JSON Web Token) authentication scheme. It is registered via `server.register()` and provides a scheme called `'jwt'` that can be used with `server.auth.strategy()`.
+`@hapi/jwt` is a hapi plugin that implements a JWT (JSON Web Token) authentication scheme. It is registered via `server.register()` and provides a scheme called `'jwt'` that can be used with `server.auth.strategy()`.
 
     const Hapi = require('@hapi/hapi');
     const Jwt = require('@hapi/jwt');
@@ -32,7 +32,7 @@
 ### Registration
 
 
-@hapi/jwt **is a plugin**. Register it before creating strategies:
+`@hapi/jwt` **is a plugin**. Register it before creating strategies:
 
     await server.register(Jwt);
 
@@ -108,7 +108,7 @@ The `keys` option controls how the token signature is verified. It accepts multi
         { key: 'old-key', algorithms: ['HS256'], kid: 'key-2023' }
     ]
 
-When multiple keys are configured, @hapi/jwt tries each key until one succeeds. If keys have `kid`, the token header's `kid` is used to select the matching key directly.
+When multiple keys are configured, `@hapi/jwt` tries each key until one succeeds. If keys have `kid`, the token header's `kid` is used to select the matching key directly.
 
 **JWKS (JSON Web Key Set) URI:**
 
@@ -164,7 +164,7 @@ Set `verify: false` to skip all verification (both signature and payload claims)
 ### Token Extraction
 
 
-@hapi/jwt extracts the JWT from one of two sources, depending on strategy configuration: (lib/plugin.js:246-257)
+`@hapi/jwt` extracts the JWT from one of two sources, depending on strategy configuration: (lib/plugin.js:246-257)
 
 1. **Cookie** -- if `cookieName` is set, the token is read from the named cookie
 2. **Request header** -- reads from the `headerName` header (default `'authorization'`), stripping the `httpAuthScheme` prefix (default `'Bearer'`)
@@ -211,7 +211,7 @@ If any step fails, a [Boom.unauthorized](../lifecycle/boom.md#boomunauthorized--
 
 - **Keys must be sufficiently long.** HMAC secrets (HS256/HS384/HS512) must meet minimum length requirements. HS256 requires at least 32 characters. Short keys will throw during strategy creation.
 - **`verify: false` skips all verification.** Setting `verify` to `false` skips both signature and payload claim verification. The `keys` option is also not required when `verify` is `false`. The token is only decoded, not verified. (lib/plugin.js:118)
-- **JWKS keys are cached.** When using a JWKS URI, keys are fetched and cached. If the auth server rotates keys, @hapi/jwt will re-fetch the JWKS when a token's `kid` is not found in the cache.
+- **JWKS keys are cached.** When using a JWKS URI, keys are fetched and cached. If the auth server rotates keys, `@hapi/jwt` will re-fetch the JWKS when a token's `kid` is not found in the cache.
 - **`validate` is always called.** Even after signature and claim verification succeed, the `validate` function runs. You must return `{ isValid: true }` or auth fails.
 - **Multiple keys try sequentially.** When an array of keys is configured without `kid`, each key is tried in order. This can impact performance with many keys -- prefer using `kid` for key selection.
 - **Token extraction order matters.** The Authorization header takes precedence. If a token exists in both the header and a cookie, the header token is used.

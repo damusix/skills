@@ -1,4 +1,4 @@
-## @hapi/boom Error Utility Reference
+## `@hapi/boom` Error Utility Reference
 
 
 Boom is an HTTP-friendly error utility -- **not a plugin**. It creates rich `Error` objects with HTTP status codes, headers, and structured payloads. Hapi natively recognizes Boom errors: when thrown or returned from handlers, lifecycle methods, or auth schemes, hapi automatically converts them into properly formatted HTTP responses.

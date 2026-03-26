@@ -1,7 +1,7 @@
-## @hapi/inert — Static File Serving
+## `@hapi/inert` — Static File Serving
 
 
-@hapi/inert is a **hapi plugin** that adds static file and directory serving capabilities. Unlike [Boom](../lifecycle/boom.md) (a standalone utility), inert must be registered via `server.register()`. Once registered, it adds:
+`@hapi/inert` is a **hapi plugin** that adds static file and directory serving capabilities. Unlike [Boom](../lifecycle/boom.md) (a standalone utility), inert must be registered via `server.register()`. Once registered, it adds:
 
 - **`h.file()`** — a [response toolkit](../lifecycle/response-toolkit.md) decoration for serving files from handlers
 - **`handler: { file: ... }`** — a [registered handler type](../route/handler.md) for single-file routes

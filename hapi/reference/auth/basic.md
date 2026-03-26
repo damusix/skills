@@ -1,4 +1,4 @@
-## @hapi/basic -- HTTP Basic Authentication Scheme
+## `@hapi/basic` -- HTTP Basic Authentication Scheme
 
 
 `@hapi/basic` is a hapi plugin that registers an authentication scheme called `'basic'`. It implements HTTP Basic authentication (RFC 7617), parsing the `Authorization: Basic <base64(username:password)>` header and delegating credential validation to a user-provided `validate` function.

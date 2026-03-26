@@ -1,4 +1,4 @@
-## @hapi/catbox-redis Reference
+## `@hapi/catbox-redis` Reference
 
 
 Redis cache adapter for hapi's catbox caching layer. Implements the catbox engine interface using [ioredis](https://github.com/redis/ioredis) as the underlying Redis client. Works with Redis, Dragonfly, and Valkey.

@@ -1,4 +1,4 @@
-## @hapi/nes WebSocket Overview
+## `@hapi/nes` WebSocket Overview
 
 
 Nes is the official WebSocket plugin for hapi. It wraps hapi's HTTP listener with WebSocket upgrade support, allowing clients to make requests to hapi routes and subscribe to real-time updates -- all through a single WebSocket connection.

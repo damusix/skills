@@ -1,4 +1,4 @@
-## @hapi/mimos MIME Database Reference
+## `@hapi/mimos` MIME Database Reference
 
 
 Mimos is a MIME type database utility -- **not a plugin**. It wraps the `mime-db` database and provides file extension and content-type lookups. Hapi uses mimos internally to auto-detect content types for file responses (via [@hapi/inert](../file-serving/overview.md)). The server exposes its mimos instance at `server.mime`.

@@ -1,4 +1,4 @@
-## @hapi/nes Client Reference
+## `@hapi/nes` Client Reference
 
 
 The nes client (`Nes.Client`) provides the browser and Node.js interface for connecting to a hapi server with the nes plugin. It handles WebSocket connection management, authentication, request/response mapping, subscriptions, and automatic reconnection.

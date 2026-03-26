@@ -1,6 +1,6 @@
 ---
 name: hapi
-description: "Use when building @hapi/hapi servers, routes, plugins, auth schemes, HTTP APIs, request lifecycle, caching, stale-while-revalidate, server methods, views, startup sequences, or response marshalling."
+description: "Creates, configures, and debugs `@hapi/hapi` servers — implements routes, plugins, auth schemes, validation, caching, and request lifecycle hooks. Use when building HTTP APIs, setting up stale-while-revalidate caching, registering server methods, configuring views, managing startup sequences, or troubleshooting response marshalling."
 ---
 
 # Hapi
@@ -19,7 +19,36 @@ description: "Use when building @hapi/hapi servers, routes, plugins, auth scheme
 2. **Follow the lifecycle** - 24-step request flow; see [lifecycle overview](reference/lifecycle/overview.md)
 3. **Auth is three layers** - scheme → strategy → default; see [server auth](reference/server/auth.md)
 4. **Validate at the route** - Use joi schemas on params, query, payload, headers; see [validation](reference/route/validation.md)
-5. **Type routes with Refs** - Use `ServerRoute<Refs>` pattern; see [route scaffold](reference/typescript/route-scaffold.md)
+5. **Type routes with Refs** - Use `ServerRoute<Refs>` with ONLY the keys you need (Params, Query, Payload, etc.); omitted keys keep defaults. See [route scaffold](reference/typescript/route-scaffold.md)
+
+Auth three-layer pattern:
+
+    server.auth.scheme('custom', schemeImpl);     // 1. scheme (how to authenticate)
+    server.auth.strategy('session', 'custom', options); // 2. strategy (configured instance)
+    server.auth.default('session');                // 3. default (apply to all routes)
+
+Scheme authenticate MUST return `h.authenticated()` with both credentials AND artifacts:
+
+    return h.authenticated({
+        credentials: { user: { id, name }, scope: ['user'] },
+        artifacts: { token }       // always include artifacts for raw auth data
+    });
+
+Route validation pattern:
+
+    server.route({
+        method: 'POST',
+        path: '/users',
+        options: {
+            validate: {
+                payload: Joi.object({
+                    name: Joi.string().required(),
+                    email: Joi.string().email().required()
+                })
+            }
+        },
+        handler: (request) => request.payload
+    });
 
 
 ## Workflow
@@ -27,8 +56,9 @@ description: "Use when building @hapi/hapi servers, routes, plugins, auth scheme
 1. **Create server** - [server overview](reference/server/overview.md) for constructor options
 2. **Register plugins** - [plugins](reference/server/plugins.md) and [plugin structure](reference/plugins/overview.md)
 3. **Configure auth** - [auth schemes](reference/server/auth.md) and [route auth](reference/route/auth.md)
-4. **Define routes** - [route overview](reference/route/overview.md) with [handlers](reference/route/handler.md)
-5. **Add extensions** - [lifecycle hooks](reference/server/extensions.md) and [pre-handlers](reference/route/pre.md)
+4. **Verify auth** - Test with `server.inject()` before defining protected routes; see [network](reference/server/network.md)
+5. **Define routes** - [route overview](reference/route/overview.md) with [handlers](reference/route/handler.md)
+6. **Add extensions** - [lifecycle hooks](reference/server/extensions.md) and [pre-handlers](reference/route/pre.md)
 
 
 ## Key Patterns

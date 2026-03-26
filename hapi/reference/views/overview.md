@@ -1,4 +1,4 @@
-## @hapi/vision Views Plugin Reference
+## `@hapi/vision` Views Plugin Reference
 
 
 Vision is a **hapi plugin** that adds template rendering support. It decorates the server, request, and response toolkit with view methods after registration via `server.register()`.

@@ -54,9 +54,11 @@ The object returned by the scheme factory function:
 #### `authenticate(request, h)`
 
 
-The core authentication method. Must return one of:
+The core authentication method. **Must call `h.authenticated()` on success — do NOT return a plain object.**
 
-- `h.authenticated({ credentials, artifacts })` -- authentication succeeded.
+Returns one of:
+
+- `h.authenticated({ credentials, artifacts })` -- authentication succeeded. **Always include both `credentials` and `artifacts`.**
 - `h.unauthenticated(error, { credentials, artifacts })` -- authentication failed.
 - Throw a Boom error -- authentication failed.
 
@@ -692,7 +694,7 @@ init();
 7. **Credential injection bypasses strategies:** Setting `request.auth.credentials` in `onPreAuth` causes hapi to skip all strategy `authenticate()` calls. Authorization still runs normally against the injected credentials.
 
 
-### Related: @hapi/jwt Plugin
+### Related: `@hapi/jwt` Plugin
 
 
 For JWT-based authentication, use the [@hapi/jwt](../jwt-auth/overview.md) plugin instead of writing a custom scheme. It registers a `'jwt'` scheme automatically via `server.register()` and handles token extraction, signature verification, and claim validation. See:

@@ -221,7 +221,7 @@ authenticate: function (request, h) {
 ```
 
 
-#### `h.file(path, [options])` -- Serve a static file (requires @hapi/inert)
+#### `h.file(path, [options])` -- Serve a static file (requires `@hapi/inert`)
 
 
 Added by the [@hapi/inert](../file-serving/overview.md) plugin. Transmits a file from the file system. Returns a standard response object.
@@ -268,7 +268,7 @@ const ext = function (request, h) {
 ```
 
 
-#### `h.view(template, [context, [options]])` -- Template response (via @hapi/vision)
+#### `h.view(template, [context, [options]])` -- Template response (via `@hapi/vision`)
 
 
 Added by the [@hapi/vision](../views/overview.md) plugin. Returns a response object with variety `'view'`. The template is rendered during the [marshal pipeline](response-marshal.md).
