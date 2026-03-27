@@ -55,7 +55,6 @@ Or use `sqlcmd` which can emit headers:
 - Add `-a 65535` to maximize the network packet size.
 - On Linux/macOS, replace `^` line continuation with `\` and use single quotes for the query string.
 
-See [mssql-server: 47-cli-bulk-operations.md](../../mssql-server/references/47-cli-bulk-operations.md) for the full bcp reference.
 
 ---
 
@@ -264,7 +263,7 @@ SQL Server 2022 can read Parquet files from S3-compatible storage or Azure Blob 
     FROM dbo.FeatureTable
     WHERE Split = 'train';
 
-> PolyBase requires the PolyBase feature to be installed and the `PolyBase Data Movement Service` running. Verify with `SELECT * FROM sys.configurations WHERE name = 'hadoop connectivity'`. See [mssql-server: 47-cli-bulk-operations.md](../../mssql-server/references/47-cli-bulk-operations.md) for OPENROWSET options.
+> PolyBase requires the PolyBase feature to be installed and the `PolyBase Data Movement Service` running. Verify with `SELECT * FROM sys.configurations WHERE name = 'hadoop connectivity'`.
 
 ---
 
@@ -341,7 +340,7 @@ For large feature stores, detect which entities have changed and recompute only 
     WHEN NOT MATCHED BY TARGET
         THEN INSERT ...;
 
-`CONCAT_WS('|', ...)` concatenates all feature values with a pipe delimiter. `HASHBYTES('SHA2_256', ...)` produces a deterministic 32-byte hash [^5] — if the hash matches, the row has not changed and can be skipped. See [mssql-server: 24-string-date-math-functions.md](../../mssql-server/references/24-string-date-math-functions.md) for HASHBYTES and CONCAT_WS.
+`CONCAT_WS('|', ...)` concatenates all feature values with a pipe delimiter. `HASHBYTES('SHA2_256', ...)` produces a deterministic 32-byte hash [^5] — if the hash matches, the row has not changed and can be skipped.
 
 ### Columnstore index on the feature store
 
@@ -350,7 +349,6 @@ Feature store reads are analytical (scan all rows for a training run). A cluster
     CREATE CLUSTERED COLUMNSTORE INDEX CCI_CustomerFeatureStore
     ON dbo.CustomerFeatureStore;
 
-See [mssql-server: 09-columnstore-indexes.md](../../mssql-server/references/09-columnstore-indexes.md) for columnstore behavior and when to use it.
 
 ---
 
@@ -359,9 +357,6 @@ See [mssql-server: 09-columnstore-indexes.md](../../mssql-server/references/09-c
 - [sampling-splitting.md](sampling-splitting.md) — splitting before export
 - [null-imputation.md](null-imputation.md) — imputing NULLs before or after export
 - [data-leakage.md](data-leakage.md) — ensuring the feature store does not include future data
-- [mssql-server: 47-cli-bulk-operations.md](../../mssql-server/references/47-cli-bulk-operations.md) — bcp and BULK INSERT full reference
-- [mssql-server: 09-columnstore-indexes.md](../../mssql-server/references/09-columnstore-indexes.md) — columnstore for scan-heavy feature tables
-- [mssql-server: 51-2022-features.md](../../mssql-server/references/51-2022-features.md) — OPENROWSET Parquet, S3 credential, JSON_OBJECT
 
 ---
 

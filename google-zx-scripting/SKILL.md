@@ -1,6 +1,6 @@
 ---
 name: google-zx-scripting
-description: "Use when writing shell scripts, automation, build tools, file processing, CLI tools, deployment scripts, data pipelines, or batch operations with Google's zx library. Also covers piping, streams, parallel execution, retries, cross-platform scripting, built-in fs utilities, and minimist argument parsing."
+description: "Writes and executes JavaScript-based shell scripts using Google's zx library. Use when writing shell scripts, automation, build tools, file processing, CLI tools, deployment scripts, data pipelines, or batch operations. Also covers piping, streams, parallel execution, retries, cross-platform scripting, built-in fs utilities, and minimist argument parsing."
 ---
 
 # Google ZX Scripting
@@ -63,12 +63,43 @@ Run directly:
              stdin, tmpdir, tmpfile, which, ps, kill,
              quote, YAML, argv, fetch } from 'zx/core';
 
+## Validation Checkpoints
+
+Before executing destructive or bulk operations, always verify scope:
+
+    // Verify glob matches before bulk processing
+    const files = await glob('src/**/*.ts');
+    console.log(`Found ${files.length} files`);
+    if (files.length === 0) throw new Error('No files matched — check glob pattern');
+    if (files.length > 500) throw new Error(`Too many files (${files.length}) — narrow the glob`);
+
+    // Dry-run flag for destructive operations
+    const dryRun = argv['dry-run'] ?? false;
+    for (const file of files) {
+        if (dryRun) { console.log(`[dry-run] would delete ${file}`); continue; }
+        await fs.rm(file);
+    }
+
+For parallel operations, use `Promise.allSettled()` to handle partial failures:
+
+    const results = await Promise.allSettled(
+        files.map(f => within(async () => $`process ${f}`))
+    );
+    const failed = results.filter(r => r.status === 'rejected');
+    if (failed.length > 0) {
+        console.error(chalk.red(`${failed.length}/${results.length} tasks failed`));
+        failed.forEach(r => console.error(r.reason));
+        process.exitCode = 1;
+    }
+
 ## Conventions for Generated Scripts
 
 1. **Shebang line**: Always include `#!/usr/bin/env npx zx` as the first line
-2. **Error handling**: Wrap top-level logic in a main function with try/catch, or use `$.nothrow` selectively
-3. **Output**: Use `chalk` for colored terminal output — green for success, red for errors, yellow for warnings, dim for secondary info
+2. **Verbose off**: Always set `$.verbose = false` before main logic to suppress command echoing
+3. **Error handling**: Always use the `main().catch()` pattern — wrap logic in `async function main()`, then call `main().catch(err => { console.error(chalk.red(err.message)); process.exit(1); })`
+3. **Output colors**: Use `chalk.green()` for success, `chalk.red()` for errors, `chalk.yellow()` for warnings, and `chalk.dim()` for secondary/per-item info (e.g., `echo(chalk.dim(\`  Processing ${file}...\`))`)
 4. **Progress**: Use `spinner()` for long-running operations in interactive contexts
 5. **Arguments**: Use `argv` (pre-parsed `minimist`) for CLI argument handling
 6. **Temp files**: Use `tmpdir()` and `tmpfile()` — they auto-clean on exit
 7. **Parallelism**: Use `Promise.all()` with `within()` for parallel operations that need isolation
+8. **Process piping**: Always use `` $`cmd1`.pipe($`cmd2`) `` for chaining processes — never use shell `|` inside template literals

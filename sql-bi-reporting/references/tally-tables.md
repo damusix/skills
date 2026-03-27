@@ -172,7 +172,8 @@ Join a continuous date spine to sparse data to expose dates with no activity. Th
         COUNT(O.OrderID)              AS OrderCount
     FROM DateSpine D
     LEFT JOIN Sales.Orders O
-        ON CAST(O.OrderDate AS DATE) = D.CalendarDate
+        ON O.OrderDate >= D.CalendarDate
+       AND O.OrderDate <  DATEADD(day, 1, D.CalendarDate)
     GROUP BY D.CalendarDate
     ORDER BY D.CalendarDate;
 

@@ -306,7 +306,7 @@ RFM (Recency, Frequency, Monetary) is a standard customer feature set used in ch
     # Features: Recency, Frequency, Monetary, R_Score, F_Score, M_Score, RFM_Total
     # RFM_Segment is interpretability label, not a model input
 
-> `NTILE(5)` distributes rows into 5 equal buckets. If the row count is not divisible by 5, the first `(count % 5)` buckets get one extra row. See [mssql-server: 02-syntax-dql.md](../../mssql-server/references/02-syntax-dql.md) for NTILE behavior on ties.
+> `NTILE(5)` distributes rows into 5 equal buckets. If the row count is not divisible by 5, the first `(count % 5)` buckets get one extra row.
 
 ---
 
@@ -493,7 +493,7 @@ Interaction features capture combinations of two or more other features. Compute
         ) t
     ) ca;
 
-> `CROSS APPLY` invokes the subquery once per outer row. Use `OUTER APPLY` when some customers have no orders and you want to preserve those rows (with NULL for the feature). See [mssql-server: 02-syntax-dql.md](../../mssql-server/references/02-syntax-dql.md) for APPLY semantics.
+> `CROSS APPLY` invokes the subquery once per outer row. Use `OUTER APPLY` when some customers have no orders and you want to preserve those rows (with NULL for the feature).
 
 ---
 
@@ -532,8 +532,6 @@ For columns that are free-text strings (product descriptions, notes, usernames),
 - [sampling-splitting.md](sampling-splitting.md) — splitting the feature table into train/test sets
 - [null-imputation.md](null-imputation.md) — handling NULLs in the feature columns above
 - [data-leakage.md](data-leakage.md) — how temporal features leak and how to prevent it
-- [mssql-server: 02-syntax-dql.md](../../mssql-server/references/02-syntax-dql.md) — window functions, APPLY, NTILE
-- [mssql-server: 51-2022-features.md](../../mssql-server/references/51-2022-features.md) — WINDOW clause, DATE_BUCKET, GENERATE_SERIES
 
 ---
 

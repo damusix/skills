@@ -6,8 +6,6 @@ description: "Use when writing T-SQL for business intelligence, analytics, or re
 # SQL BI & Reporting
 
 
-Patterns for writing analytical T-SQL queries — aggregations, time series, pivots, gap analysis, and data export. These patterns extract meaning from data for dashboards, reports, and human decision-making.
-
 ## When to Use
 
 - Writing summary reports with subtotals across multiple dimensions
@@ -48,8 +46,6 @@ Use `GROUPING(col)` to distinguish subtotal NULLs from real NULLs — returns 1 
 **Full reference:** [Aggregation Patterns](references/aggregation-patterns.md) — GROUPING_ID, conditional aggregation, HAVING vs WHERE, COUNT semantics with NULLs.
 
 ## Window Functions
-
-Window functions compute values across related rows without collapsing the result. They are the analytical workhorse — replacing self-joins, correlated subqueries, and cursors.
 
 ### Quick Reference
 
@@ -131,14 +127,17 @@ When multiple window functions share the same partition and order, avoid repetit
 
 ### Gap filling
 
-LEFT JOIN from a continuous date spine (tally table or calendar table) to your sparse data. ISNULL replaces NULL with zero for missing dates:
+LEFT JOIN from a continuous date spine (tally table or calendar table) to your sparse data. ISNULL replaces NULL with zero for missing dates. Use a range join to keep the date column SARGable — never `CAST(col AS DATE)` in a JOIN:
 
     SELECT
         C.FullDate,
         ISNULL(SUM(O.TotalAmount), 0) AS Revenue
     FROM dbo.Calendar C
-    LEFT JOIN Sales.Orders O ON CAST(O.OrderDate AS DATE) = C.FullDate
-    WHERE C.Year = 2024
+    LEFT JOIN Sales.Orders O
+        ON O.OrderDate >= C.FullDate
+       AND O.OrderDate <  DATEADD(day, 1, C.FullDate)
+    WHERE C.FullDate >= '2024-01-01'
+      AND C.FullDate <  '2025-01-01'
     GROUP BY C.FullDate
     ORDER BY C.FullDate;
 
@@ -158,7 +157,10 @@ Generate number sequences with zero I/O using the stacking CTE pattern:
             SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS N
             FROM L4
         )
-    SELECT N FROM Nums WHERE N <= @Count;
+    SELECT N FROM Nums
+    WHERE N <= @Count;   -- REQUIRED: limits output to needed rows
+
+**Every tally CTE must include `WHERE N <= <limit>`** — without it, the full 65,536 rows are generated. When used for date spines, the limit is `DATEDIFF(day, @Start, @End)`. Never omit the limit and rely on an outer query to filter — the optimizer may still materialize all rows.
 
 On SQL Server 2022+, use `GENERATE_SERIES(1, @Count)` for simpler syntax. Do not use recursive CTEs for number generation — they are row-by-row and 10-50x slower.
 
@@ -207,12 +209,36 @@ Group by GroupKey to find each island's start, end, and length.
 
 | Format | T-SQL | Notes |
 |--------|-------|-------|
-| JSON | `FOR JSON PATH` | Dot-notation aliases control nesting |
+| JSON | `FOR JSON PATH` | Dot-notation aliases control nesting: `AS "customer.name"` produces `{"customer":{"name":"..."}}` |
 | XML | `FOR XML PATH` | Only when downstream requires XML (SOAP, EDI) |
 | CSV column | `STRING_AGG(col, ',')` | WITHIN GROUP for ordering (2017+) |
 | Bulk file | BCP / BULK INSERT | TABLOCK for columnstore direct-path |
 
+### FOR JSON PATH nesting
+
+Use dot-notation aliases to control JSON structure — no subqueries needed for flat nesting:
+
+    SELECT
+        O.OrderID      AS "id",
+        C.CustomerName AS "customer.name",
+        C.Email        AS "customer.email"
+    FROM Sales.Orders O
+    JOIN Sales.Customers C ON C.CustomerID = O.CustomerID
+    FOR JSON PATH;
+    -- {"id":1001,"customer":{"name":"Acme","email":"info@acme.com"}}
+
 **Full reference:** [Export Patterns](references/export-patterns.md) — FOR JSON nesting, JSON_OBJECT (2022+), Power BI DirectQuery optimization, BCP parameters.
+
+## Validation Checklist
+
+Before finalizing any BI query, verify:
+
+1. **Subtotal rows** — `GROUPING(col) = 1` filters identify rollup rows; confirm NULL isn't confused with real data
+2. **Window frames** — every windowed aggregate has an explicit `ROWS BETWEEN` clause
+3. **Date filters** — all WHERE and JOIN predicates on date columns use range predicates, never `CAST(col AS DATE)` or `YEAR(col)`
+4. **Gap fills** — LEFT JOIN from calendar/tally produces rows for every expected period; ISNULL handles missing data
+5. **Dynamic PIVOT** — generated SQL is printed and inspected before `sp_executesql`; all column names pass through QUOTENAME
+6. **Export shape** — FOR JSON PATH output matches the consumer's expected schema; test with a LIMIT before full run
 
 ## Common Mistakes
 
@@ -221,6 +247,8 @@ Group by GroupKey to find each island's start, end, and length.
 | Default window frame with ORDER BY (RANGE, not ROWS) | Always specify `ROWS BETWEEN ...` explicitly |
 | Using RANGE for moving averages (includes ties) | Use `ROWS BETWEEN N PRECEDING AND CURRENT ROW` |
 | YEAR(col) = 2024 in WHERE (kills seeks) | Range predicate: `col >= '2024-01-01' AND col < '2025-01-01'` |
+| CAST(col AS DATE) in JOIN conditions | Use range join: `ON col >= date AND col < DATEADD(day, 1, date)` |
+| Tally CTE without WHERE N <= limit | Always add `WHERE N <= @count` — without it, generates full 65K rows |
 | COUNT(column) when you want total rows | `COUNT(*)` includes NULLs; `COUNT(col)` excludes them |
 | AVG ignoring NULL semantics | AVG uses COUNT(col) as denominator — use ISNULL(col, 0) if NULLs mean zero |
 | UNPIVOT dropping NULL rows | Use CROSS APPLY VALUES to preserve NULLs |

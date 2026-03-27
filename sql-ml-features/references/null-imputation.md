@@ -55,7 +55,6 @@ SQL Server aggregate functions ignore NULLs — except `COUNT(*)`:
 
 This distinction matters enormously for feature quality. Know what NULL means in your domain before choosing an imputation strategy.
 
-See [mssql-server: 25-null-handling.md](../../mssql-server/references/25-null-handling.md) for the full three-valued logic reference.
 
 ---
 
@@ -333,8 +332,6 @@ All strategies share one rule: **compute imputation statistics from training row
 - [feature-engineering.md](feature-engineering.md) — features that may contain NULLs
 - [data-leakage.md](data-leakage.md) — how imputation causes train/test leakage
 - [sampling-splitting.md](sampling-splitting.md) — splitting before imputation
-- [mssql-server: 25-null-handling.md](../../mssql-server/references/25-null-handling.md) — three-valued logic, COALESCE vs ISNULL, aggregate behavior
-- [mssql-server: 02-syntax-dql.md](../../mssql-server/references/02-syntax-dql.md) — PERCENTILE_CONT, window functions, ROWS vs RANGE
 
 ---
 

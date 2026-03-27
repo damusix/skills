@@ -21,26 +21,48 @@ Patterns for extracting ML-ready features from SQL Server — turning normalized
 
 **When NOT to use:** application schema design (table design, naming conventions, access control), query performance tuning (execution plans, index tuning, wait stats), BI dashboards and summary reports (GROUPING SETS, pivot tables, dashboard queries), or running R/Python inside SQL Server (SQL Server ML Services).
 
-## The Fundamental Tension
+## Feature Table Build Workflow
 
-SQL Server stores data in **normalized, narrow, NULL-aware** form. Machine learning models expect **denormalized, wide, NULL-free** feature matrices. Every query in this skill navigates that gap.
+Follow these steps in order. Each step has a validation checkpoint.
 
-| SQL world | ML world |
-|---|---|
-| One fact per row (normalized) | One entity per row with all its features wide |
-| NULL means "unknown" | NULL causes training errors or silent imputation |
-| Timestamps are exact | Time must become numeric features (recency, duration) |
-| Categories as codes or FKs | Categories as indicator columns or ordinal integers |
-| Aggregation collapses rows | Features aggregate without collapsing the entity row |
-| Newest data is always visible | Training data must not see the future |
+1. **Set snapshot date** — Anchor all features to a fixed `@SnapshotDate`. Never use `GETDATE()` inside feature queries.
+   - _Validate:_ `SELECT @SnapshotDate` returns the intended date.
 
-The last row is the most important. Temporal leakage — building features from data that wasn't available at prediction time — is the most common and most damaging mistake a data scientist can make in SQL. It is called out explicitly throughout this skill.
+2. **Build base entity table** — `SELECT DISTINCT` the entity key into a temp table `#Base`. One row per entity, primary key only — no features yet.
+    ```sql
+    SELECT DISTINCT CustomerId
+    INTO #Base
+    FROM Customers
+    WHERE SignupDate < @SnapshotDate;
+    ```
+   - _Validate:_ `SELECT COUNT(*), COUNT(DISTINCT CustomerId) FROM #Base` — counts must match (no duplicates).
+
+3. **Join features with temporal bounds** — LEFT JOIN each feature set to `#Base`. Bound every join with `AND EventDate <= @SnapshotDate`.
+    ```sql
+    SELECT b.CustomerId,
+           DATEDIFF(DAY, f.LastOrder, @SnapshotDate) AS Recency,
+           f.OrderCount AS Frequency
+    FROM #Base b
+    LEFT JOIN FeatureCTE f ON f.CustomerId = b.CustomerId;
+    ```
+   - _Validate:_ Row count equals `#Base` row count. No feature references dates after `@SnapshotDate`.
+
+4. **Impute NULLs** — Replace every NULL with an explicit value. Use `COALESCE` with mean, median, zero, or a sentinel depending on the column semantics.
+   - _Validate:_ `SELECT SUM(CASE WHEN col IS NULL THEN 1 ELSE 0 END) FROM FeatureTable` returns 0 for every column.
+
+5. **Encode categoricals** — One-hot, ordinal, or frequency encode all non-numeric columns.
+   - _Validate:_ `SELECT * FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'FeatureTable'` — all columns are numeric types (`int`, `float`, `decimal`, `bit`).
+
+6. **Split train/test** — Use hash-based split for cross-sectional data or cutoff-date split for time series.
+   - _Validate:_ `SELECT SplitLabel, COUNT(*) FROM FeatureTable GROUP BY SplitLabel` — verify expected proportions (e.g., 80/20).
+
+7. **Export** — BCP, `pandas.read_sql`, or `FOR JSON` depending on the consumer.
 
 ## Feature Engineering Taxonomy
 
 | Category | Examples | T-SQL tools |
 |---|---|---|
-| Numeric | Raw values, log transforms, ratios, z-scores | `LOG`, `SQRT`, window `AVG`/`STDEV` |
+| Numeric | Raw values, `LOG(col + 1)` for skewed, ratios, z-scores | `LOG(col + 1)`, `SQRT`, window `AVG`/`STDEV` |
 | Categorical | One-hot encoding, ordinal, frequency | `CASE`, `PIVOT`, `DENSE_RANK`, COUNT ratios |
 | Temporal | Recency, duration, day-of-week | `DATEDIFF`, `DATEPART`, `DATENAME` |
 | Rolling window | 7-day sum, 30-day average | `SUM/AVG OVER (ROWS BETWEEN ...)` |
@@ -60,8 +82,9 @@ The last row is the most important. Temporal leakage — building features from 
 | One-hot encode | `CASE WHEN Category = 'A' THEN 1 ELSE 0 END AS Category_A` |
 | Ordinal encode | `DENSE_RANK() OVER (ORDER BY Category)` |
 | Frequency encode | `COUNT(*) OVER (PARTITION BY Category) * 1.0 / COUNT(*) OVER ()` |
+| Log transform | `LOG(Amount + 1)` — the `+1` offset handles zero values; omit only when zeros are impossible |
 | Quantile bucket | `NTILE(10) OVER (ORDER BY Score)` |
-| Row hash for split | `ABS(CAST(CAST(HASHBYTES('SHA2_256', CAST(Id AS NVARCHAR(20))) AS BINARY(8)) AS BIGINT)) % 10` |
+| Row hash for split | 5-step chain: (1) `CAST(Id AS NVARCHAR(20))` → (2) `HASHBYTES('SHA2_256', ...)` → (3) `CAST(... AS BINARY(8))` → (4) `CAST(... AS BIGINT)` → (5) `ABS(...) % 10` |
 | Mean imputation | `COALESCE(col, AVG(col) OVER ())` |
 | Median imputation | `PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY col) OVER ()` |
 | NULL indicator | `CASE WHEN col IS NULL THEN 1 ELSE 0 END AS col_is_missing` |

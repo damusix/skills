@@ -1,6 +1,6 @@
 ---
 name: htmx
-description: "Use when tasks involve hx-* attributes, HTMX AJAX requests, swap strategies, server-sent events, WebSockets, or hypermedia-driven UIs."
+description: "Implements HTMX interactions, configures swap behaviors, debugs hx-* requests, and builds hypermedia-driven UI components. Use when tasks involve hx-* attributes, HTMX AJAX requests, swap strategies, server-sent events, WebSockets, or hypermedia-driven UIs."
 ---
 
 # HTMX
@@ -15,6 +15,27 @@ Use this skill for HTMX implementation and integration. Read only the reference 
 3. Implement using HTML-first, hypermedia-driven patterns.
 4. Validate that server responses return HTML fragments, not JSON.
 
+Minimal example — a button that loads content via GET:
+
+```html
+<button hx-get="/contacts" hx-target="#results" hx-swap="innerHTML">
+    Load Contacts
+</button>
+<div id="results"></div>
+```
+
+The server endpoint (`/contacts`) must return an HTML fragment, not JSON:
+
+```html
+<!-- Server response (HTML fragment, no <html>/<body> wrappers) -->
+<ul>
+    <li>Alice</li>
+    <li>Bob</li>
+</ul>
+```
+
+The default swap is `innerHTML` — the response replaces the target's children. Use `hx-swap="outerHTML"` to replace the target element itself.
+
 ## Critical Rules
 
 1. **HTML responses** - HTMX expects HTML responses from the server, not JSON
@@ -22,9 +43,13 @@ Use this skill for HTMX implementation and integration. Read only the reference 
 3. **Default swap is innerHTML** - Always confirm the intended swap method
 4. **Form values auto-included** - Non-GET requests automatically include the closest enclosing form's values
 5. **Progressive enhancement** - Use `hx-boost="true"` — pages must work without JS
-6. **Escape user content** - Escape all user-supplied content server-side to prevent XSS
+6. **Escape user content** - Escape all user-supplied content server-side to prevent XSS. Wrap areas rendering user-generated content with `hx-disable` to prevent HTMX processing of injected attributes
 7. **CSS lifecycle classes** - HTMX adds/removes CSS classes during requests — use for transitions and indicators
 8. **data-prefix supported** - All `hx-*` attributes can also be written as `data-hx-*` for HTML validation compliance
+9. **Stop polling with HTTP 286** - Server returns status `286` to stop `every` or `load delay` polling. Always use 286 for poll termination, not conditional client-side logic
+10. **Error swaps need htmx:beforeSwap** - Non-2xx responses (e.g., 422 validation errors) are not swapped by default. Add an `htmx:beforeSwap` listener to enable swapping for error status codes
+11. **Decouple with HX-Trigger headers** - Use `HX-Trigger` response headers to fire client-side events instead of hardcoding DOM element IDs in server responses
+12. **Detect HTMX requests server-side** - Check the `HX-Request` header to serve HTML fragments for HTMX requests and full pages for direct browser requests. Set `Vary: HX-Request` for caching
 
 ## Reference Map
 

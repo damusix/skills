@@ -282,9 +282,6 @@ Upsampling by duplication is simplest but adds no new information — the model 
 - [feature-engineering.md](feature-engineering.md) — computing the features that go into these splits
 - [data-leakage.md](data-leakage.md) — why random splits fail for temporal data
 - [null-imputation.md](null-imputation.md) — imputing NULLs after splitting (impute on train, apply to test)
-- [mssql-server: 02-syntax-dql.md](../../mssql-server/references/02-syntax-dql.md) — NTILE, ROWS vs RANGE, window functions
-- [mssql-server: 24-string-date-math-functions.md](../../mssql-server/references/24-string-date-math-functions.md) — HASHBYTES encoding and hashing
-- [mssql-server: 51-2022-features.md](../../mssql-server/references/51-2022-features.md) — GENERATE_SERIES for number/date series
 
 ---
 

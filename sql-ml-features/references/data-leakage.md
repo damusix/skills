@@ -111,7 +111,7 @@ SQL Server system-versioned temporal tables let you query the state of any table
     SELECT p.ProductId, p.Price
     FROM dbo.ProductPricing FOR SYSTEM_TIME AS OF @SnapshotDate AS p;
 
-Without `FOR SYSTEM_TIME AS OF`, you get the current price. If prices changed after the snapshot date, the feature uses incorrect values — a form of temporal leakage. See [mssql-server: 17-temporal-tables.md](../../mssql-server/references/17-temporal-tables.md) for temporal table syntax.
+Without `FOR SYSTEM_TIME AS OF`, you get the current price. If prices changed after the snapshot date, the feature uses incorrect values — a form of temporal leakage.
 
 ---
 
@@ -298,8 +298,6 @@ Always create the `Split` column first (using HASHBYTES or time-based split), th
 - [feature-engineering.md](feature-engineering.md) — how each feature type relates to temporal leakage risk
 - [sampling-splitting.md](sampling-splitting.md) — time-based splitting to prevent cross-boundary leakage
 - [null-imputation.md](null-imputation.md) — imputing on training rows only
-- [mssql-server: 17-temporal-tables.md](../../mssql-server/references/17-temporal-tables.md) — FOR SYSTEM_TIME AS OF for point-in-time features
-- [mssql-server: 02-syntax-dql.md](../../mssql-server/references/02-syntax-dql.md) — window function framing (ROWS vs RANGE, LAG vs LEAD)
 
 ---
 

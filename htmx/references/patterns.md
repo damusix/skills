@@ -704,7 +704,18 @@ document.body.addEventListener('htmx:configRequest', async function(event) {
 </div>
 ```
 
-**Stop polling:** Server responds with HTTP `286`.
+**Stop polling:** Server responds with HTTP `286`. Server-side example:
+
+```python
+@app.route('/job-status/<job_id>')
+def job_status(job_id):
+    job = get_job(job_id)
+    fragment = render_template('job_status.html', job=job)
+    if job.status in ('complete', 'failed'):
+        # HTTP 286 tells HTMX to stop polling
+        return fragment, 286
+    return fragment, 200
+```
 
 ### Load Polling (Server-Controlled)
 

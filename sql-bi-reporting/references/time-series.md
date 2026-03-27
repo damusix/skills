@@ -213,7 +213,8 @@ A permanent date dimension table provides human-readable attributes (day name, m
         SUM(O.TotalAmount) AS Revenue
     FROM dbo.Calendar C
     LEFT JOIN Sales.Orders O
-        ON CAST(O.OrderDate AS DATE) = C.FullDate
+        ON O.OrderDate >= C.FullDate
+       AND O.OrderDate <  DATEADD(day, 1, C.FullDate)
     WHERE C.Year = 2024
     GROUP BY C.Year, C.Month, C.MonthName
     ORDER BY C.Month;
@@ -242,7 +243,8 @@ LEFT JOIN from a complete time spine to sparse data, substituting zero or NULL f
         COUNT(O.OrderID)              AS OrderCount
     FROM dbo.Calendar C
     LEFT JOIN Sales.Orders O
-        ON CAST(O.OrderDate AS DATE) = C.FullDate
+        ON O.OrderDate >= C.FullDate
+       AND O.OrderDate <  DATEADD(day, 1, C.FullDate)
     WHERE C.FullDate >= '2024-01-01'
       AND C.FullDate <  '2025-01-01'
     GROUP BY C.FullDate
@@ -424,7 +426,9 @@ Retail calendars divide each quarter into periods of 4 weeks, 4 weeks, and 5 wee
         C.FiscalQuarter,
         SUM(O.TotalAmount) AS Revenue
     FROM dbo.Calendar C
-    JOIN Sales.Orders O ON CAST(O.OrderDate AS DATE) = C.FullDate
+    JOIN Sales.Orders O
+        ON O.OrderDate >= C.FullDate
+       AND O.OrderDate <  DATEADD(day, 1, C.FullDate)
     GROUP BY C.FiscalYear, C.FiscalQuarter
     ORDER BY C.FiscalYear, C.FiscalQuarter;
 

@@ -1,12 +1,10 @@
 ---
 name: sql-server-performance
-description: "Use when diagnosing slow T-SQL queries, tuning indexes, reading execution plans, fixing parameter sniffing, optimizing batch operations, reducing transaction log bloat, troubleshooting locking and blocking, configuring tempdb, or when a query that used to be fast is now slow. Also use when writing high-throughput INSERT/UPDATE/DELETE operations, implementing minimal logging, designing covering indexes, or analyzing wait statistics."
+description: "Diagnoses and optimizes SQL Server database performance. Use when diagnosing slow T-SQL queries, tuning indexes, reading execution plans, fixing parameter sniffing, optimizing batch operations, reducing transaction log bloat, troubleshooting locking and blocking, configuring tempdb, or when a query that used to be fast is now slow. Also use when writing high-throughput INSERT/UPDATE/DELETE operations, implementing minimal logging, designing covering indexes, or analyzing wait statistics."
 ---
 
 # SQL Server Performance
 
-
-A methodology for diagnosing and fixing T-SQL performance problems. This skill covers the runtime side — making queries fast, understanding why they're slow, and writing high-throughput operations.
 
 ## When to Use
 
