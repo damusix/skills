@@ -1,1 +1,14 @@
 tmp
+tile.json
+evals/
+evals*/
+.agents
+.claude
+.codex
+.cursor
+.gemini
+.github
+.tessl
+.vscode
+.mcp.json
+tessl.json
