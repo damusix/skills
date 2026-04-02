@@ -27,15 +27,15 @@ Run directly:
 
 ## Critical Rules
 
-1. **Always use `zx/core`** — import from `zx/core` (the lite bundle), never bare `zx`. This avoids the heavy CLI wrapper and keeps scripts lean and embeddable.
-2. **Template literals auto-escape** — interpolated values in `` $`...` `` are automatically shell-quoted. Never manually quote interpolated variables: `` $`echo ${userInput}` `` is safe, `` $`echo "${userInput}"` `` double-quotes and may break.
-3. **Arrays expand correctly** — `` $`cmd ${arrayOfArgs}` `` expands each element as a separate quoted argument. Use this for flags, file lists, etc.
-4. **Non-zero exits throw** — by default, a failed command throws `ProcessOutput` as an error. Use `nothrow` option or `.nothrow()` to suppress when you expect failures (e.g., `grep` returning no matches).
-5. **Use `within()` for isolation** — `within()` creates an async scope with its own `$.cwd`, `$.env`, and other settings. Essential for parallel tasks that need different working directories.
-6. **Pipe with `.pipe()`** — use `` $`cmd1`.pipe($`cmd2`) `` instead of shell pipes. This keeps each process managed by zx.
-7. **Prefer zx builtins over shell commands** — use `glob()` instead of `find`, `fs` instead of `cat`/`cp`/`mv`, `fetch()` instead of `curl`. These are cross-platform and return proper JS types.
-8. **`cd()` is global** — `cd()` changes `$.cwd` for ALL subsequent commands. Use `within()` or `$({cwd: '/path'})` for scoped directory changes.
-9. **Scripts must be `.mjs`** — use `.mjs` extension for top-level `await` support without bundler config.
+1. **Always use `zx/core`** — never bare `zx`. Avoids the heavy CLI wrapper.
+2. **Template literals auto-escape** — `` $`echo ${userInput}` `` is safe. Never manually quote interpolated variables.
+3. **Arrays expand correctly** — `` $`cmd ${arrayOfArgs}` `` expands each element as a separate quoted argument.
+4. **Non-zero exits throw** — use `.nothrow()` to suppress when you expect failures (e.g., `grep` with no matches).
+5. **`within()` for isolation** — creates an async scope with its own `$.cwd` and `$.env`. Essential for parallel tasks.
+6. **Pipe with `.pipe()`** — use `` $`cmd1`.pipe($`cmd2`) `` instead of shell `|`.
+7. **Prefer zx builtins** — `glob()` over `find`, `fs` over `cat`/`cp`/`mv`, `fetch()` over `curl`.
+8. **`cd()` is global** — use `within()` or `$({cwd: '/path'})` for scoped directory changes.
+9. **Scripts must be `.mjs`** — for top-level `await` support without bundler config.
 
 ## Reference Map
 
@@ -95,11 +95,10 @@ For parallel operations, use `Promise.allSettled()` to handle partial failures:
 ## Conventions for Generated Scripts
 
 1. **Shebang line**: Always include `#!/usr/bin/env npx zx` as the first line
-2. **Verbose off**: Always set `$.verbose = false` before main logic to suppress command echoing
-3. **Error handling**: Always use the `main().catch()` pattern — wrap logic in `async function main()`, then call `main().catch(err => { console.error(chalk.red(err.message)); process.exit(1); })`
-3. **Output colors**: Use `chalk.green()` for success, `chalk.red()` for errors, `chalk.yellow()` for warnings, and `chalk.dim()` for secondary/per-item info (e.g., `echo(chalk.dim(\`  Processing ${file}...\`))`)
-4. **Progress**: Use `spinner()` for long-running operations in interactive contexts
-5. **Arguments**: Use `argv` (pre-parsed `minimist`) for CLI argument handling
-6. **Temp files**: Use `tmpdir()` and `tmpfile()` — they auto-clean on exit
-7. **Parallelism**: Use `Promise.all()` with `within()` for parallel operations that need isolation
-8. **Process piping**: Always use `` $`cmd1`.pipe($`cmd2`) `` for chaining processes — never use shell `|` inside template literals
+2. **Verbose off**: Set `$.verbose = false` before main logic to suppress command echoing
+3. **Error handling**: Use the `main().catch()` pattern — wrap logic in `async function main()`, then call `main().catch(err => { console.error(chalk.red(err.message)); process.exit(1); })`
+4. **Output colors**: Use `chalk.green()` for success, `chalk.red()` for errors, `chalk.yellow()` for warnings, `chalk.dim()` for secondary info
+5. **Progress**: Use `spinner()` for long-running operations in interactive contexts
+6. **Arguments**: Use `argv` (pre-parsed `minimist`) for CLI argument handling
+7. **Temp files**: Use `tmpdir()` and `tmpfile()` — they auto-clean on exit
+8. **Parallelism**: Use `Promise.all()` with `within()` for parallel operations that need isolation

@@ -27,7 +27,7 @@ Tables become an implementation detail — restructure them freely as long as vi
 
 ## Custom Type Systems
 
-Never use bare built-in types (`VARCHAR`, `INT`, `DATETIME`, `BIT`) for columns. Instead, define a catalog of **named type aliases** that form a consistent, semantic layer of meaning across the entire schema:
+Never use bare built-in types (`VARCHAR`, `INT`, `DATETIME`, `BIT`) for columns. Define **named type aliases** that form a semantic layer across the schema:
 
     CREATE TYPE Email FROM VARCHAR(100) NOT NULL;
     CREATE TYPE ApiKey FROM VARCHAR(128) NOT NULL;
@@ -35,17 +35,11 @@ Never use bare built-in types (`VARCHAR`, `INT`, `DATETIME`, `BIT`) for columns.
     CREATE TYPE _Timestamp FROM DATETIME2 NOT NULL;
     CREATE TYPE _Bool FROM BIT NOT NULL;
 
-Every column uses a named type. `Email` instead of `VARCHAR(100)`. `_Timestamp` instead of `DATETIME2`. `_Bool` instead of `BIT`.
+Every column uses a named type — `Email` instead of `VARCHAR(100)`, `_Timestamp` instead of `DATETIME2`.
 
-**Consistency.** Change the type definition once, not per-table.
+**NOT NULL by default.** Nullable only with an explicit business reason.
 
-**Semantic inference.** `ApiKey` tells you what the data *is*; `VARCHAR(128)` tells you nothing. The schema becomes self-documenting and queryable — find every API key by searching for columns typed `ApiKey`.
-
-**NOT NULL by default.** Define custom types as `NOT NULL`. Nullable only with an explicit business reason — optional is a deliberate design choice, not the default.
-
-**Organize types by domain:** group them into categories (identity, web/auth, civic, financial, generic primitives) and maintain a central manifest (YAML or similar) as the source of truth. Types will be unique per system — a property management app will have `PartyNo`, `EntrataID`, `LeaseNo`; a financial app will have `AccountNo`, `TransactionNo`, `RoutingNumber`. The pattern is universal; the specific types are yours to define.
-
-**Default conventions:** document a standard default for each type in your manifest — `_Timestamp` → `SYSDATETIME()`, `_Bool` → `0`, `DbUserID` → `DATABASE_PRINCIPAL_ID()`. Apply these as column-level `DEFAULT` constraints consistently so every column of a given type gets the same default.
+**Organize types by domain** and maintain a central manifest (YAML or similar) as the source of truth. Document a standard default for each type (`_Timestamp` → `SYSDATETIME()`, `_Bool` → `0`, `DbUserID` → `DATABASE_PRINCIPAL_ID()`) and apply as column-level `DEFAULT` constraints consistently.
 
 ## Transaction Hierarchy
 
@@ -170,7 +164,7 @@ For the full security model — user creation, role membership, granular permiss
 
 ## Relational Queues
 
-Tables that carry queue semantics alongside relational data — a notification is both a domain record and a work item. Queue columns (`Status`, `Step`, `AttemptNum`, `Response`, `Error`, `StartedAt`, `Duration`, `ScheduledFor`, `UpdatedAt`) track the lifecycle of the work, distinct from the record's own timestamps. `Step` tracks progress through multi-step jobs so workers can resume on retry. A shared `QueueStatus` reference table defines the state vocabulary. Workers claim items via a `Next_` procedure (atomic SELECT-then-UPDATE with `READPAST` for concurrent consumers, max attempts from `AppSettings` with sane defaults) and report results via a `Modify_` procedure (optimistic concurrency, state machine enforcement, step tracking).
+Tables that carry queue semantics alongside relational data. Queue columns (`Status`, `Step`, `AttemptNum`, `Response`, `Error`, `StartedAt`, `Duration`, `ScheduledFor`, `UpdatedAt`) track work lifecycle. Workers claim items via a `Next_` procedure (atomic SELECT-then-UPDATE with `READPAST` for concurrent consumers) and report results via a `Modify_` procedure (optimistic concurrency, state machine enforcement, step tracking).
 
 For queue table shapes, state classification functions, the Next/Modify procedure patterns, and queues as base/subtypes — read [Relational Queues](references/relational-queues.md).
 
@@ -240,7 +234,7 @@ This ensures that foreign key constraints referencing the table are immediately 
 
 ## Application Settings
 
-A centralized control table for application-wide configuration — max retry attempts, feature flags, service endpoints, batch sizes. Rather than hardcoding values in procedures or creating per-feature settings tables, a single `AppSettings` table provides a queryable, auditable home for all runtime parameters:
+A centralized `AppSettings` table for runtime configuration (retry limits, feature flags, endpoints, batch sizes):
 
     CREATE TABLE AppSettings (
         Param Name PRIMARY KEY,
@@ -250,9 +244,9 @@ A centralized control table for application-wide configuration — max retry att
         ValStr Description DEFAULT ''
     );
 
-Each row is a named parameter using dot-separated namespaces (`notification.maxAttempts`, `smtp.host`, `feature.emailEnabled`). Procedures read from the typed column directly, always wrapped in `COALESCE` with a sane default so the system works even if a setting hasn't been configured.
+Rows use dot-separated namespaces (`notification.maxAttempts`, `smtp.host`). Procedures read from the typed column wrapped in `COALESCE` with a sane default.
 
-For the full pattern — table shape, seeding, reading in procedures, and naming conventions — read [Application Settings](references/application-settings.md).
+For the full pattern — read [Application Settings](references/application-settings.md).
 
 ## Normal Form Violations
 

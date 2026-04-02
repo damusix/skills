@@ -1,33 +1,30 @@
 ---
 name: mssql-server
-description: >
-  Writes, optimizes, and debugs T-SQL queries. Explains SQL Server internals,
-  troubleshoots performance issues, and guides database administration tasks
-  including backup/restore, high availability, security, and index design.
-  Use when the user asks about T-SQL syntax, SQL Server administration,
-  query performance, stored procedures, indexes, locking, transactions,
-  backup/restore, high availability, security, or any MSSQL-related
-  topic — even without saying "SQL Server" explicitly. Also trigger on
-  terms like SSMS, tempdb, bcp, sqlcmd, MSSQL, sp_executesql, NOLOCK,
-  columnstore, Hekaton, RCSI, param sniffing, or execution plan.
+description: "Writes, optimizes, and debugs T-SQL queries. Explains SQL Server internals, troubleshoots performance issues, and guides database administration tasks including backup/restore, high availability, security, and index design. Use when the user asks about T-SQL syntax, SQL Server administration, query performance, stored procedures, indexes, locking, transactions, backup/restore, high availability, security, or any MSSQL-related topic — even without saying 'SQL Server' explicitly. Also trigger on terms like SSMS, tempdb, bcp, sqlcmd, MSSQL, sp_executesql, NOLOCK, columnstore, Hekaton, RCSI, param sniffing, or execution plan."
 ---
 
 # MSSQL Server Skill
 
 ## How to use this skill
 
-When this skill triggers, follow this workflow:
-
 1. **Identify the topic** using the routing table below (keyword → file mapping).
 2. **Read the relevant reference file(s).** Never answer from memory alone when a reference file covers the topic.
-3. **For cross-cutting questions** (e.g., "optimize a stored proc with dynamic SQL and parameter sniffing"): identify ALL matching rows in the routing table and read each file. Check the "See Also" section in the first file for additional files to load. Synthesize across files and state which files you drew from.
-4. **For ambiguous keywords** that appear in multiple routing rows: read the "Disambiguation" column. When in doubt, load both files — a broader answer is better than a wrong routing.
-5. **Answer using the reference file content:** cite the specific section, include T-SQL examples, note version constraints with admonition blocks, and cite the source URL for non-obvious claims.
-6. **Response format:**
-    - Lead with the direct answer or recommended pattern (code first when applicable)
-    - Follow with caveats, gotchas, or version notes in admonition blocks
-    - End with source links for key claims
-    - Use headers matching the reference file sections so the user can trace the source
+3. **Cross-cutting questions** — identify ALL matching rows and read each file. Check "See Also" sections for additional files.
+4. **Ambiguous keywords** — read the "Disambiguation" column. When in doubt, load both files.
+5. **Response format:** Lead with code/pattern, follow with caveats in admonition blocks, end with source links.
+
+## Quick Examples
+
+    -- Basic filtered query with pagination
+    SELECT CustomerName, Email
+    FROM Customer
+    WHERE Status = 'Active'
+    ORDER BY CustomerName
+    OFFSET 0 ROWS FETCH NEXT 25 ROWS ONLY;
+
+    -- Create a covering index
+    CREATE NONCLUSTERED INDEX IX_Customer_Status
+    ON Customer(Status) INCLUDE (CustomerName, Email);
 
 ---
 
