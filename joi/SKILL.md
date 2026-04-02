@@ -36,6 +36,29 @@ description: "Use when building joi schemas, validating input data, defining cus
 4. **Add conditionals** - Use `.when()` for dynamic schemas; see [conditionals](reference/conditionals.md)
 5. **Customize errors** - Override messages via `.messages()` or `.error()`; see [errors](reference/errors.md)
 
+## Common Patterns
+
+### Conditional validation with `.when()`
+
+    const schema = Joi.object({
+        type: Joi.string().valid('email', 'sms').required(),
+        address: Joi.when('type', {
+            is: 'email',
+            then: Joi.string().email().required(),
+            otherwise: Joi.string().pattern(/^\+?[1-9]\d{1,14}$/).required()
+        })
+    });
+
+### Cross-field references with `Joi.ref()`
+
+    const schema = Joi.object({
+        password: Joi.string().min(8).required(),
+        confirmPassword: Joi.string().valid(Joi.ref('password')).required()
+            .messages({ 'any.only': 'passwords must match' }),
+        startDate: Joi.date().required(),
+        endDate: Joi.date().greater(Joi.ref('startDate')).required()
+    });
+
 
 ## Key Patterns
 
