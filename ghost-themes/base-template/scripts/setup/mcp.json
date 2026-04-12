@@ -1,0 +1,14 @@
+{
+    "mcpServers": {
+        "ghost": {
+            "command": "npx",
+            "args": ["@damusix/ghost-mcp"],
+            "env": {
+                "GHOST_URL": "http://localhost:2368",
+                "GHOST_ADMIN_API_KEY": "",
+                "GHOST_API_MODE": "admin",
+                "GHOST_API_VERSION": "v6.0"
+            }
+        }
+    }
+}
