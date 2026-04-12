@@ -1,0 +1,11 @@
+{
+  "name": "alonso-skills/sql-ml-features",
+  "version": "0.1.0",
+  "private": false,
+  "summary": "Use when preparing data for machine learning from SQL Server — feature engineering in T-SQL, building training/test datasets, statistical aggregations for ML pipelines, sampling strategies, data normalization and encoding in SQL, writing queries that feed pandas or scikit-learn, exporting to Parquet or CSV for model training, or when a data scientist asks for a 'feature table' or 'training set' from a SQL Server database.",
+  "skills": {
+    "sql-ml-features": {
+      "path": "SKILL.md"
+    }
+  }
+}

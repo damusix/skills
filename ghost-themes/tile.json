@@ -1,0 +1,11 @@
+{
+  "name": "alonso-skills/ghost-theme",
+  "version": "0.1.0",
+  "private": false,
+  "summary": "Build, customize, and deploy Ghost CMS themes. Use this skill whenever the user mentions Ghost themes, Ghost CMS, Handlebars templates (.hbs files), Ghost Admin, Ghost membership/subscription integration, Ghost custom settings, or Ghost content API — even if they don't say \"theme\" explicitly. Trigger on: building a blog theme, creating a Ghost site, editing .hbs templates, adding member-only content, Ghost hero sections, Ghost routing (routes.yaml), Ghost image optimization, Ghost dark mode, Ghost search, Ghost deploy, gscan validation, Ghost JSON-LD/SEO, or any mention of {{ghost_head}}, {{ghost_foot}}, {{#foreach}}, {{#get}}, {{img_url}}, {{asset}}, @custom, @member, or Portal. Also use when the user has an existing Ghost theme they want to modify, extend, or debug — not just for new themes.",
+  "skills": {
+    "ghost-theme": {
+      "path": "SKILL.md"
+    }
+  }
+}

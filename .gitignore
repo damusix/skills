@@ -1,5 +1,4 @@
 tmp
-tile.json
 evals/
 evals*/
 .agents
@@ -7,11 +6,7 @@ evals*/
 .codex
 .cursor
 .gemini
-.github
-.tessl
 .vscode
 .mcp.json
-tessl.json
-
 !ghost-themes/base-template/.github
 !ghost-themes/base-template/.mcp.json

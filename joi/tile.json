@@ -1,0 +1,11 @@
+{
+  "name": "alonso-skills/joi",
+  "version": "0.1.0",
+  "private": false,
+  "summary": "Use when building joi schemas, validating input data, defining custom types, conditional validation with .when(), cross-field references, custom error messages, or writing joi extensions. Standalone package that integrates with the @hapi ecosystem.",
+  "skills": {
+    "joi": {
+      "path": "SKILL.md"
+    }
+  }
+}

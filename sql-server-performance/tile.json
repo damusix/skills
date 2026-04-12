@@ -1,0 +1,11 @@
+{
+  "name": "alonso-skills/sql-server-performance",
+  "version": "0.1.0",
+  "private": false,
+  "summary": "Diagnoses and optimizes SQL Server database performance. Use when diagnosing slow T-SQL queries, tuning indexes, reading execution plans, fixing parameter sniffing, optimizing batch operations, reducing transaction log bloat, troubleshooting locking and blocking, configuring tempdb, or when a query that used to be fast is now slow. Also use when writing high-throughput INSERT/UPDATE/DELETE operations, implementing minimal logging, designing covering indexes, or analyzing wait statistics.",
+  "skills": {
+    "sql-server-performance": {
+      "path": "SKILL.md"
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "alonso-skills/sql-bi-reporting",
+  "version": "0.1.0",
+  "private": false,
+  "summary": "Use when writing T-SQL for business intelligence, analytics, or reporting. Includes building summary reports with GROUPING SETS, ROLLUP, and CUBE, writing time-series queries with date bucketing, creating pivot/unpivot transformations, generating tally/numbers tables for gap-filling, building running totals and moving averages with window functions, writing year-over-year comparisons, designing materialized views for dashboards, or producing CSV/JSON exports from SQL Server.",
+  "skills": {
+    "sql-bi-reporting": {
+      "path": "SKILL.md"
+    }
+  }
+}

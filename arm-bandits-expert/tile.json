@@ -1,0 +1,11 @@
+{
+  "name": "alonso-skills/arm-bandits-expert",
+  "version": "0.1.0",
+  "private": false,
+  "summary": "Implements, evaluates, and deploys multi-armed bandit algorithms — including Thompson Sampling, UCB, epsilon-greedy, LinUCB, EXP3, and contextual bandits. Covers algorithm selection, experiment harnesses, offline evaluation (IPS, Doubly Robust), infrastructure patterns, and correctness verification. Use when the user asks about multi-armed bandits, exploration-exploitation tradeoffs, adaptive experiments, A/B testing alternatives, online optimization, bandit-based recommendation or personalization systems, or contextual bandits.",
+  "skills": {
+    "arm-bandits-expert": {
+      "path": "SKILL.md"
+    }
+  }
+}

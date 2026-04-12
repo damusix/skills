@@ -1,0 +1,11 @@
+{
+  "name": "alonso-skills/google-zx-scripting",
+  "version": "0.1.0",
+  "private": false,
+  "summary": "Writes and executes JavaScript-based shell scripts using Google's zx library. Use when writing shell scripts, automation, build tools, file processing, CLI tools, deployment scripts, data pipelines, or batch operations. Also covers piping, streams, parallel execution, retries, cross-platform scripting, built-in fs utilities, and minimist argument parsing.",
+  "skills": {
+    "google-zx-scripting": {
+      "path": "SKILL.md"
+    }
+  }
+}

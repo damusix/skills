@@ -1,0 +1,11 @@
+{
+  "name": "alonso-skills/sql-writing-guidelines",
+  "version": "0.1.0",
+  "private": false,
+  "summary": "Use when writing or reviewing T-SQL, creating stored procedures, designing table schemas, writing views, building migrations, defining custom types, or architecting a SQL Server application database. Also use when writing RAISERROR patterns, CHECK constraints with scalar functions, base/subtype table hierarchies, composite key designs, role-scoped views with row-level security, or idempotent DDL scripts. If you are touching SQL for an application database, use this skill.",
+  "skills": {
+    "sql-writing-guidelines": {
+      "path": "SKILL.md"
+    }
+  }
+}

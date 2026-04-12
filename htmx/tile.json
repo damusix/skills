@@ -1,0 +1,11 @@
+{
+  "name": "alonso-skills/htmx",
+  "version": "0.1.0",
+  "private": false,
+  "summary": "Implements HTMX interactions, configures swap behaviors, debugs hx-* requests, and builds hypermedia-driven UI components. Use when tasks involve hx-* attributes, HTMX AJAX requests, swap strategies, server-sent events, WebSockets, or hypermedia-driven UIs.",
+  "skills": {
+    "htmx": {
+      "path": "SKILL.md"
+    }
+  }
+}
