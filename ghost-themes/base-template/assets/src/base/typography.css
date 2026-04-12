@@ -1,0 +1,14 @@
+h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-heading);
+    line-height: 1.2;
+    margin: 0 0 0.5em;
+}
+
+a {
+    color: var(--ghost-accent-color);
+    text-decoration: none;
+}
+
+a:hover {
+    text-decoration: underline;
+}

@@ -1,0 +1,25 @@
+{{!< default}}
+
+{{#author}}
+<header class="author-header container">
+    {{#if profile_image}}
+        <img class="author-avatar" src="{{img_url profile_image size="m"}}" alt="{{name}}">
+    {{/if}}
+    <h1 class="author-name">{{name}}</h1>
+    {{#if bio}}
+        <p class="author-bio">{{bio}}</p>
+    {{/if}}
+    <div class="author-meta">
+        {{#if location}}<span class="author-location">{{location}}</span>{{/if}}
+        {{#if website}}<a class="author-website" href="{{website}}">{{t "Website"}}</a>{{/if}}
+    </div>
+</header>
+{{/author}}
+
+<div class="post-feed container">
+    {{#foreach posts}}
+        {{> loop-card}}
+    {{/foreach}}
+</div>
+
+{{pagination}}

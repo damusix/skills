@@ -1,0 +1,22 @@
+{{#if @site.members_enabled}}
+    {{#unless @member}}
+        <div class="members-cta">
+            <form class="members-cta-form" data-members-form>
+                <input
+                    class="members-cta-email"
+                    type="email"
+                    data-members-email
+                    placeholder="{{t "Your email address"}}"
+                    required="true"
+                    autocomplete="off"
+                >
+                <button class="members-cta-button" type="submit">
+                    <span class="members-cta-default">{{t "Subscribe"}}</span>
+                    <span class="members-cta-loading">{{t "Sending..."}}</span>
+                    <span class="members-cta-success">{{t "Email sent — check your inbox"}}</span>
+                </button>
+            </form>
+            <p class="members-cta-error" data-members-error></p>
+        </div>
+    {{/unless}}
+{{/if}}

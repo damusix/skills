@@ -12,3 +12,6 @@ evals*/
 .vscode
 .mcp.json
 tessl.json
+
+!ghost-themes/base-template/.github
+!ghost-themes/base-template/.mcp.json

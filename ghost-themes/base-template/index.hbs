@@ -1,0 +1,25 @@
+{{!< default}}
+
+{{#is "home"}}
+<section class="hero">
+    <div class="hero-inner container">
+        <h1 class="hero-title">{{@site.title}}</h1>
+        {{#if @site.description}}
+            <p class="hero-description">{{@site.description}}</p>
+        {{/if}}
+        {{#if @site.members_enabled}}
+            {{#unless @member}}
+                {{> members-cta}}
+            {{/unless}}
+        {{/if}}
+    </div>
+</section>
+{{/is}}
+
+<div class="post-feed container">
+    {{#foreach posts}}
+        {{> loop-card}}
+    {{/foreach}}
+</div>
+
+{{pagination}}

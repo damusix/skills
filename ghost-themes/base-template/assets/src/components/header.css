@@ -1,0 +1,51 @@
+.site-header {
+    padding: 1.5rem 0;
+    border-bottom: 1px solid var(--color-border);
+}
+
+.site-header-inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1.5rem;
+}
+
+.site-logo a {
+    display: flex;
+    align-items: center;
+    color: var(--color-text);
+    font-weight: 700;
+    font-size: 1.25rem;
+}
+
+.site-logo img {
+    max-height: 40px;
+    width: auto;
+}
+
+.site-nav .nav {
+    display: flex;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    gap: 1.5rem;
+}
+
+.site-nav .nav a {
+    color: var(--color-text);
+    font-size: 0.9rem;
+}
+
+.site-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+.search-button {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--color-text);
+    font-size: 0.9rem;
+}

@@ -1,0 +1,30 @@
+.author-header {
+    text-align: center;
+    padding: 3rem 0;
+}
+
+.author-avatar {
+    width: 100px;
+    height: 100px;
+    border-radius: 50%;
+    object-fit: cover;
+    margin-bottom: 1rem;
+}
+
+.author-name {
+    font-size: 2rem;
+}
+
+.author-bio {
+    color: var(--color-text-secondary);
+    max-width: 500px;
+    margin: 0 auto 1rem;
+}
+
+.author-meta {
+    font-size: 0.9rem;
+    color: var(--color-text-secondary);
+    display: flex;
+    justify-content: center;
+    gap: 1rem;
+}

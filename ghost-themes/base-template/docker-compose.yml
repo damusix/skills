@@ -1,0 +1,17 @@
+services:
+  ghost:
+    image: ghost:5
+    ports:
+      - "2368:2368"
+    environment:
+      NODE_ENV: development
+      url: http://localhost:2368
+      database__client: sqlite3
+      database__connection__filename: /var/lib/ghost/content/data/ghost-dev.db
+    volumes:
+      - ghost-data:/var/lib/ghost/content
+      - ./:/var/lib/ghost/content/themes/dev-theme
+    restart: unless-stopped
+
+volumes:
+  ghost-data:

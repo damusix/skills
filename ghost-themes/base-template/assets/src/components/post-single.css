@@ -1,0 +1,86 @@
+.post-header, .page-header {
+    padding: 3rem 0 1.5rem;
+    max-width: var(--container-narrow);
+    margin: 0 auto;
+}
+
+.post-tag {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    display: inline-block;
+    margin-bottom: 0.5rem;
+}
+
+.post-title, .page-title {
+    font-size: 2.5rem;
+    margin-bottom: 0.75rem;
+}
+
+.post-meta {
+    color: var(--color-text-secondary);
+    font-size: 0.9rem;
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.post-hero, .page-hero {
+    margin-bottom: 2rem;
+}
+
+.post-hero-image, .page-hero-image {
+    width: 100%;
+    border-radius: 4px;
+}
+
+.post-content, .page-content {
+    max-width: var(--container-narrow);
+    margin: 0 auto;
+    padding-bottom: 2rem;
+}
+
+/* Ghost content card styles */
+.post-content .kg-width-wide {
+    max-width: calc(var(--container-narrow) + 200px);
+    margin-left: calc(50% - 50vw + (50vw - var(--container-narrow) / 2));
+}
+
+.post-content .kg-width-full {
+    max-width: 100vw;
+    margin-left: calc(50% - 50vw);
+    margin-right: calc(50% - 50vw);
+}
+
+.post-content .kg-image {
+    max-width: 100%;
+    height: auto;
+}
+
+.post-content .kg-embed-card {
+    position: relative;
+    padding-top: 56.25%;
+}
+
+.post-content .kg-embed-card iframe {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+}
+
+/* Social share */
+.social-share {
+    display: flex;
+    gap: 1rem;
+    padding: 1.5rem 0;
+    max-width: var(--container-narrow);
+    margin: 0 auto;
+    border-top: 1px solid var(--color-border);
+}
+
+.social-share-link {
+    font-size: 0.9rem;
+    color: var(--color-text-secondary);
+}

@@ -1,0 +1,43 @@
+.members-cta {
+    max-width: 440px;
+    margin: 0 auto;
+}
+
+.members-cta-form {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.members-cta-email {
+    flex: 1;
+    padding: 0.6rem 1rem;
+    border: 1px solid var(--color-border);
+    border-radius: 4px;
+    font-size: 0.95rem;
+}
+
+.members-cta-button {
+    padding: 0.6rem 1.5rem;
+    background: var(--ghost-accent-color);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.95rem;
+}
+
+.members-cta-loading,
+.members-cta-success {
+    display: none;
+}
+
+.loading .members-cta-default { display: none; }
+.loading .members-cta-loading { display: inline; }
+.success .members-cta-default { display: none; }
+.success .members-cta-success { display: inline; }
+
+.members-cta-error {
+    color: #e25440;
+    font-size: 0.85rem;
+    margin: 0.5rem 0 0;
+}

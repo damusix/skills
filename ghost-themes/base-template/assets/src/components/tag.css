@@ -1,0 +1,20 @@
+.tag-header {
+    text-align: center;
+    padding: 3rem 0;
+}
+
+.tag-image {
+    max-height: 200px;
+    border-radius: 4px;
+    margin-bottom: 1rem;
+}
+
+.tag-name {
+    font-size: 2rem;
+}
+
+.tag-description {
+    color: var(--color-text-secondary);
+    max-width: 500px;
+    margin: 0 auto;
+}

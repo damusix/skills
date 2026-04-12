@@ -1,0 +1,11 @@
+.container {
+    max-width: var(--container-width);
+    margin: 0 auto;
+    padding: 0 1.5rem;
+}
+
+.container-wide {
+    max-width: calc(var(--container-width) + 200px);
+    margin: 0 auto;
+    padding: 0 1.5rem;
+}

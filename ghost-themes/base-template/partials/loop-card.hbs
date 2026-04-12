@@ -1,0 +1,40 @@
+<article class="post-card {{post_class}}{{#if featured}} featured{{/if}}">
+    {{#if feature_image}}
+        <a class="post-card-image-link" href="{{url}}">
+            <img
+                class="post-card-image"
+                srcset="
+                    {{img_url feature_image size="s"}} 400w,
+                    {{img_url feature_image size="m"}} 750w
+                "
+                sizes="(max-width: 600px) 400px, 750px"
+                src="{{img_url feature_image size="m"}}"
+                alt="{{#if feature_image_alt}}{{feature_image_alt}}{{else}}{{title}}{{/if}}"
+                loading="lazy"
+            >
+        </a>
+    {{/if}}
+    <div class="post-card-content">
+        {{#if primary_tag}}
+            <a class="post-card-tag" href="{{primary_tag.url}}">{{primary_tag.name}}</a>
+        {{/if}}
+        <h2 class="post-card-title">
+            <a href="{{url}}">{{title}}</a>
+        </h2>
+        {{#if excerpt}}
+            <p class="post-card-excerpt">{{excerpt words="30"}}</p>
+        {{/if}}
+        <div class="post-card-meta">
+            <span class="post-card-author">
+                {{#primary_author}}<a href="{{url}}">{{name}}</a>{{/primary_author}}
+            </span>
+            <time class="post-card-date" datetime="{{date format="YYYY-MM-DD"}}">
+                {{date format="DD MMM YYYY"}}
+            </time>
+            <span class="post-card-reading-time">{{reading_time}}</span>
+        </div>
+        {{#has visibility="paid"}}
+            <span class="post-card-badge">{{t "Members only"}}</span>
+        {{/has}}
+    </div>
+</article>

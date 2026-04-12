@@ -1,0 +1,81 @@
+{
+    "name": "my-ghost-theme",
+    "description": "A custom Ghost theme",
+    "version": "1.0.0",
+    "license": "MIT",
+    "author": {
+        "email": "author@example.com"
+    },
+    "engines": {
+        "ghost": ">=5.0.0"
+    },
+    "scripts": {
+        "dev": "bun run scripts/build.ts --watch",
+        "build": "bun run scripts/build.ts",
+        "typecheck": "tsc --noEmit",
+        "lint": "eslint .",
+        "test:visual": "bun run scripts/test-screenshots.ts",
+        "zip": "bash scripts/zip.sh"
+    },
+    "devDependencies": {
+        "eslint": "^9.0.0",
+        "postcss": "^8.4.47",
+        "postcss-import": "^16.1.0",
+        "typescript": "^5.7.0",
+        "typescript-eslint": "^8.0.0"
+    },
+    "config": {
+        "posts_per_page": 25,
+        "image_sizes": {
+            "xs": { "width": 150 },
+            "s": { "width": 400 },
+            "m": { "width": 750 },
+            "l": { "width": 960 },
+            "xl": { "width": 1140 },
+            "xxl": { "width": 1920 }
+        },
+        "card_assets": true,
+        "custom": {
+            "navigation_layout": {
+                "type": "select",
+                "options": ["Logo on the left", "Logo in the middle"],
+                "default": "Logo on the left"
+            },
+            "hero_title": {
+                "type": "text",
+                "default": "",
+                "description": "Custom homepage hero title (defaults to site title)",
+                "group": "homepage"
+            },
+            "hero_description": {
+                "type": "text",
+                "default": "",
+                "description": "Custom homepage hero description",
+                "group": "homepage"
+            },
+            "show_featured_posts": {
+                "type": "boolean",
+                "default": true,
+                "description": "Show featured posts section on homepage",
+                "group": "homepage"
+            },
+            "feed_layout": {
+                "type": "select",
+                "options": ["Grid", "List"],
+                "default": "Grid",
+                "group": "homepage"
+            },
+            "accent_color_override": {
+                "type": "color",
+                "default": "#FF5500",
+                "description": "Button and link accent color"
+            },
+            "cta_text": {
+                "type": "text",
+                "default": "Subscribe to get full access",
+                "description": "Call-to-action text for members",
+                "group": "post"
+            }
+        }
+    }
+}

@@ -1,0 +1,39 @@
+{{!--
+    Custom Article JSON-LD structured data partial.
+
+    Note: Ghost automatically emits JSON-LD via {{ghost_head}} for all contexts
+    (Article, WebSite, Series, Person). This partial is provided as a reference
+    for adding supplemental structured data or overriding specific fields.
+
+    Use inside {{#post}} block in post.hbs or page.hbs:
+        {{> structured-data}}
+--}}
+<script type="application/ld+json">
+{
+    "@context": "https://schema.org",
+    "@type": "Article",
+    "headline": "{{title}}",
+    "url": "{{url absolute="true"}}",
+    "datePublished": "{{date published_at format="YYYY-MM-DDTHH:mm:ssZ"}}",
+    "dateModified": "{{date updated_at format="YYYY-MM-DDTHH:mm:ssZ"}}",
+    {{#if feature_image}}
+    "image": "{{img_url feature_image size="xl" absolute="true"}}",
+    {{/if}}
+    "description": "{{excerpt words="50"}}",
+    "author": {
+        "@type": "Person",
+        "name": "{{primary_author.name}}",
+        "url": "{{primary_author.url absolute="true"}}"
+    },
+    "publisher": {
+        "@type": "Organization",
+        "name": "{{@site.title}}",
+        "url": "{{@site.url}}"{{#if @site.logo}},
+        "logo": {
+            "@type": "ImageObject",
+            "url": "{{img_url @site.logo absolute="true"}}"
+        }{{/if}}
+    },
+    "mainEntityOfPage": "{{url absolute="true"}}"
+}
+</script>

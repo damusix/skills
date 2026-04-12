@@ -1,0 +1,7 @@
+@media (max-width: 768px) {
+    .hero-title { font-size: 2rem; }
+    .post-title, .page-title { font-size: 1.75rem; }
+    .post-feed { grid-template-columns: 1fr; }
+    .site-header-inner { flex-wrap: wrap; }
+    .members-cta-form { flex-direction: column; }
+}

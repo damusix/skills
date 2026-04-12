@@ -1,0 +1,21 @@
+{{!< default}}
+
+{{#tag}}
+<header class="tag-header container">
+    {{#if feature_image}}
+        <img class="tag-image" src="{{img_url feature_image size="l"}}" alt="{{name}}">
+    {{/if}}
+    <h1 class="tag-name">{{name}}</h1>
+    {{#if description}}
+        <p class="tag-description">{{description}}</p>
+    {{/if}}
+</header>
+{{/tag}}
+
+<div class="post-feed container">
+    {{#foreach posts}}
+        {{> loop-card}}
+    {{/foreach}}
+</div>
+
+{{pagination}}

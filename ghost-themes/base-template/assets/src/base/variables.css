@@ -1,0 +1,12 @@
+:root {
+    --ghost-accent-color: #FF5500;
+    --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+    --font-heading: var(--gh-font-heading, var(--font-body));
+    --font-body-custom: var(--gh-font-body, var(--font-body));
+    --color-text: #15171a;
+    --color-text-secondary: #738a94;
+    --color-border: #e5eff5;
+    --color-bg: #ffffff;
+    --container-width: 1200px;
+    --container-narrow: 720px;
+}
