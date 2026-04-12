@@ -80,6 +80,7 @@ Route validation pattern:
 | Error handling (Boom)    | [boom errors](reference/lifecycle/boom.md)                                                              |
 | Error filtering (Bounce) | [bounce utility](reference/lifecycle/bounce.md)                                                         |
 | WebSockets (nes)         | [overview](reference/websockets/overview.md), [subscriptions](reference/websockets/subscriptions.md), [client](reference/websockets/client.md) |
+| SSE (sse)                | [overview](reference/sse/overview.md), [subscriptions](reference/sse/subscriptions.md), [session](reference/sse/session.md), [replay](reference/sse/replay.md) |
 | Startup & shutdown       | [startup lifecycle](reference/server/startup-lifecycle.md)                                              |
 | Events                   | [events](reference/server/events.md)                                                                   |
 | Testing (server.inject)  | [network](reference/server/network.md)                                                                 |
