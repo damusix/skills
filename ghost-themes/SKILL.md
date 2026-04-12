@@ -36,10 +36,10 @@ The base template includes: all required HBS files, TypeScript + component CSS b
 
 After copying, update `"name"` in `package.json` to the new theme name.
 
-Then start the local Ghost instance and build:
+Then run the one-time setup script, which starts Ghost and moves dotfiles (`.mcp.json`, `.github/`) into place:
 
 ```bash
-    docker compose up -d
+    bash scripts/setup.sh
     bun run dev
 ```
 

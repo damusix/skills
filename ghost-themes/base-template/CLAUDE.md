@@ -89,9 +89,13 @@
 ├── routes.yaml              # Custom routing
 ├── tsconfig.json            # TypeScript config (type checking only)
 ├── scripts/
+│   ├── setup.sh             # One-time setup: starts Ghost, moves dotfiles into place
 │   ├── build.ts             # Bun build config
 │   ├── test-screenshots.ts  # Visual screenshot tests (Bun.WebView)
-│   └── zip.sh               # Build + package dist.zip for Ghost upload
+│   ├── zip.sh               # Build + package dist.zip for Ghost upload
+│   └── setup/
+│       ├── mcp.json         # → .mcp.json (ghost-mcp config)
+│       └── github/          # → .github/ (CI + deploy workflows)
 ├── locales/en.json          # i18n strings
 ├── partials/                # Reusable template fragments
 │   ├── header.hbs
