@@ -30,7 +30,7 @@ Context array composition (from `context.js`):
 
 ---
 
-## Global @site Object
+## Global `@site` Object
 
 Available in every context, no block expression needed.
 

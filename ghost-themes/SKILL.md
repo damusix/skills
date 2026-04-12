@@ -9,7 +9,7 @@ description: >-
   member-only content, Ghost hero sections, Ghost routing (routes.yaml), Ghost
   image optimization, Ghost dark mode, Ghost search, Ghost deploy, gscan
   validation, Ghost JSON-LD/SEO, or any mention of {{ghost_head}}, {{ghost_foot}},
-  {{#foreach}}, {{#get}}, {{img_url}}, {{asset}}, @custom, @member, or Portal.
+  {{#foreach}}, {{#get}}, {{img_url}}, {{asset}}, `@custom`, `@member`, or Portal.
   Also use when the user has an existing Ghost theme they want to modify, extend,
   or debug — not just for new themes.
 ---

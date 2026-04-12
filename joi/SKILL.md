@@ -1,6 +1,6 @@
 ---
 name: joi
-description: "Use when building joi schemas, validating input data, defining custom types, conditional validation with .when(), cross-field references, custom error messages, or writing joi extensions. Standalone package that integrates with the @hapi ecosystem."
+description: "Use when building joi schemas, validating input data, defining custom types, conditional validation with .when(), cross-field references, custom error messages, or writing joi extensions. Standalone package that integrates with the hapijs ecosystem."
 ---
 
 # Joi
@@ -8,7 +8,7 @@ description: "Use when building joi schemas, validating input data, defining cus
 
 ## Quick Start
 
-    const Joi = require('@hapi/joi');
+    const Joi = require('joi');
 
     const schema = Joi.object({
         name: Joi.string().min(1).max(100).required(),
