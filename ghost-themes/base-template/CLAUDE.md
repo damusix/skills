@@ -15,11 +15,12 @@
 
 ## Local Development
 
-- `docker compose up -d` starts a local Ghost instance at http://localhost:2368
+- Run `bash scripts/setup.sh` once after copying the template — starts Ghost and moves dotfiles (`.mcp.json`, `.github/`) into place
+- After setup, `docker compose up -d` starts Ghost at http://localhost:2368
 - The theme is bind-mounted into Ghost's themes directory — changes are live
 - Run `bun run dev` alongside for watch-mode builds
 - Ghost Admin is at http://localhost:2368/ghost/ — complete setup wizard on first run
-- The `.mcp.json` configures ghost-mcp for AI-driven testing — set `GHOST_ADMIN_API_KEY` after Ghost setup
+- `.mcp.json` configures ghost-mcp for AI-driven testing — set `GHOST_ADMIN_API_KEY` after Ghost setup
 
 
 ## Visual Testing
