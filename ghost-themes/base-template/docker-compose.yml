@@ -1,6 +1,6 @@
 services:
   ghost:
-    image: ghost:6
+    image: ghost:5
     ports:
       - "2368:2368"
     environment:

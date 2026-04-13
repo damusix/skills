@@ -893,7 +893,60 @@ The `{{{block "custom-meta-title"}}}` pattern uses Ghost's `{{block}}` / `{{cont
 ---
 
 
-## 11. Quick-Reference: Hero Pattern Decision Tree
+## 11. CSS Layout Variants via `data-*` Attributes
+
+A clean pattern for multi-layout heroes: write the `@custom` value as a `data-` attribute in Handlebars, then drive all layout logic from CSS. No `{{#match}}` conditionals in the template, no JS switching.
+
+**In the template:**
+
+    <section class="hero"
+        data-image-style="{{@custom.post_image_style}}"
+        data-feature-image="{{#if feature_image}}true{{else}}false{{/if}}">
+
+**In CSS:**
+
+    /* Background image fills the hero */
+    .hero[data-image-style="background"] {
+        min-height: 32rem;
+        padding: 4rem 2rem;
+
+        .hero__media {
+            position: absolute;
+            inset: 0;
+            z-index: 0;
+        }
+
+        .hero__media img { filter: brightness(0.65); }
+    }
+
+    /* Side-by-side layout at wider screens */
+    .hero[data-image-style="side"] {
+        @media (min-width: 48em) {
+            display: flex;
+            flex-direction: row;
+            gap: 2rem;
+        }
+    }
+
+    /* No image — collapse the media area entirely */
+    .hero[data-image-style="hidden"] .hero__media {
+        display: none;
+    }
+
+    /* Conditional text colour only when a feature image is present */
+    .hero[data-feature-image="true"][data-image-style="background"] .hero__title {
+        color: #fff;
+    }
+
+The `data-feature-image` boolean lets CSS conditionally apply light-text treatment without a second `{{#if}}` branch. The `@custom.post_image_style` options (`background`, `side`, `hidden`, `default`) map directly to the attribute selectors.
+
+This is preferable to `{{#match}}` blocks in the template when the variation is purely presentational — keep content/structure decisions in HBS, layout/visual decisions in CSS.
+
+
+---
+
+
+## 12. Quick-Reference: Hero Pattern Decision Tree
 
 
 Use this to choose the right pattern for a given requirement.

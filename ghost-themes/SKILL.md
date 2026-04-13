@@ -11,7 +11,10 @@ description: >-
   validation, Ghost JSON-LD/SEO, or any mention of {{ghost_head}}, {{ghost_foot}},
   {{#foreach}}, {{#get}}, {{img_url}}, {{asset}}, `@custom`, `@member`, or Portal.
   Also use when the user has an existing Ghost theme they want to modify, extend,
-  or debug — not just for new themes.
+  or debug — not just for new themes. Also trigger on: Koenig editor cards, .kg-
+  CSS classes, kg-image-card, kg-gallery-card, kg-bookmark-card, kg-callout-card,
+  kg-toggle-card, kg-header-card, kg-signup-card, card_assets, cards.min.css,
+  content card styling, breakout image layout, wide/full-width cards.
 ---
 
 # Ghost Theme Skill
@@ -67,6 +70,7 @@ Identify what the user needs, then read **only** the relevant reference file(s).
 | Add translations | [11-i18n.md](references/11-i18n.md) | `{{t}}` helper, locale files, pluralization, RTL |
 | Add dark mode, search, or styling | [12-appearance-search.md](references/12-appearance-search.md) | Dark mode, accent color, custom fonts, search triggers |
 | Use Ghost content as UI data | [13-content-as-data.md](references/13-content-as-data.md) | Featured flag as hero curation, tag metadata (accent_color, feature_image, count.posts), Ghost pages as section metadata, internal (#hash) tags, related posts filter, JS carousel pattern, custom homepage with no default feed |
+| Style rich text editor blocks | [14-kg-card-css.md](references/14-kg-card-css.md) | All `.kg-` card classes, width modifiers, card_assets config, HTML structure per card type, prose link exclusion, content vertical rhythm |
 
 
 ## Common Workflows
