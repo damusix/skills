@@ -30,6 +30,14 @@ Replace `mssql-server` with the skill name you want to install.
 - [SQL BI & Reporting](https://skills.sh/damusix/skills/sql-bi-reporting) - Analytical T-SQL patterns for aggregations, time series, pivots, and data export
 - [SQL ML Features](https://skills.sh/damusix/skills/sql-ml-features) - Extracting ML-ready feature datasets from SQL Server for model training
 
+### CMS
+
+- [Ghost Theme](https://skills.sh/damusix/skills/ghost-theme) - Build, customize, and deploy Ghost CMS themes with Handlebars templates, membership integration, and Koenig editor cards
+
+### CLI
+
+- [CLI Building](https://skills.sh/damusix/skills/cli-building) - Build TypeScript CLIs using citty, @clack/prompts, and @bomb.sh/tab
+
 ### Algorithms & ML
 
 - [Multi-Armed Bandits](https://skills.sh/damusix/skills/arm-bandits-expert) - Expert guidance for implementing, evaluating, and deploying multi-armed bandit algorithms
