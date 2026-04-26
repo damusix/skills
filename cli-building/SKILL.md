@@ -7,7 +7,19 @@ description: "Use when building TypeScript CLIs. Guides command structure, inter
 
 ## Quick Start
 
-    npm install citty @bomb.sh/tab @clack/prompts
+    npm install citty `@bomb.sh/tab` `@clack/prompts`
+
+Minimal command:
+
+```ts
+import { defineCommand, runMain } from 'citty';
+
+export default defineCommand({
+    meta: { name: 'greet', description: 'Say hello' },
+    args: { name: { type: 'string', description: 'Your name', required: true } },
+    run({ args }) { console.log(`Hello, ${args.name}!`); },
+});
+```
 
 ## Critical Rules
 
@@ -28,6 +40,7 @@ See [architecture](references/architecture.md) for the full `cli/` layout with c
 3. Wire tab completion — [tab-completion](references/tab-completion.md)
 4. Scaffold `cli/` if multi-command — [architecture](references/architecture.md)
 5. Configure bin entry — [sidecar setup](references/sidecar-setup.md)
+6. **Verify** — run with `--help` to confirm command registration
 
 ## References
 
