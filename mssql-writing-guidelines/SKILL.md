@@ -1,9 +1,9 @@
 ---
-name: sql-writing-guidelines
-description: "Use when writing or reviewing T-SQL, creating stored procedures, designing table schemas, writing views, building migrations, defining custom types, or architecting a SQL Server application database. Also use when writing RAISERROR patterns, CHECK constraints with scalar functions, base/subtype table hierarchies, composite key designs, role-scoped views with row-level security, or idempotent DDL scripts. If you are touching SQL for an application database, use this skill."
+name: mssql-writing-guidelines
+description: "Use when writing or reviewing MSSQL/T-SQL, creating stored procedures, designing table schemas, writing views, building migrations, defining custom types, or architecting a SQL Server application database. Also use when writing RAISERROR patterns, CHECK constraints with scalar functions, base/subtype table hierarchies, composite key designs, role-scoped views with row-level security, or idempotent DDL scripts. If you are touching MSSQL for an application database, use this skill. Not for PostgreSQL, MySQL, Oracle, or SQLite — patterns are SQL Server-specific."
 ---
 
-# SQL Writing Guidelines
+# MSSQL Writing Guidelines
 
 
 ## When to Use
@@ -15,7 +15,7 @@ description: "Use when writing or reviewing T-SQL, creating stored procedures, d
 - Designing table hierarchies (base/subtype, parent-child composite keys)
 - Implementing background job queues backed by relational tables
 
-**When NOT to use:** one-off ad-hoc queries or read-only reporting databases.
+**When NOT to use:** one-off ad-hoc queries, read-only reporting databases, or any non-SQL-Server engine (PostgreSQL, MySQL, Oracle, SQLite). Examples and syntax throughout are T-SQL — they will not run on other dialects without translation.
 
 ## The Two Access Rules
 
