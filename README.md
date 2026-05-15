@@ -25,7 +25,9 @@ Replace `mssql-server` with the skill name you want to install.
 ### SQL
 
 - [MSSQL Server](https://skills.sh/damusix/skills/mssql-server) - T-SQL syntax, SQL Server administration, query performance, stored procedures, indexes, and more
-- [SQL Writing Guidelines](https://skills.sh/damusix/skills/sql-writing-guidelines) - My own methodology for writing type-safe, access-controlled SQL Server application databases
+- [MSSQL Writing Guidelines](https://skills.sh/damusix/skills/mssql-writing-guidelines) - My own methodology for writing type-safe, access-controlled SQL Server application databases
+- [PostgreSQL](https://skills.sh/damusix/skills/postgres) - Comprehensive PostgreSQL reference covering PG14–18: queries, indexes, MVCC, VACUUM, WAL, partitioning, replication, backup, HA, pgvector, PostGIS, and more
+- [Postgres Writing Guidelines](https://skills.sh/damusix/skills/postgres-writing-guidelines) - Same methodology adapted for PostgreSQL — snake_case, CREATE DOMAIN, RLS, triggers-call-functions, EXCEPTION blocks
 - [SQL Server Performance](https://skills.sh/damusix/skills/sql-server-performance) - Diagnosing and fixing T-SQL performance problems, index tuning, and execution plans
 - [SQL BI & Reporting](https://skills.sh/damusix/skills/sql-bi-reporting) - Analytical T-SQL patterns for aggregations, time series, pivots, and data export
 - [SQL ML Features](https://skills.sh/damusix/skills/sql-ml-features) - Extracting ML-ready feature datasets from SQL Server for model training

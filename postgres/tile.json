@@ -1,0 +1,11 @@
+{
+  "name": "alonso-skills/postgres",
+  "version": "0.1.0",
+  "private": false,
+  "summary": "Comprehensive PostgreSQL reference for developers and DBAs covering versions 14–18. Use whenever the user asks about PostgreSQL syntax, DDL/DML/DQL, joins, LATERAL, CTEs, window functions, GROUPING SETS, DISTINCT ON, RETURNING, ON CONFLICT, PL/pgSQL, functions, procedures, triggers, views, materialized views, indexes (B-tree/GIN/GiST/BRIN/Hash/Bloom), MVCC, VACUUM, autovacuum, WAL, TOAST, partitioning, replication (streaming/logical), backup, PITR, HA (Patroni/repmgr), pgBouncer, EXPLAIN ANALYZE, RLS, roles, extensions (pgvector, PostGIS, TimescaleDB, Citus, pg_trgm, pg_cron), JSON/JSONB, full-text search, UUID, timestamptz, COPY, system catalogs, collations, large objects, cursors, GUC, or any Postgres administration, performance, security, replication, backup, or recovery topic.",
+  "skills": {
+    "postgres": {
+      "path": "SKILL.md"
+    }
+  }
+}
