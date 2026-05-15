@@ -1,5 +1,5 @@
 {
-  "name": "alonso-skills",
+  "name": "alonso-skills/alonso-skills",
   "mode": "vendored",
   "dependencies": {
     "tessl-labs/skill-optimizer": {
