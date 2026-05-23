@@ -226,9 +226,29 @@ Available rule modifiers (defined in `any` type):
 | ---------------------------- | -------------------------------------------------- |
 | `.describe()`                | Return schema description object (manifest)        |
 | `.isAsync()`                 | `true` if schema uses `.external()` (checks whens recursively) |
+| `['~standard']`             | Standard Schema compatibility — see below          |
 
     const desc = Joi.string().min(3).describe();
     // { type: 'string', rules: [{ name: 'min', args: { limit: 3 } }] }
+
+
+### `any['~standard']`
+
+
+Provides compatibility with the [Standard Schema](https://github.com/standard-schema/spec) specification.
+
+`~standard.jsonSchema` exposes two methods for generating JSON Schema representations:
+
+| Method                   | Description                                                 |
+| ------------------------ | ----------------------------------------------------------- |
+| `.input([options])`      | JSON Schema for the input value (before conversion)         |
+| `.output([options])`     | JSON Schema for the output value (after conversion)         |
+
+Both accept `options.target` — the JSON Schema draft version. Currently only `'draft-2020-12'` (default).
+
+    const schema = Joi.string().min(5);
+    const jsonSchema = schema['~standard'].jsonSchema.input();
+    // { type: 'string', minLength: 5 }
 
 
 ### `Joi.isSchema(value, [options])`
