@@ -53,16 +53,18 @@ Use these classes for loading indicators, animations, and transitions.
 
 HTMX automatically includes these headers with every request:
 
+> **[htmx 4 change]** `HX-Trigger` → `HX-Source` (format changed to `tagName#id`). `HX-Target` format changed to `tagName#id`. `HX-Trigger-Name` and `HX-Prompt` are removed. New headers: `HX-Request-Type` (`"full"` or `"partial"`), `Accept: text/html`.
+
 | Header | Value | Purpose |
 |---|---|---|
 | `HX-Boosted` | `true` | Present when request is via `hx-boost` |
 | `HX-Current-URL` | Current browser URL | Lets server know the user's current page |
 | `HX-History-Restore-Request` | `true` | Present when request is for history cache miss restoration |
-| `HX-Prompt` | User's response | Present when `hx-prompt` was used |
+| `HX-Prompt` | User's response | Present when `hx-prompt` was used. **[htmx 4 removed]** |
 | `HX-Request` | `true` | Always present on HTMX requests |
 | `HX-Target` | Target element's `id` | The target element for the response |
-| `HX-Trigger` | Triggering element's `id` | The element that triggered the request |
-| `HX-Trigger-Name` | Triggering element's `name` | The `name` attribute of the triggering element |
+| `HX-Trigger` | Triggering element's `id` | The element that triggered the request. **[htmx 4 change]** Renamed to `HX-Source` |
+| `HX-Trigger-Name` | Triggering element's `name` | The `name` attribute of the triggering element. **[htmx 4 removed]** |
 
 ### Server-Side Detection
 
@@ -98,8 +100,8 @@ The server can control client behavior using these response headers:
 | `HX-Retarget` | Override the `hx-target` value. Value: CSS selector |
 | `HX-Reselect` | Override the `hx-select` value. Value: CSS selector |
 | `HX-Trigger` | Trigger client-side events. Value: event name or JSON `{"event": {"key": "value"}}` |
-| `HX-Trigger-After-Settle` | Trigger events after the settle phase |
-| `HX-Trigger-After-Swap` | Trigger events after the swap phase |
+| `HX-Trigger-After-Settle` | Trigger events after the settle phase. **[htmx 4 removed]** — use `HX-Trigger` or JS events |
+| `HX-Trigger-After-Swap` | Trigger events after the swap phase. **[htmx 4 removed]** — use `HX-Trigger` or JS events |
 
 ### Triggering Client Events from Server
 
@@ -129,12 +131,16 @@ A `204 No Content` response performs no swap. Useful for fire-and-forget request
 
 ### Error Responses
 
+> **[htmx 4 change]** All HTTP responses now swap by default — only 204 and 304 are excluded. Design error responses as valid swap content, or use `hx-status` to control per-code behavior. Restore v2 behavior with `htmx.config.noSwap = [204, 304, '4xx', '5xx']`.
+
 - Non-2xx responses (except 204) trigger the `htmx:responseError` event
 - Network failures trigger the `htmx:sendError` event
 
 > **Important:** Response headers (`HX-Trigger`, `HX-Retarget`, etc.) are **NOT processed** on 3xx redirect responses. Use alternative status codes when returning htmx-specific headers.
 
 ### Response Handling Configuration
+
+> **[htmx 4 removed]** `htmx.config.responseHandling` is removed. Use the `hx-status` attribute for per-element status code handling. See `references/attributes.md`.
 
 Override default behavior per status code using `htmx.config.responseHandling`:
 
@@ -177,7 +183,7 @@ Fields per entry:
 
 | Method | Encoding |
 |---|---|
-| GET, DELETE | URL query string parameters |
+| GET, DELETE | URL query string parameters. **[htmx 4 change]** DELETE no longer includes enclosing form data (matches GET). Use `hx-include="closest form"` if needed |
 | POST, PUT, PATCH | URL-encoded form body (`application/x-www-form-urlencoded`) |
 | With `hx-encoding="multipart/form-data"` | Multipart form body |
 
@@ -212,6 +218,8 @@ Set `hx-encoding="multipart/form-data"` to enable file uploads:
 ```
 
 Track upload progress via the `htmx:xhr:progress` event:
+
+> **[htmx 4 removed]** `htmx:xhr:progress` is removed (htmx 4 uses `fetch()` instead of XHR). File upload progress tracking requires a different approach in v4.
 
 ```html
 <form hx-post="/upload" hx-encoding="multipart/form-data"
@@ -260,6 +268,8 @@ For cross-origin requests, configure the server to allow HTMX headers:
 ```
 Access-Control-Allow-Headers: HX-Request, HX-Trigger, HX-Trigger-Name, HX-Target, HX-Current-URL, HX-Boosted, HX-Prompt
 Access-Control-Expose-Headers: HX-Location, HX-Push-Url, HX-Redirect, HX-Refresh, HX-Replace-Url, HX-Reswap, HX-Retarget, HX-Reselect, HX-Trigger, HX-Trigger-After-Settle, HX-Trigger-After-Swap
+
+> **[htmx 4 change]** Update CORS headers: `HX-Trigger` request header → `HX-Source`. Remove `HX-Trigger-Name`, `HX-Prompt` from allow-headers. Remove `HX-Trigger-After-Settle`, `HX-Trigger-After-Swap` from expose-headers.
 ```
 
 **Note:** `htmx.config.selfRequestsOnly = true` (default) restricts requests to the same domain. Set to `false` for cross-origin requests, or use the `htmx:validateUrl` event for fine-grained control.
@@ -298,6 +308,8 @@ Appends a unique `org.htmx.cache-buster` query parameter to GET requests.
 
 ### hx-disable
 
+> **[htmx 4 change]** Renamed to `hx-ignore` in v4.
+
 Prevents HTMX processing on an element and all children. Use to protect user-content areas:
 
 ```html
@@ -313,6 +325,8 @@ Prevents HTMX processing on an element and all children. Use to protect user-con
 ```
 
 ### Configuration for Hardening
+
+> **[htmx 4 change]** `selfRequestsOnly` → `mode` (`'same-origin'` default). `allowEval`, `allowScriptTags`, `historyCacheSize` are removed in v4.
 
 ```javascript
 // Restrict to same-origin requests only (default: true)
@@ -359,6 +373,8 @@ HTMX integrates with the HTML5 Validation API. If a form element is invalid, the
 
 ### Validation Events
 
+> **[htmx 4 removed]** Validation events are removed. Use native HTML form validation.
+
 | Event | When |
 |---|---|
 | `htmx:validation:validate` | Before `checkValidity()` is called |
@@ -396,6 +412,8 @@ document.body.addEventListener('htmx:confirm', function(event) {
 ```
 
 ### Prompt
+
+> **[htmx 4 removed]** `hx-prompt` is removed. Use `hx-confirm` with `js:` prefix instead.
 
 ```html
 <button hx-post="/rename" hx-prompt="Enter new name:">Rename</button>

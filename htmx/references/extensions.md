@@ -8,6 +8,8 @@ globs: "*.html"
 
 Official extensions that add functionality beyond core HTMX. Each extension is enabled via `hx-ext="<name>"` and inherits to child elements.
 
+> **[htmx 4 change]** Extensions no longer require the `hx-ext` attribute. Include the extension script and it auto-registers. Restrict allowed extensions with `<meta name="htmx-config" content='{"extensions": "sse, ws"}'>`. Nine extensions are bundled in htmx 4 core: `alpine-compat`, `browser-indicator`, `head-support`, `htmx-2-compat`, `optimistic`, `preload`, `sse`, `upsert`, `ws`. The `response-targets` extension is replaced by the native `hx-status` attribute.
+
 ## Contents
 
 - Installation
@@ -19,6 +21,8 @@ Official extensions that add functionality beyond core HTMX. Each extension is e
 - Preload (`preload`)
 
 ## Installation
+
+> **[htmx 4 change]** In v4, just include the extension script — no `hx-ext` attribute needed. Extensions auto-register on load.
 
 Extensions are separate packages loaded after the core htmx library. Enable them with `hx-ext="<name>"` on an ancestor element (typically `<body>`).
 
@@ -232,6 +236,8 @@ Uses the Idiomorph algorithm to morph existing DOM nodes into new HTML instead o
 ---
 
 ## Response Targets (`response-targets`)
+
+> **[htmx 4 change]** This extension is superseded by the native `hx-status` attribute. Use `hx-status:422="swap:innerHTML target:#errors"` instead. See `references/attributes.md`.
 
 Route responses to different target elements based on HTTP status code. Extension name: `response-targets`.
 

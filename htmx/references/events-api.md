@@ -23,22 +23,27 @@ Events, JS API, configuration, extensions, debugging, and scripting integration.
 
 All events are fired on the relevant DOM element and bubble up. Listen with `addEventListener`, `htmx.on()`, or `hx-on:`.
 
+> **[htmx 4 change]** All event names changed to colon-separated format: `htmx:phase:action` (e.g., `htmx:beforeSwap` → `htmx:before:swap`). The `htmx-2-compat` extension restores old names. See the tables below for v4 equivalents. Events no longer bubble to `document.body` — attach listeners directly to elements or use `hx-on` attributes.
+
 ### Request Lifecycle Events
 
-| Event | Fires When | Key `event.detail` Properties |
-|---|---|---|
-| `htmx:confirm` | Fires on **every** trigger (not just `hx-confirm`). Call `event.preventDefault()` to halt, `event.detail.issueRequest()` to resume. Use for async custom dialogs | `elt`, `path`, `verb`, `target`, `triggeringEvent`, `question`, `issueRequest(skipConfirmation)` |
-| `htmx:configRequest` | Before request. Modify parameters and headers here | `parameters`, `headers`, `elt`, `target`, `verb`, `path` |
-| `htmx:beforeRequest` | Before AJAX request is made | `elt`, `target`, `requestConfig`, `xhr` |
-| `htmx:beforeSend` | Just before request is sent over the network | `elt`, `target`, `requestConfig`, `xhr` |
-| `htmx:afterRequest` | After request completes (success or failure) | `elt`, `target`, `xhr`, `successful`, `failed` |
-| `htmx:responseError` | On non-2xx/3xx HTTP response | `xhr`, `elt`, `target` |
-| `htmx:sendError` | On network failure | `xhr`, `elt`, `target` |
-| `htmx:sendAbort` | When request is aborted | `elt`, `target` |
-| `htmx:timeout` | When request times out | `elt`, `target`, `xhr` |
-| `htmx:abort` | Trigger this on an element to abort its in-flight request | — |
+| Event (v2) | Event (v4) | Fires When | Key `event.detail` Properties |
+|---|---|---|---|
+| `htmx:confirm` | `htmx:confirm` | Fires on **every** trigger (not just `hx-confirm`). Call `event.preventDefault()` to halt, `event.detail.issueRequest()` to resume. Use for async custom dialogs | `elt`, `path`, `verb`, `target`, `triggeringEvent`, `question`, `issueRequest(skipConfirmation)` |
+| `htmx:configRequest` | `htmx:config:request` | Before request. Modify parameters and headers here | `parameters`, `headers`, `elt`, `target`, `verb`, `path` |
+| `htmx:beforeRequest` | `htmx:before:request` | Before AJAX request is made | `elt`, `target`, `requestConfig`, `xhr` |
+| `htmx:beforeSend` | `htmx:before:send` | Just before request is sent over the network | `elt`, `target`, `requestConfig`, `xhr` |
+| `htmx:afterRequest` | `htmx:after:request` | After request completes (success or failure) | `elt`, `target`, `xhr`, `successful`, `failed` |
+| `htmx:responseError` | `htmx:response:error` | On non-2xx/3xx HTTP response | `xhr`, `elt`, `target` |
+| `htmx:sendError` | `htmx:error` | On network failure | `xhr`, `elt`, `target` |
+| `htmx:sendAbort` | — | When request is aborted | `elt`, `target` |
+| `htmx:timeout` | `htmx:error` | When request times out | `elt`, `target`, `xhr` |
+| `htmx:abort` | `htmx:abort` | Trigger this on an element to abort its in-flight request | — |
+| — | `htmx:finally:request` | **[htmx 4]** Always fires after request (success or failure) | — |
 
 ### Response Processing Events
+
+> **[htmx 4 change]** `htmx:beforeOnLoad` → `htmx:before:init`, `htmx:afterOnLoad` → `htmx:after:init`.
 
 | Event | Fires When | Key `event.detail` Properties |
 |---|---|---|
@@ -47,6 +52,8 @@ All events are fired on the relevant DOM element and bubble up. Listen with `add
 | `htmx:onLoadError` | When an exception occurs during response processing | `xhr`, `elt`, `target`, `exception` |
 
 ### Swap & Settle Events
+
+> **[htmx 4 change]** `htmx:beforeSwap` → `htmx:before:swap`, `htmx:afterSwap` → `htmx:after:swap`, `htmx:afterSettle` → `htmx:after:swap` (merged), `htmx:swapError`/`htmx:targetError` → `htmx:error`. New events: `htmx:before:settle`, `htmx:after:settle`, `htmx:before:viewTransition`, `htmx:after:viewTransition`.
 
 | Event | Fires When | Key `event.detail` Properties |
 |---|---|---|
@@ -59,6 +66,8 @@ All events are fired on the relevant DOM element and bubble up. Listen with `add
 
 ### Element Lifecycle Events
 
+> **[htmx 4 change]** `htmx:beforeProcessNode` → `htmx:before:process`, `htmx:afterProcessNode` → `htmx:after:init`, `htmx:beforeCleanupElement` → `htmx:before:cleanup`. New: `htmx:after:cleanup`, `htmx:after:process`.
+
 | Event | Fires When |
 |---|---|
 | `htmx:load` | New content added to DOM. Use for initializing third-party libraries |
@@ -68,6 +77,8 @@ All events are fired on the relevant DOM element and bubble up. Listen with `add
 
 ### OOB Events
 
+> **[htmx 4 change]** `htmx:oobBeforeSwap` → `htmx:before:swap`, `htmx:oobAfterSwap` → `htmx:after:swap` (merged with main swap events).
+
 | Event | Fires When | Key `event.detail` Properties |
 |---|---|---|
 | `htmx:oobBeforeSwap` | Before OOB swap | `fragment`, `target` |
@@ -75,6 +86,8 @@ All events are fired on the relevant DOM element and bubble up. Listen with `add
 | `htmx:oobErrorNoTarget` | OOB element has no matching `id` in DOM | `content` |
 
 ### History Events
+
+> **[htmx 4 change]** `htmx:beforeHistorySave` → `htmx:before:history:update`, `htmx:pushedIntoHistory` → `htmx:after:history:push`, `htmx:replacedInHistory` → `htmx:after:history:replace`, `htmx:historyRestore`/`htmx:historyCacheMiss` → `htmx:before:history:restore`. Cache-related events (`historyCacheHit`, `historyCacheMissLoad`, `historyCacheMissLoadError`, `historyCacheError`) are removed — htmx 4 does not cache history in localStorage.
 
 | Event | Fires When |
 |---|---|
@@ -90,6 +103,8 @@ All events are fired on the relevant DOM element and bubble up. Listen with `add
 
 ### Validation Events
 
+> **[htmx 4 removed]** All validation events are removed. Use native HTML form validation (`checkValidity()`, `reportValidity()`) instead.
+
 | Event | Fires When |
 |---|---|
 | `htmx:validation:validate` | Before `checkValidity()` is called |
@@ -97,6 +112,8 @@ All events are fired on the relevant DOM element and bubble up. Listen with `add
 | `htmx:validation:halted` | When request is blocked due to validation |
 
 ### XHR Progress Events
+
+> **[htmx 4 removed]** All XHR events are removed — htmx 4 uses `fetch()` instead of `XMLHttpRequest`. File upload progress tracking requires a different approach in v4.
 
 | Event | Fires When | Key `event.detail` Properties |
 |---|---|---|
@@ -144,6 +161,8 @@ All events are fired on the relevant DOM element and bubble up. Listen with `add
 | `htmx:wsAfterSend` | After message sent over WebSocket |
 
 ## Event Naming
+
+> **[htmx 4 change]** Events use colon-separated format only: `htmx:after:swap`. The camelCase forms (`htmx:afterSwap`) are no longer emitted unless the `htmx-2-compat` extension is loaded.
 
 HTMX events support both **camelCase** and **kebab-case**:
 
@@ -205,6 +224,8 @@ htmx.ajax('POST', '/api/data', {
 ```
 
 ### DOM Manipulation
+
+> **[htmx 4 removed]** `htmx.addClass()`, `htmx.removeClass()`, `htmx.toggleClass()`, `htmx.closest()`, `htmx.remove()`, `htmx.off()` are removed. Use native DOM APIs instead: `element.classList.add()`, `element.closest()`, `element.remove()`, `removeEventListener()`.
 
 ```javascript
 // Class manipulation (all accept optional delay in ms)
@@ -308,6 +329,8 @@ htmx.createWebSocket = function(url) {
 
 ### Extension Management
 
+> **[htmx 4 change]** `htmx.defineExtension()` → `htmx.registerExtension()`. The callback-based API is replaced with event-based hooks. `onEvent` becomes individual hook methods (e.g., `htmx_before_request`), `transformResponse` → `htmx_after_request` (modify `detail.ctx.text`), `isInlineSwap`/`handleSwap` → `handle_swap`. See the migration guide at `four.htmx.org/docs/get-started/migration`.
+
 ```javascript
 // Define a custom extension
 htmx.defineExtension('my-ext', {
@@ -356,43 +379,45 @@ htmx.config.historyCacheSize = 20;
 
 ### All Configuration Options
 
+> **[htmx 4 change]** Several config keys are renamed: `defaultSwapStyle` → `defaultSwap`, `globalViewTransitions` → `transitions`, `historyEnabled` → `history`, `includeIndicatorStyles` → `includeIndicatorCSS`, `timeout` → `defaultTimeout`. Default timeout changed from `0` to `60000` (60s). Default settle delay changed from `20` to `1`. Many keys are removed (see notes below). New keys: `extensions`, `mode` (replaces `selfRequestsOnly`), `inlineScriptNonce`, `metaCharacter`, `morphIgnore`, `morphSkip`, `morphSkipChildren`.
+
 | Option | Default | Description |
 |---|---|---|
 | `historyEnabled` | `true` | Enable history snapshot and navigation |
-| `historyCacheSize` | `10` | Max pages in history cache. `0` to disable |
-| `refreshOnHistoryMiss` | `false` | Full page reload on cache miss instead of AJAX |
+| `historyCacheSize` | `10` | Max pages in history cache. `0` to disable. **[htmx 4 removed]** |
+| `refreshOnHistoryMiss` | `false` | Full page reload on cache miss instead of AJAX. **[htmx 4 removed]** |
 | `defaultSwapStyle` | `innerHTML` | Default `hx-swap` strategy |
-| `defaultSwapDelay` | `0` | Default swap delay in ms |
-| `defaultSettleDelay` | `20` | Default settle delay in ms |
+| `defaultSwapDelay` | `0` | Default swap delay in ms. **[htmx 4 removed]** |
+| `defaultSettleDelay` | `20` | Default settle delay in ms. **[htmx 4 change]** Default is `1` in v4 |
 | `includeIndicatorStyles` | `true` | Inject default indicator CSS |
 | `indicatorClass` | `htmx-indicator` | Class for request indicators |
 | `requestClass` | `htmx-request` | Class applied during requests |
-| `addedClass` | `htmx-added` | Class for newly swapped content |
-| `settlingClass` | `htmx-settling` | Class during settle phase |
-| `swappingClass` | `htmx-swapping` | Class during swap phase |
-| `allowEval` | `true` | Allow eval-dependent features (`hx-on:`, trigger filters, `hx-vals` with `js:`) |
-| `allowScriptTags` | `true` | Process `<script>` tags in responses |
+| `addedClass` | `htmx-added` | Class for newly swapped content. **[htmx 4 removed]** |
+| `settlingClass` | `htmx-settling` | Class during settle phase. **[htmx 4 removed]** |
+| `swappingClass` | `htmx-swapping` | Class during swap phase. **[htmx 4 removed]** |
+| `allowEval` | `true` | Allow eval-dependent features (`hx-on:`, trigger filters, `hx-vals` with `js:`). **[htmx 4 removed]** |
+| `allowScriptTags` | `true` | Process `<script>` tags in responses. **[htmx 4 removed]** |
 | `inlineScriptNonce` | `''` | Nonce for inline scripts |
 | `inlineStyleNonce` | `''` | Nonce for inline styles |
-| `attributesToSettle` | `["class","style","width","height"]` | Attributes settled during settle phase |
-| `useTemplateFragments` | `false` | Use `<template>` for HTML parsing (helps with table/SVG content) |
-| `wsReconnectDelay` | `full-jitter` | WebSocket reconnect delay strategy |
-| `wsBinaryType` | `blob` | WebSocket binary data type |
-| `disableSelector` | `[hx-disable], [data-hx-disable]` | CSS selector for disabled elements |
-| `withCredentials` | `false` | Send credentials with cross-origin requests |
-| `timeout` | `0` | Request timeout in ms. `0` = no timeout |
-| `scrollBehavior` | `instant` | Scroll behavior: `instant`, `smooth`, `auto` |
+| `attributesToSettle` | `["class","style","width","height"]` | Attributes settled during settle phase. **[htmx 4 removed]** |
+| `useTemplateFragments` | `false` | Use `<template>` for HTML parsing (helps with table/SVG content). **[htmx 4 removed]** |
+| `wsReconnectDelay` | `full-jitter` | WebSocket reconnect delay strategy. **[htmx 4 removed]** |
+| `wsBinaryType` | `blob` | WebSocket binary data type. **[htmx 4 removed]** |
+| `disableSelector` | `[hx-disable], [data-hx-disable]` | CSS selector for disabled elements. **[htmx 4 removed]** — use `hx-ignore` |
+| `withCredentials` | `false` | Send credentials with cross-origin requests. **[htmx 4 removed]** — use `hx-config` |
+| `timeout` | `0` | Request timeout in ms. `0` = no timeout. **[htmx 4 change]** Renamed to `defaultTimeout`, default is `60000` (60s) |
+| `scrollBehavior` | `instant` | Scroll behavior: `instant`, `smooth`, `auto`. **[htmx 4 removed]** |
 | `defaultFocusScroll` | `false` | Scroll focused element into view after swap |
-| `getCacheBusterParam` | `false` | Add cache-buster query param to GET requests |
-| `globalViewTransitions` | `false` | Enable View Transitions API globally |
-| `methodsThatUseUrlParams` | `["get","delete"]` | Methods that encode params in URL |
-| `selfRequestsOnly` | `true` | Only allow same-origin requests |
-| `ignoreTitle` | `false` | Don't update `document.title` from responses |
+| `getCacheBusterParam` | `false` | Add cache-buster query param to GET requests. **[htmx 4 removed]** |
+| `globalViewTransitions` | `false` | Enable View Transitions API globally. **[htmx 4 change]** Renamed to `transitions` |
+| `methodsThatUseUrlParams` | `["get","delete"]` | Methods that encode params in URL. **[htmx 4 removed]** |
+| `selfRequestsOnly` | `true` | Only allow same-origin requests. **[htmx 4 change]** Replaced by `mode` (`'same-origin'` default) |
+| `ignoreTitle` | `false` | Don't update `document.title` from responses. **[htmx 4 removed]** — use per-swap `ignoreTitle:true` |
 | `disableInheritance` | `false` | Disable attribute inheritance globally |
-| `scrollIntoViewOnBoost` | `true` | Scroll to top on boosted navigation |
-| `triggerSpecsCache` | `null` | Cache object for parsed trigger specs |
-| `allowNestedOobSwaps` | `true` | Process OOB swaps in nested content |
-| `responseHandling` | See docs | Array of status code handling rules |
+| `scrollIntoViewOnBoost` | `true` | Scroll to top on boosted navigation. **[htmx 4 removed]** |
+| `triggerSpecsCache` | `null` | Cache object for parsed trigger specs. **[htmx 4 removed]** |
+| `allowNestedOobSwaps` | `true` | Process OOB swaps in nested content. **[htmx 4 removed]** |
+| `responseHandling` | See docs | Array of status code handling rules. **[htmx 4 removed]** — use `hx-status` attribute and `noSwap` config |
 | `historyRestoreAsHxRequest` | `true` | Send HX-Request header on history restore |
 | `reportValidityOfForms` | `false` | Report validation errors via browser UI |
 
@@ -410,15 +435,17 @@ htmx.config.historyCacheSize = 20;
 </body>
 ```
 
-### Core Extensions
+### Core Extensions (htmx 2.x)
+
+> **[htmx 4 change]** Extensions auto-register on script load — `hx-ext` attribute is not needed. See `references/extensions.md` for the full v4 bundled extension list.
 
 | Extension | Purpose | Package |
 |---|---|---|
 | `head-support` | Merge `<head>` elements from responses | `htmx-ext-head-support` |
 | `htmx-1-compat` | HTMX 1.x compatibility layer | `htmx-ext-htmx-1-compat` |
-| `idiomorph` | DOM morphing swap strategy | `idiomorph` |
+| `idiomorph` | DOM morphing swap strategy | `idiomorph`. **[htmx 4]** Built into core as `innerMorph`/`outerMorph` swaps |
 | `preload` | Preload content on hover/focus | `htmx-ext-preload` |
-| `response-targets` | Target different elements by HTTP status code | `htmx-ext-response-targets` |
+| `response-targets` | Target different elements by HTTP status code | `htmx-ext-response-targets`. **[htmx 4]** Replaced by native `hx-status` attribute |
 | `sse` | Server-Sent Events support | `htmx-ext-sse` |
 | `ws` | WebSocket support | `htmx-ext-ws` |
 
@@ -469,6 +496,8 @@ Target different elements based on HTTP response status:
 
 ### Disabling Extensions
 
+> **[htmx 4 change]** `hx-ext` is removed. Extensions auto-register when their script is loaded. Restrict allowed extensions with `<meta name="htmx-config" content='{"extensions": "sse, ws"}'>`.
+
 ```html
 <div hx-ext="preload">
     <!-- Preload enabled here -->
@@ -481,6 +510,8 @@ Target different elements based on HTTP response status:
 ## Debugging
 
 ### Log All Events
+
+> **[htmx 4 change]** `htmx.logAll()`, `htmx.logNone()`, and the pluggable `htmx.logger` are removed. Use `htmx.config.logAll = true` instead. htmx 4 logs via `console.error`, `console.warn`, `console.log`.
 
 ```javascript
 htmx.logAll();

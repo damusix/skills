@@ -33,6 +33,10 @@ The `hx-swap` attribute controls how the response is inserted relative to the ta
 | `afterend` | Insert after the target element (as a sibling) |
 | `delete` | Delete the target element, no content swap |
 | `none` | No content swap. OOB swaps and response headers still process |
+| `innerMorph` | **[htmx 4]** Morph target's children using Idiomorph (preserves state) |
+| `outerMorph` | **[htmx 4]** Morph entire target element using Idiomorph |
+
+> **[htmx 4]** Short aliases: `before` = `beforebegin`, `after` = `afterend`, `prepend` = `afterbegin`, `append` = `beforeend`. Both old and new names work.
 
 ```html
 <!-- Replace inner content (default) -->
@@ -79,8 +83,8 @@ Append modifiers to `hx-swap` separated by spaces. Each modifier uses `key:value
 | `scroll:<selector>:bottom` | Scroll specified element to bottom | — |
 | `show:top` | Scroll viewport so target's top is visible | — |
 | `show:bottom` | Scroll viewport so target's bottom is visible | — |
-| `show:<selector>:top` | Scroll viewport so specified element's top is visible | — |
-| `show:<selector>:bottom` | Scroll viewport so specified element's bottom is visible | — |
+| `show:<selector>:top` | Scroll viewport so specified element's top is visible. **[htmx 4 change]** Use `show:top showTarget:<selector>` instead | — |
+| `show:<selector>:bottom` | Scroll viewport so specified element's bottom is visible. **[htmx 4 change]** Use `show:bottom showTarget:<selector>` instead | — |
 | `show:window:top` | Scroll viewport to the top of the window | — |
 | `show:window:bottom` | Scroll viewport to the bottom of the window | — |
 | `show:none` | Disable all scroll-into-view behavior | — |
@@ -104,6 +108,18 @@ Append modifiers to `hx-swap` separated by spaces. Each modifier uses `key:value
 ## Out-of-Band (OOB) Swaps
 
 OOB swaps update elements **outside** the target using their `id` attributes. This enables updating multiple page regions from a single response.
+
+> **[htmx 4 change]** OOB swap order changed: main content swaps first, then OOB and `<hx-partial>` elements (in document order). In v2, OOB swapped before main content.
+
+> **[htmx 4]** New `<hx-partial>` element provides cleaner multi-target responses. Each `<hx-partial>` specifies its own `hx-target` and `hx-swap`:
+> ```html
+> <hx-partial hx-target="#messages" hx-swap="beforeend">
+>     <div>New message</div>
+> </hx-partial>
+> <hx-partial hx-target="#count">
+>     <span>5</span>
+> </hx-partial>
+> ```
 
 ### hx-swap-oob on Response Elements
 
@@ -179,6 +195,8 @@ Server returns one response that updates several page areas:
 ## Morphing
 
 Morphing merges new HTML into existing DOM, preserving focus, scroll position, and element state. Requires an extension.
+
+> **[htmx 4 change]** Idiomorph is built into core — no extension needed. Use `hx-swap="innerMorph"` or `hx-swap="outerMorph"` directly. New config keys `morphIgnore`, `morphSkip`, `morphSkipChildren` control morph behavior via CSS selectors.
 
 ### Idiomorph (Recommended)
 
@@ -305,6 +323,8 @@ The View Transitions API provides browser-native animated transitions.
 ```
 
 ### Enable Globally
+
+> **[htmx 4 change]** Config key renamed from `globalViewTransitions` to `transitions`.
 
 ```javascript
 htmx.config.globalViewTransitions = true;

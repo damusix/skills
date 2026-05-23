@@ -6,7 +6,7 @@ description: "Implements HTMX interactions, configures swap behaviors, debugs hx
 # HTMX
 
 
-Use this skill for HTMX implementation and integration. Read only the reference file(s) needed for the task.
+Use this skill for HTMX implementation and integration. Covers htmx 2.x (current stable) and htmx 4.x (beta). Reference files are annotated with `[htmx 4]`, `[htmx 4 change]`, and `[htmx 4 removed]` admonitions. Read only the reference file(s) needed for the task.
 
 ## Quick Start
 
@@ -39,7 +39,7 @@ The default swap is `innerHTML` — the response replaces the target's children.
 ## Critical Rules
 
 1. **HTML responses** - HTMX expects HTML responses from the server, not JSON
-2. **Attribute inheritance** - Most attributes inherit to children. **Not inherited:** `hx-trigger`, `hx-on*`, `hx-swap-oob`, `hx-preserve`, `hx-history-elt`, `hx-validate`. Use `hx-disinherit` or `unset` to stop inheritance
+2. **Attribute inheritance** - (v2) Most attributes inherit to children; use `hx-disinherit` or `unset` to stop. (v4) Inheritance is explicit — use `:inherited` suffix to opt in. **Not inherited in either version:** `hx-trigger`, `hx-on*`, `hx-swap-oob`, `hx-preserve`, `hx-history-elt`, `hx-validate`
 3. **Default swap is innerHTML** - Always confirm the intended swap method
 4. **Form values auto-included** - Non-GET requests automatically include the closest enclosing form's values
 5. **Progressive enhancement** - Use `hx-boost="true"` — pages must work without JS
@@ -47,7 +47,7 @@ The default swap is `innerHTML` — the response replaces the target's children.
 7. **CSS lifecycle classes** - HTMX adds/removes CSS classes during requests — use for transitions and indicators
 8. **data-prefix supported** - All `hx-*` attributes can also be written as `data-hx-*` for HTML validation compliance
 9. **Stop polling with HTTP 286** - Server returns status `286` to stop `every` or `load delay` polling. Always use 286 for poll termination, not conditional client-side logic
-10. **Error swaps need htmx:beforeSwap** - Non-2xx responses (e.g., 422 validation errors) are not swapped by default. Add an `htmx:beforeSwap` listener to enable swapping for error status codes
+10. **Error swaps** - (v2) Non-2xx responses are not swapped by default — add an `htmx:beforeSwap` listener to enable. (v4) All responses swap by default except 204/304 — use `hx-status` for per-code control
 11. **Decouple with HX-Trigger headers** - Use `HX-Trigger` response headers to fire client-side events instead of hardcoding DOM element IDs in server responses
 12. **Detect HTMX requests server-side** - Check the `HX-Request` header to serve HTML fragments for HTMX requests and full pages for direct browser requests. Set `Vary: HX-Request` for caching
 

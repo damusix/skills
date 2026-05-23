@@ -54,6 +54,10 @@ These attributes issue HTTP requests when the element is triggered.
 | `hx-patch` | PATCH | Parameters sent in request body |
 | `hx-delete` | DELETE | Parameters appended to URL by default |
 
+> **[htmx 4 change]** `hx-delete` no longer includes enclosing form data by default (matches `hx-get` behavior). Use `hx-include="closest form"` if you need form values with DELETE requests.
+
+> **[htmx 4]** New attributes `hx-action` (URL) and `hx-method` (HTTP method) provide an alternative to `hx-get`/`hx-post`/etc. Use together: `<button hx-action="/api" hx-method="post">`.
+
 **Value:** A URL string (relative or absolute). Relative URLs resolve against the current page.
 
 ## Trigger Attribute
@@ -107,6 +111,8 @@ These attributes issue HTTP requests when the element is triggered.
 | `target:<CSS selector>` | Only fire if the event target matches the selector |
 | `consume` | Prevent event from propagating to parent elements |
 | `queue:<strategy>` | Queue behavior when event fires during an active request. Values: `first`, `last` (default), `all`, `none` |
+
+> **[htmx 4 removed]** The `queue` trigger modifier is removed. Use `hx-sync` instead: `<div hx-trigger="click" hx-get="/test" hx-sync="this:queue all">`.
 
 ### Trigger Filters
 
@@ -218,6 +224,8 @@ Add extra values to the request as a JSON object.
 
 ### hx-vars (deprecated — use hx-vals with js: prefix)
 
+> **[htmx 4 removed]** `hx-vars` is removed. Use `hx-vals` with `js:` prefix instead.
+
 Comma-separated name-expression pairs evaluated as JavaScript.
 
 ### hx-include
@@ -236,6 +244,8 @@ Include values from additional elements in the request.
 ```
 
 ### hx-params
+
+> **[htmx 4 removed]** `hx-params` is removed. Use the `htmx:config:request` event to filter parameters programmatically.
 
 Filter which parameters are submitted.
 
@@ -305,6 +315,8 @@ Replace the current URL in the browser's location bar (no new history entry).
 
 ### hx-history
 
+> **[htmx 4 removed]** `hx-history` is removed. htmx 4 no longer caches pages in localStorage — back/forward navigation re-fetches from the server. Configure via `htmx.config.history = false` (disable) or `htmx.config.history = "reload"` (full page reload).
+
 Prevent the current page from being saved in the history cache.
 
 ```html
@@ -347,6 +359,8 @@ Multiple indicators:
 
 ### hx-disabled-elt
 
+> **[htmx 4 change]** Renamed to `hx-disable`. Rename in order: first rename security `hx-disable` → `hx-ignore`, then rename `hx-disabled-elt` → `hx-disable`.
+
 Add the `disabled` attribute to elements while a request is in flight.
 
 ```html
@@ -372,6 +386,8 @@ Use `hx-confirm="unset"` on a child to disable an inherited confirm.
 
 ### hx-prompt
 
+> **[htmx 4 removed]** `hx-prompt` is removed. Use `hx-confirm` with `js:` prefix instead.
+
 Show a browser `prompt()` dialog. The user's response is sent in the `HX-Prompt` request header.
 
 ```html
@@ -382,7 +398,11 @@ Show a browser `prompt()` dialog. The user's response is sent in the `HX-Prompt`
 
 Most `hx-*` attributes inherit from parent to child elements. **Not inherited:** `hx-trigger`, `hx-on*`, `hx-swap-oob`, `hx-preserve`, `hx-history-elt`, `hx-validate`.
 
+> **[htmx 4 change]** Inheritance is **explicit** by default. Attributes no longer cascade to children unless you add the `:inherited` suffix: `hx-confirm:inherited="Are you sure?"`. Use `:inherited:append` to add to (rather than replace) inherited values. Restore v2 implicit inheritance with `htmx.config.implicitInheritance = true`.
+
 ### hx-disinherit
+
+> **[htmx 4 removed]** `hx-disinherit` is removed. Inheritance is explicit in v4 — no need to opt out since attributes don't cascade by default.
 
 Disable inheritance of specific attributes for child elements.
 
@@ -399,6 +419,8 @@ Disable inheritance of specific attributes for child elements.
 ```
 
 ### hx-inherit
+
+> **[htmx 4 removed]** `hx-inherit` is removed. Use the `:inherited` suffix on individual attributes instead: `hx-target:inherited="#results"`.
 
 Explicitly enable inheritance for specific attributes (useful when `htmx.config.disableInheritance = true`).
 
@@ -421,6 +443,8 @@ Use `"unset"` as the value to clear an inherited attribute:
 ## Security Attributes
 
 ### hx-disable
+
+> **[htmx 4 change]** Renamed to `hx-ignore`. The name `hx-disable` is repurposed for the old `hx-disabled-elt` behavior (disabling form elements during requests).
 
 Completely prevents HTMX processing on the element and all its children. Cannot be overridden by injected content.
 
@@ -450,6 +474,8 @@ Convert standard anchors and forms into AJAX requests targeting the `<body>`.
 Boosted anchors push the URL into browser history. **Boosted forms do NOT push URL** — add `hx-push-url="true"` explicitly if needed. Boosted pages must serve full HTML pages. They degrade gracefully when JS is disabled. Only same-domain links are boosted; local anchor links are ignored.
 
 ### hx-ext
+
+> **[htmx 4 removed]** `hx-ext` is removed. Extensions auto-register when their script is loaded. Restrict allowed extensions with `<meta name="htmx-config" content='{"extensions": "sse, ws"}'>`.
 
 Enable HTMX extensions on an element and its children.
 
@@ -508,6 +534,8 @@ Force elements to validate themselves before a request is issued.
 
 ### hx-request
 
+> **[htmx 4 removed]** `hx-request` is removed. Use `hx-config` for per-element request configuration instead.
+
 Configure various aspects of the request.
 
 ```html
@@ -541,3 +569,39 @@ Respond to any event directly with inline JavaScript. Uses `hx-on:<event-name>` 
 ```
 
 **Note:** HTML attributes are case-insensitive. Use kebab-case for camelCase event names (e.g., `htmx:config-request` instead of `htmx:configRequest`).
+
+## htmx 4 Attributes
+
+> **[htmx 4]** The following attributes are only available in htmx 4.
+
+### hx-status
+
+Control swap behavior per HTTP status code. Accepts exact codes (`404`), single-digit wildcards (`50x`), and range wildcards (`5xx`). More specific codes take priority.
+
+```html
+<form hx-post="/save"
+    hx-status:422="swap:innerHTML target:#errors select:#validation-errors"
+    hx-status:5xx="swap:none push:false">
+</form>
+```
+
+Available config keys per status rule: `swap:`, `target:`, `select:`, `push:`, `replace:`, `transition:`.
+
+### hx-config
+
+Per-element request configuration in JSON or `key:value` syntax. Replaces `hx-request`.
+
+### hx-validate
+
+Control form validation behavior on the element.
+
+### hx-ignore
+
+Replaces v2's `hx-disable`. Completely prevents htmx processing on the element and all its children.
+
+```html
+<div hx-ignore>
+    <!-- No htmx processing here -->
+    {{ user_generated_content }}
+</div>
+```

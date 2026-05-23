@@ -401,15 +401,53 @@ Avoid combining HTMX with React, Vue, or other frameworks that manage their own 
 
 ## Version Awareness
 
-### HTMX 2.x to 4.0 changes (The Fetch()ening)
+### HTMX 2.x to 4.0 changes (The Fetchening)
 
-Key changes in htmx 4.0 ([official changelog](https://four.htmx.org/htmx-4/)):
+htmx 4.0 is in beta (v4.0.0-beta4, Summer 2026 stable target). Current stable: htmx 2.0.9.
 
-- **`fetch()` replaces `XMLHttpRequest`** — file upload progress events (`htmx:xhr:progress`) will no longer work the same way
-- **Attribute inheritance becomes explicit by default** — use the `:inherited` modifier (`hx-target:inherited="#output"`) or set `htmx.config.implicitInheritance = true` to restore old behavior
-- **Error responses now swap by default** — 4xx/5xx responses are swapped into the DOM (only 204 and 304 are excluded). Revert with `htmx.config.noSwap = [204, 304, '4xx', '5xx']`
-- **Event names changed** — colon-separated format: `htmx:afterSwap` → `htmx:after:swap`, `htmx:configRequest` → `htmx:config:request`. Multiple error events consolidated into `htmx:error`
-- **Local history caching removed** — history restore issues a network request instead of using localStorage snapshots
-- **Morphing swaps in core** — `morphInner` and `morphOuter` swap strategies available without extensions
+**Quick restore of v2 behavior:**
 
-HTMX 2.x will continue to be supported. No rush to migrate, but be aware when starting new projects.
+```javascript
+htmx.config.implicitInheritance = true;
+htmx.config.noSwap = [204, 304, '4xx', '5xx'];
+```
+
+Or load the `htmx-2-compat` extension which restores implicit inheritance, legacy event names, and error-response defaults.
+
+**Upgrade checker:** `npx htmx.org@next upgrade-check -- ./path/to/project` scans templates and JS for v2 code that needs updating.
+
+### Breaking changes
+
+- **`fetch()` replaces `XMLHttpRequest`** — irreversible. File upload progress events (`htmx:xhr:progress`) are removed. Streaming via `ReadableStream` is now possible
+- **Attribute inheritance is explicit** — use `:inherited` suffix (`hx-target:inherited="#output"`) or set `htmx.config.implicitInheritance = true`
+- **Error responses swap by default** — 4xx/5xx responses are swapped into the DOM (only 204 and 304 excluded). Revert with `htmx.config.noSwap = [204, 304, '4xx', '5xx']`. Use `hx-status` for per-code control
+- **Event names use colon-separated format** — `htmx:afterSwap` → `htmx:after:swap`, `htmx:configRequest` → `htmx:config:request`. Multiple error events consolidated into `htmx:error`
+- **Local history caching removed** — back/forward navigation re-fetches from server instead of localStorage snapshots
+- **`hx-delete` excludes form data** — matches `hx-get` behavior. Use `hx-include="closest form"` if needed
+- **OOB swap order changed** — main content swaps first, then OOB elements (was reversed in v2)
+- **Default timeout is 60 seconds** — was 0 (no timeout). Revert with `htmx.config.defaultTimeout = 0`
+- **`queue` trigger modifier removed** — use `hx-sync` instead
+
+### Renamed attributes
+
+| v2 | v4 |
+|---|---|
+| `hx-disable` (security) | `hx-ignore` |
+| `hx-disabled-elt` | `hx-disable` |
+
+### Removed attributes
+
+`hx-vars` (use `hx-vals` with `js:`), `hx-params` (use `htmx:config:request` event), `hx-prompt` (use `hx-confirm` with `js:`), `hx-ext` (extensions auto-register), `hx-disinherit` / `hx-inherit` (inheritance is explicit), `hx-request` (use `hx-config`), `hx-history` (no localStorage caching)
+
+### New features
+
+- **`hx-status`** — per-element status code swap control: `hx-status:422="swap:innerHTML target:#errors"`
+- **`<hx-partial>`** — cleaner multi-target responses replacing `hx-swap-oob`
+- **`innerMorph` / `outerMorph` swap strategies** — Idiomorph in core, no extension needed
+- **`textContent` and `delete` swap strategies** — in core
+- **`hx-action` + `hx-method`** — alternative to verb-specific attributes
+- **`hx-config`** — per-element request configuration
+- **Short swap aliases** — `before`, `after`, `prepend`, `append`
+- **JSX compatibility** — `htmx.config.metaCharacter = "-"` replaces `:` with `-` in attribute names
+
+HTMX 2.x will continue to be supported. No rush to migrate, but be aware when starting new projects. Each reference file in this skill is annotated with `[htmx 4]`, `[htmx 4 change]`, and `[htmx 4 removed]` admonitions at the relevant sections.
