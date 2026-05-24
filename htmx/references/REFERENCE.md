@@ -35,3 +35,18 @@ Use this index to pick the smallest reference file that matches the task.
 1. Start with this file.
 2. Open one domain file for the immediate task.
 3. Open additional files only when cross-domain integration is required.
+
+## Sources
+
+All reference material is derived from official htmx documentation and source code.
+
+| Source | URL |
+|---|---|
+| htmx documentation (v2) | https://htmx.org/docs/ |
+| htmx reference (v2) | https://htmx.org/reference/ |
+| htmx 4 documentation | https://four.htmx.org/ |
+| htmx 4 migration guide | https://four.htmx.org/docs/get-started/migration/ |
+| htmx GitHub repo | https://github.com/bigskysoftware/htmx |
+| htmx extensions | https://htmx.org/extensions/ |
+
+htmx 4 annotations (tagged `[htmx 4]`, `[htmx 4 change]`, `[htmx 4 removed]`) were sourced from the v4 beta documentation at `four.htmx.org` as of v4.0.0-beta4 (May 2026).

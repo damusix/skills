@@ -451,3 +451,13 @@ Or load the `htmx-2-compat` extension which restores implicit inheritance, legac
 - **JSX compatibility** — `htmx.config.metaCharacter = "-"` replaces `:` with `-` in attribute names
 
 HTMX 2.x will continue to be supported. No rush to migrate, but be aware when starting new projects. Each reference file in this skill is annotated with `[htmx 4]`, `[htmx 4 change]`, and `[htmx 4 removed]` admonitions at the relevant sections.
+
+## Sources
+
+[^1]: htmx documentation. <https://htmx.org/docs/> — security, accessibility, and integration guidance.
+
+[^2]: htmx documentation — security considerations. <https://htmx.org/docs/#security>
+
+[^3]: htmx 4 migration guide — backward compatibility layer (`htmx-2-compat` extension), behavioral changes, removed attributes and config options. <https://four.htmx.org/docs/get-started/migration/>
+
+[^4]: htmx GitHub repository. <https://github.com/bigskysoftware/htmx> — issue tracker and source for edge-case behavior.

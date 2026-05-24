@@ -406,3 +406,15 @@ Browsers enforce strict HTML structure. OOB swap elements may need wrapping:
     </tr>
 </template>
 ```
+
+## Sources
+
+[^1]: htmx documentation — swapping strategies, targets, and OOB swaps. <https://htmx.org/docs/#swapping>
+
+[^2]: htmx documentation — CSS transitions. <https://htmx.org/docs/#css_transitions>
+
+[^3]: htmx documentation — View Transitions API. <https://htmx.org/docs/#view-transitions>
+
+[^4]: htmx reference — `hx-swap` attribute values. <https://htmx.org/reference/#attributes>
+
+[^5]: htmx 4 migration guide — `innerMorph`/`outerMorph` swap strategies, short aliases (`before`, `after`, `prepend`, `append`), `<hx-partial>` element, OOB swap order change (main first, then OOB), scroll modifier syntax change. <https://four.htmx.org/docs/get-started/migration/>

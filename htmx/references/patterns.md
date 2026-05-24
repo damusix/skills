@@ -492,6 +492,8 @@ Server-driven tabs using hypermedia.
 
 **Use `htmx.takeClass`** to toggle the active class:
 
+> **[htmx 4 removed]** `htmx.takeClass()` moved to `hx-live` extension. Use `htmx.live.take(this, 'active')` in v4, or use a plain JS equivalent: `this.parentElement.querySelectorAll('.active').forEach(el => el.classList.remove('active')); this.classList.add('active')`.
+
 ```html
 <a hx-get="/tabs/details"
    hx-target="#tab-content"
@@ -768,3 +770,9 @@ Integration with Sortable.js for reorderable lists.
     });
 </script>
 ```
+
+## Sources
+
+[^1]: htmx examples. <https://htmx.org/examples/> — official UI pattern examples (click to edit, bulk update, lazy loading, infinite scroll, active search, progress bar, etc.).
+
+[^2]: htmx documentation. <https://htmx.org/docs/> — attribute behavior and request lifecycle underlying all patterns.

@@ -405,3 +405,11 @@ All preload requests include `HX-Preloaded: true`.
 - `mouseover` trigger has a built-in 100ms delay; if the mouse leaves before timeout, no request fires.
 - Responses are only cached if server response headers allow it (e.g., `Cache-Control: private, max-age=60`). `Cache-Control: no-cache` prevents caching.
 - Touch devices get an `ontouchstart` handler (fires immediately, no delay) alongside `mouseover`/`mousedown`.
+
+## Sources
+
+[^1]: htmx extensions directory. <https://htmx.org/extensions/> — official and community extension list with install instructions.
+
+[^2]: htmx documentation — extensions. <https://htmx.org/docs/#extensions>
+
+[^3]: htmx 4 migration guide — extension auto-registration (no `hx-ext` attribute needed), `defineExtension` → `registerExtension`, 9 bundled extensions (`alpine-compat`, `browser-indicator`, `head-support`, `htmx-2-compat`, `optimistic`, `preload`, `sse`, `upsert`, `ws`), Idiomorph superseded by `innerMorph`/`outerMorph`, `response-targets` superseded by `hx-status`. <https://four.htmx.org/docs/get-started/migration/>

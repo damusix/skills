@@ -605,3 +605,13 @@ Replaces v2's `hx-disable`. Completely prevents htmx processing on the element a
     {{ user_generated_content }}
 </div>
 ```
+
+## Sources
+
+[^1]: htmx attribute reference. <https://htmx.org/reference/#attributes> — complete list of core and additional attributes with descriptions.
+
+[^2]: htmx documentation. <https://htmx.org/docs/> — attribute inheritance, triggering, swapping, and request behavior.
+
+[^3]: htmx 4 migration guide. <https://four.htmx.org/docs/get-started/migration/> — attribute removals (`hx-params`, `hx-prompt`, `hx-disinherit`, `hx-ext`, `hx-request`, `hx-history`), new attributes (`hx-action`, `hx-method`, `hx-status`, `hx-config`, `hx-ignore`), and explicit inheritance via `:inherited` suffix.
+
+[^4]: htmx GitHub repository. <https://github.com/bigskysoftware/htmx> — source code and per-attribute behavior.

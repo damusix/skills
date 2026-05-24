@@ -225,7 +225,7 @@ htmx.ajax('POST', '/api/data', {
 
 ### DOM Manipulation
 
-> **[htmx 4 removed]** `htmx.addClass()`, `htmx.removeClass()`, `htmx.toggleClass()`, `htmx.closest()`, `htmx.remove()`, `htmx.off()` are removed. Use native DOM APIs instead: `element.classList.add()`, `element.closest()`, `element.remove()`, `removeEventListener()`.
+> **[htmx 4 removed]** `htmx.addClass()`, `htmx.removeClass()`, `htmx.toggleClass()`, `htmx.closest()`, `htmx.remove()`, `htmx.off()`, `htmx.takeClass()`, `htmx.location()` are removed. Use native DOM APIs instead: `element.classList.add()`, `element.closest()`, `element.remove()`, `removeEventListener()`. `htmx.takeClass()` moved to the `hx-live` extension as `htmx.live.take()`. `htmx.location()` replaced by `htmx.ajax()`.
 
 ```javascript
 // Class manipulation (all accept optional delay in ms)
@@ -236,7 +236,12 @@ htmx.removeClass(elt, 'active', 500);  // remove after 500ms
 htmx.toggleClass(elt, 'active');
 
 // Take class from siblings (only this element gets it)
+// [htmx 4 removed] moved to hx-live extension: htmx.live.take(elt, 'selected')
 htmx.takeClass(elt, 'selected');
+
+// Navigate via AJAX (v2 only — use htmx.ajax() in v4)
+htmx.location('/new-page');
+htmx.location({ path: '/new-page', target: '#main', swap: 'innerHTML' });
 
 // Remove element from DOM (optional delay in ms)
 htmx.remove(elt);
@@ -311,6 +316,11 @@ var values = htmx.values(formElement, 'get');
 htmx.parseInterval('500ms'); // 500
 htmx.parseInterval('2s');    // 2000
 // Caution: '3m' uses parseFloat, won't parse as minutes
+
+// [htmx 4] Promise-based delay
+htmx.timeout('500ms');           // returns Promise, resolves after 500ms
+htmx.timeout(1000);             // also accepts raw milliseconds
+await htmx.timeout('2s');       // use in async contexts
 ```
 
 ### Factory Properties
@@ -418,6 +428,9 @@ htmx.config.historyCacheSize = 20;
 | `triggerSpecsCache` | `null` | Cache object for parsed trigger specs. **[htmx 4 removed]** |
 | `allowNestedOobSwaps` | `true` | Process OOB swaps in nested content. **[htmx 4 removed]** |
 | `responseHandling` | See docs | Array of status code handling rules. **[htmx 4 removed]** — use `hx-status` attribute and `noSwap` config |
+| `noSwap` | `[204, 304]` | **[htmx 4]** Array of status codes (or patterns like `'4xx'`, `'5xx'`) that skip swap. Restore v2 behavior: `[204, 304, '4xx', '5xx']` |
+| `implicitInheritance` | `false` | **[htmx 4]** Set `true` to restore v2 implicit attribute inheritance |
+| `morphScanLimit` | `2000` | **[htmx 4]** Max elements to scan during `innerMorph`/`outerMorph` matching |
 | `historyRestoreAsHxRequest` | `true` | Send HX-Request header on history restore |
 | `reportValidityOfForms` | `false` | Report validation errors via browser UI |
 
@@ -642,3 +655,15 @@ Libraries that fire DOM events can trigger HTMX requests:
 </div>
 <div id="location-info"></div>
 ```
+
+## Sources
+
+[^1]: htmx events reference. <https://htmx.org/events/> — complete v2 event list with descriptions and `event.detail` properties.
+
+[^2]: htmx JavaScript API reference. <https://htmx.org/api/> — all JS methods, utilities, and factory properties.
+
+[^3]: htmx reference — configuration options. <https://htmx.org/reference/#config>
+
+[^4]: htmx documentation — extensions API. <https://htmx.org/docs/#extensions>
+
+[^5]: htmx 4 migration guide — event renames (colon-separated format), removed events (validation, XHR progress), removed JS methods (`htmx.addClass`, `htmx.location`, `htmx.takeClass`, etc.), new methods (`htmx.timeout`), config key renames and removals, new config keys (`noSwap`, `implicitInheritance`, `morphScanLimit`), extension API change (`defineExtension` → `registerExtension`). <https://four.htmx.org/docs/get-started/migration/>

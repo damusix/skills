@@ -420,3 +420,13 @@ document.body.addEventListener('htmx:confirm', function(event) {
 ```
 
 The user's response is available in the `HX-Prompt` request header.
+
+## Sources
+
+[^1]: htmx documentation — AJAX, triggers, parameters, and request lifecycle. <https://htmx.org/docs/#ajax>
+
+[^2]: htmx reference — request and response headers. <https://htmx.org/reference/#headers>
+
+[^3]: htmx documentation — CSRF, security, and request configuration. <https://htmx.org/docs/#security>
+
+[^4]: htmx 4 migration guide — header renames (`HX-Trigger` → `HX-Source`), removed headers (`HX-Prompt`, `HX-Trigger-Name`, `HX-Trigger-After-Settle`, `HX-Trigger-After-Swap`), new headers (`HX-Request-Type`, `Accept`), fetch replacing XHR, default timeout change. <https://four.htmx.org/docs/get-started/migration/>
