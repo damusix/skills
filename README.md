@@ -40,6 +40,10 @@ Replace `mssql-server` with the skill name you want to install.
 
 - [CLI Building](https://skills.sh/damusix/skills/cli-building) - Build TypeScript CLIs using citty, @clack/prompts, and @bomb.sh/tab
 
+### Code Search
+
+- [ast-grep](https://skills.sh/damusix/skills/ast-grep) - AST-based code search, lint, and rewrite using structural patterns instead of regex
+
 ### Algorithms & ML
 
 - [Multi-Armed Bandits](https://skills.sh/damusix/skills/arm-bandits-expert) - Expert guidance for implementing, evaluating, and deploying multi-armed bandit algorithms
