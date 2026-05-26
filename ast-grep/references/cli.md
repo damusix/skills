@@ -145,31 +145,75 @@ Generate shell completions.
     sg completions [bash|elvish|fish|powershell|zsh]
 
 
+<constraints>
+
+## CLI vs Playground Differences
+
+If CLI and Playground produce different results for the same pattern, two causes:
+
+1. **Parser version** -- CLI ships newer tree-sitter parsers than the web Playground. Node kinds or error recovery may differ.
+2. **Text encoding** -- CLI uses UTF-8; Playground uses UTF-16. Affects error recovery behavior on malformed input.
+
+Debug with `sg run -p <PATTERN> --debug-query ast` and compare against Playground output. Most inconsistencies stem from incomplete pattern context -- provide full code via the pattern object (`context` + `selector`).
+
+</constraints>
+
+
+<examples>
+
 ## Common Patterns
 
-Search for a pattern:
+<example description="Search for a pattern">
 
     sg run -p 'console.log($ARG)' -l javascript
 
-Search and replace:
+</example>
+
+<example description="Search and replace">
 
     sg run -p 'require($MOD)' -r 'import $MOD from $MOD' -l javascript -U
 
-Scan with a single rule file:
+</example>
+
+<example description="Scan with a single rule file">
 
     sg scan --rule rules/no-eval.yml
 
-Scan with inline rule:
+</example>
+
+<example description="Scan with inline rule">
 
     sg scan --inline-rules 'id: test, language: js, rule: {pattern: "eval($$$)"}'
 
-JSON output for scripting:
+</example>
+
+<example description="JSON output for scripting">
 
     sg run -p 'TODO' --json=compact
 
-Debug pattern parsing:
+</example>
+
+<example description="Debug pattern parsing">
 
     sg run -p '$FUNC($$$)' --debug-query -l typescript
+
+</example>
+
+<example description="Search markdown files (v0.43+)">
+
+    sg run -k 'atx_heading' -l md
+    sg run -k 'fenced_code_block' -l md
+    sg run -k 'atx_heading, fenced_code_block' -l md
+
+</example>
+
+<example description="ESQuery structural selectors with --kind">
+
+    sg run -k 'program > export_statement' -l ts
+
+</example>
+
+</examples>
 
 
 ## Sources

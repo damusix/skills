@@ -8,20 +8,50 @@ A rule object defines how to match AST nodes. It combines atomic, relational, an
 Every rule must contain at least one positive atomic rule (`pattern`, `kind`, or `regex`). A `not` rule alone is invalid.
 
 
+<constraints>
+
+## Matching Order
+
+Rule objects are unordered dictionaries -- ast-grep applies them in implementation-defined order: atomic rules first, then composite rules, then relational rules. The first rule that references a metavariable **captures** it; later rules can only match against that captured value.
+
+**Use `all` for order-dependent matching.** When a metavariable must be captured by one rule before another rule references it, wrap them in `all` to enforce explicit sequencing.
+
+</constraints>
+
+<example description="Enforcing metavariable capture order with all">
+
+Finding recursive functions requires capturing `$F` from the declaration before searching for calls:
+
+```yaml
+rule:
+  all:
+  - pattern: function $F() { $$$ }
+  - has:
+      pattern: $F()
+      stopBy: end
+```
+
+Reversing the order fails because `has` would capture `$F` as the first call it finds, not the declaration.
+
+</example>
+
+
 ## Atomic Rules
 
 ### pattern
 
 Matches nodes against a code pattern with metavariables.
 
-String form:
+<example description="pattern rule -- string form">
 
 ```yaml
 rule:
   pattern: console.log($ARG)
 ```
 
-Object form (for disambiguation):
+</example>
+
+<example description="pattern rule -- object form for disambiguation">
 
 ```yaml
 rule:
@@ -30,6 +60,8 @@ rule:
     selector: field_definition
     strictness: smart
 ```
+
+</example>
 
 ### kind
 
@@ -40,14 +72,24 @@ rule:
   kind: call_expression
 ```
 
-Supports ESQuery-style selectors (v0.39+):
+Supports ESQuery-style selectors (v0.39+) for structural relationships:
 
 ```yaml
 rule:
   kind: 'call_expression > identifier'
 ```
 
+Selector syntax: `A > B` (child), `A B` (descendant), `A + B` (adjacent sibling), `A ~ B` (general sibling), `A, B` (union), `:is(A, B)`, `:has()`, `:not()`, `:nth-child()`. Also works with `sg run --kind`:
+
+    sg run -k 'program > export_statement' -l ts
+
 Use `sg run --pattern '$X' --debug-query` to discover node kind names.
+
+<constraints>
+
+**`kind` and `pattern` are independent rules.** Combining them in a rule object does NOT make tree-sitter parse the pattern string as the specified kind. `{ pattern: 'a = 123', kind: field_definition }` will not match class fields -- `a = 123` still parses as an assignment expression. Use the pattern object form instead: `pattern: { context: 'class A { a = 123 }', selector: field_definition }`.
+
+</constraints>
 
 ### regex
 
@@ -64,21 +106,27 @@ Cannot stand alone -- must combine with `pattern` or `kind`. Lacks lookaround an
 
 Matches nodes by their position among siblings (1-based index, named nodes only).
 
-Number form:
+<examples>
+
+<example description="nthChild -- number form">
 
 ```yaml
 rule:
   nthChild: 1
 ```
 
-CSS An+B form:
+</example>
+
+<example description="nthChild -- CSS An+B form">
 
 ```yaml
 rule:
   nthChild: '2n+1'
 ```
 
-Object form:
+</example>
+
+<example description="nthChild -- object form with ofRule filter">
 
 ```yaml
 rule:
@@ -88,6 +136,10 @@ rule:
     ofRule:
       kind: function_declaration
 ```
+
+</example>
+
+</examples>
 
 
 ### range
@@ -161,6 +213,12 @@ Controls how far relational rules search. Available on all relational rules.
 | `neighbor` | Default. Stop at the immediate parent/child/sibling. |
 | `end` | Search all the way to root (inside), all descendants (has), or all siblings (follows/precedes). |
 | Rule object | Stop when a node matches this rule (inclusive boundary). |
+
+<constraints>
+
+**Nested AST gotcha:** some tree-sitter node kinds nest unintuitively. C/C++ `case_statement` nodes contain all subsequent cases as descendants, not siblings. When searching with `has` or `inside`, use `stopBy: { kind: case_statement }` (or the relevant boundary kind) to prevent matching through to unrelated nested nodes. Always verify structure with `--debug-query=cst`.
+
+</constraints>
 
 ### field (sub-field)
 

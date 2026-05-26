@@ -10,7 +10,13 @@ A YAML rule file defines a single lint rule or codemod. Top-level fields:
 
 **`id`** (String) -- Unique rule identifier. Example: `no-console-log`.
 
-**`language`** (String) -- Target language for parsing. Values: Bash, C, Cpp, CSharp, Css, Elixir, Go, Haskell, Hcl, Html, Java, JavaScript, Json, Kotlin, Lua, Nix, Php, Python, Ruby, Rust, Scala, Solidity, Swift, Tsx, TypeScript, Yaml.
+**`language`** (String) -- Target language for parsing. Values: Bash, C, Cpp, CSharp, Css, Elixir, Go, Haskell, Hcl, Html, Java, JavaScript, Json, Kotlin, Lua, Markdown, Nix, Php, Python, Ruby, Rust, Scala, Solidity, Swift, Tsx, TypeScript, Yaml.
+
+<constraints>
+
+**Markdown support (v0.43+):** powered by `tree-sitter-md`. Supports structural queries on `atx_heading`, `fenced_code_block`, `list_item`, and other markdown nodes. The parser has known edge cases with complex markdown -- validate results before relying on output for rewrites.
+
+</constraints>
 
 **`rule`** (Rule object) -- The matching rule. See [Rule Reference](rule-reference.md).
 
@@ -19,13 +25,17 @@ A YAML rule file defines a single lint rule or codemod. Top-level fields:
 
 **`fix`** (String or FixConfig) -- Replacement text for matched nodes. Metavariables from the pattern are substituted. Empty string deletes the match.
 
-String form:
+<examples>
+
+<example description="fix -- string form">
 
 ```yaml
 fix: logger.info($ARG)
 ```
 
-Object form (for surrounding token cleanup):
+</example>
+
+<example description="fix -- object form for surrounding token cleanup">
 
 ```yaml
 fix:
@@ -39,6 +49,10 @@ fix:
 - `template` -- replacement text
 - `expandStart` -- rule to expand the replacement range backward (e.g., to eat a preceding comma)
 - `expandEnd` -- rule to expand the replacement range forward
+
+</example>
+
+</examples>
 
 **`rewriters`** (Array) -- Named rewriter sub-rules for use with the `rewrite` transform. Each entry has `id`, `rule`, and optionally `fix`/`transform`.
 
@@ -61,9 +75,9 @@ constraints:
 
 **`transform`** (HashMap<String, Transformation>) -- Manipulate metavariable values before substitution in `fix`.
 
-#### replace
+<examples>
 
-Regex substitution on a metavariable's text:
+<example description="transform: replace -- regex substitution on a metavariable's text">
 
 ```yaml
 transform:
@@ -76,9 +90,9 @@ transform:
 
 String shorthand: `replace($OLD_NAME, replace=Foo, by=Bar)`
 
-#### substring
+</example>
 
-Extract a substring by character index (Unicode). Negative indices count from end.
+<example description="transform: substring -- extract by character index (negative counts from end)">
 
 ```yaml
 transform:
@@ -91,9 +105,9 @@ transform:
 
 String shorthand: `substring($VAR, startChar=1, endChar=-1)`
 
-#### convert
+</example>
 
-Change string casing:
+<example description="transform: convert -- change string casing">
 
 ```yaml
 transform:
@@ -110,9 +124,9 @@ Separators: `dash`, `dot`, `space`, `slash`, `underscore`, `caseChange`.
 
 String shorthand: `convert($NAME, toCase=snakeCase)`
 
-#### rewrite
+</example>
 
-Apply rewriter rules to a metavariable's AST subtree:
+<example description="transform: rewrite -- apply rewriter rules to a metavariable's AST subtree">
 
 ```yaml
 transform:
@@ -126,6 +140,10 @@ transform:
 String shorthand: `rewrite($$$ITEMS, rewriters=[my-rewriter], joinBy='\n')`
 
 Rewriters apply in order; first match wins per node. Higher AST levels match before deeper ones.
+
+</example>
+
+</examples>
 
 
 ### Linting Metadata
@@ -161,6 +179,8 @@ labels:
 
 Project-level configuration file (like `tsconfig.json` for ast-grep).
 
+<example description="sgconfig.yml with all common fields">
+
 ```yaml
 ruleDirs:
   - rules
@@ -178,6 +198,8 @@ languageGlobs:
   json: ['.eslintrc']
 ```
 
+</example>
+
 ### Fields
 
 **`ruleDirs`** (required, Array<String>) -- Directories containing YAML rule files. Paths relative to sgconfig.yml.
@@ -186,7 +208,7 @@ languageGlobs:
 
 **`utilDirs`** (optional, Array<String>) -- Directories containing global utility rules.
 
-**`languageGlobs`** (optional, HashMap) -- Map non-standard file extensions to language parsers.
+**`languageGlobs`** (optional, HashMap) -- Map non-standard file extensions to language parsers. Also the recommended approach for handling similar languages (TS/JS, C/C++): parse all files as the superset language (e.g., TypeScript encompasses JavaScript) rather than writing multi-language rules. ast-grep does not support multi-language rules because similar languages produce different ASTs and node kinds.
 
 **`customLanguages`** (optional, HashMap) -- Register custom tree-sitter parsers:
 

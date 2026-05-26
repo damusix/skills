@@ -3,6 +3,8 @@ evals/
 evals*/
 .agents
 .claude
+claude.md
+CLAUDE.md
 .codex
 .cursor
 .gemini
