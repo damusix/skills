@@ -10,5 +10,6 @@ CLAUDE.md
 .gemini
 .vscode
 .mcp.json
+private
 !ghost-themes/base-template/.github
 !ghost-themes/base-template/.mcp.json
