@@ -40,6 +40,10 @@ Replace `mssql-server` with the skill name you want to install.
 
 - [CLI Building](https://skills.sh/damusix/skills/cli-building) - Build TypeScript CLIs using citty, @clack/prompts, and @bomb.sh/tab
 
+### Testing
+
+- [Hurl](https://skills.sh/damusix/skills/hurl) - Plain-text HTTP API testing with the Hurl CLI — assertions, captures, CI reports, and executable API documentation
+
 ### Code Search
 
 - [ast-grep](https://skills.sh/damusix/skills/ast-grep) - AST-based code search, lint, and rewrite using structural patterns instead of regex
