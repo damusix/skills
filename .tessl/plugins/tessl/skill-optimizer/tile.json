@@ -1,7 +1,7 @@
 {
-  "name": "tessl-labs/skill-optimizer",
-  "version": "0.7.1",
-  "summary": "Optimize your skills and tiles: review SKILL.md quality, generate eval scenarios, run evals, compare across models, diagnose gaps, and re-run until scores improve.",
+  "name": "tessl/skill-optimizer",
+  "version": "0.12.0",
+  "summary": "Optimize your skills and plugins: review SKILL.md quality, generate eval scenarios, run evals, compare across models, diagnose gaps, and re-run until scores improve.",
   "private": false,
   "skills": {
     "optimize-skill-performance-and-instructions": {

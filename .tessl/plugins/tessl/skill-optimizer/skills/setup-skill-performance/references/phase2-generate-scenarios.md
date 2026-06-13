@@ -2,14 +2,14 @@
 
 ## 2.1 Run scenario generation
 
-Generate scenarios from the tile:
+Generate scenarios from the plugin:
 ```bash
-tessl scenario generate <tile-path> --count=<N>
+tessl scenario generate <plugin-path> --count=<N>
 ```
 
 Default to `--count=3` for a first run, up to 5 for comprehensive coverage. For example:
 ```bash
-tessl scenario generate ./my-tile --count=3
+tessl scenario generate ./my-plugin --count=3
 ```
 
 The CLI polls until complete (~1–2 minutes per scenario). Capture the **run ID** from the output — you'll need it for the download step.

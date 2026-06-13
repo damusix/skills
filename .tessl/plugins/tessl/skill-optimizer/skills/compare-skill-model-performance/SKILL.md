@@ -1,40 +1,61 @@
 ---
 name: compare-skill-model-performance
-description: Run task evals across multiple Claude models, compare results side-by-side, and optimise. Use when you want to understand how a skill performs across different models, identify model-specific gaps versus universal tile issues, or validate a skill before publishing it to the registry.
+description: Run task evals across multiple Claude models, compare results side-by-side, and optimise. Use when you want to benchmark a skill across models, compare haiku vs sonnet vs opus performance, run multi-model comparison or benchmark reports, identify model-specific gaps versus universal plugin gaps, evaluate whether a skill works for all model tiers, or validate a skill before publishing it to the registry.
 ---
 
 # Review Model Performance
 
 **Models tested by default:** `claude-haiku-4-5`, `claude-sonnet-4-6`, `claude-opus-4-6` (cheapest to most capable)
 
-**Eval command:** `tessl eval run <path/to/tile> --agent=...`
+**Eval command:** `tessl eval run <path/to/plugin> --agent=... --label <run-label>`
+
+## Run labels
+
+Every `tessl eval run` invocation MUST include `--label <run-label>` so the run is identifiable in `tessl eval list`. The label is a short, human-readable description of what the run is about — not a structured ID.
+
+Compose `<run-label>` from whatever helps you recognise the run later when scanning the list. Typical ingredients:
+
+- **Eval type** — e.g. `activation`, `baseline`, `initial evals`, `verification`
+- **What was being tested or changed** — e.g. `description rewrite`, `plan-solution fixes`, `clean scenario`
+- **Model in parens, when comparing models** — e.g. `(haiku-4-5)`, `(sonnet-4-6)`
+- **Version when iterating** — e.g. `v0.5.0`, `v4`
+
+Examples:
+- `repro-clean-scenario`
+- `task-prep v0.3.0 baseline`
+- `task-prep v0.5.0 plan-solution fixes`
+- `v4-final-verification`
+- `skill-insights activation (haiku-4-5)`
+- `skill-insights initial evals (haiku-4-5)`
+
+Keep it concise — what the run was about should be obvious without opening it.
 
 ---
 
-## Phase 1: Identify the tile
+## Phase 1: Identify the plugin
 
-### 1.1 Find the tile
+### 1.1 Find the plugin
 
-Look for a `tile.json` in the current directory or a parent/sibling directory. Exclude `.tessl/` cache directories:
+Look for a plugin manifest (`.tessl-plugin/plugin.json`) in the current directory or a parent/sibling directory. Exclude `.tessl/` cache directories:
 ```bash
-find . -name "tile.json" -not -path "*/node_modules/*" -not -path "*/.tessl/*" 2>/dev/null | head -10
+find . -path "*/.tessl-plugin/plugin.json" -not -path "*/node_modules/*" -not -path "*/.tessl/*" 2>/dev/null | head -10
 ```
 
-If the user provides a path inside a `.tessl/tiles/` directory (an installed tile cache), stop and warn them: that path is Tessl's local install cache — running evals from there won't work and changes would be overwritten on the next `tessl install`. Offer two options: point to the original tile source, or copy the tile out of `.tessl/tiles/` to a new location (`cp -r .tessl/tiles/<workspace>/<tile> ./<tile>`).
+If the user provides a path inside a `.tessl/plugins/` directory (an installed plugin cache), stop and warn them: that path is Tessl's local install cache — running evals from there won't work and changes would be overwritten on the next `tessl install`. Offer two options: point to the original plugin source, or copy the plugin out of `.tessl/plugins/` to a new location (`cp -r .tessl/plugins/<workspace>/<plugin> ./<plugin>`).
 
-If multiple tiles are found outside `.tessl/`, ask the user which one to evaluate. If none are found, explain that this skill evaluates a packaged tile and suggest `tessl tile new` to get started.
+If multiple plugins are found outside `.tessl/`, ask the user which one to evaluate. If none are found, explain that this skill evaluates a packaged plugin and suggest `tessl plugin new` to get started.
 
 ### 1.2 Verify eval scenarios exist
 
 ```bash
-ls <tile-dir>/evals/*/task.md 2>/dev/null
+ls <plugin-dir>/evals/*/task.md 2>/dev/null
 ```
 
 If no scenarios exist, inform the user and provide the quickest path to generate them:
 ```bash
-tessl scenario generate <path/to/tile> --count=3
+tessl scenario generate <path/to/plugin> --count=3
 tessl scenario download --last
-mv ./evals/ <tile-dir>/evals/
+mv ./evals/ <plugin-dir>/evals/
 ```
 Note that scenario generation takes roughly 1–2 minutes per scenario. Also mention the `setup-skill-performance` skill for a guided walkthrough.
 
@@ -71,33 +92,32 @@ If they choose more than 1, add `--runs=<n>` to all eval run commands in Phase 3
 
 ## Phase 3: Run evals across models
 
-Run one eval per model, in sequence from the tile's directory. Do NOT run them in parallel — capture each run ID before starting the next.
+Run models **one at a time, fully completing each before starting the next**. Do NOT start multiple eval runs back-to-back — even without bash `&` or background jobs, kicking off all three then polling them causes them to execute concurrently on the server, which inflates cost and creates noisy interactions between runs.
 
-```bash
-tessl eval run <path/to/tile> --agent=claude:<model> [--runs=<n>]
-```
+For each model in your chosen set, in order:
 
-Capture the **eval run ID** from the output (`Eval run started: <id>`). Store all run IDs mapped to model names. After each starts, briefly update the user (e.g., "✔ Started haiku: `<id>`. Starting sonnet…").
+1. **Start** the eval:
+   ```bash
+   tessl eval run <path/to/plugin> --agent=claude:<model> [--runs=<n>] --label <run-label>
+   ```
+2. **Capture** the eval run ID from the output (`Eval run started: <id>`). Store it mapped to the model name for Phase 5.
+3. **Share** the browser monitoring URL with the user (`https://tessl.io/eval-runs/<id>`).
+4. **Poll this run to completion** (see Phase 4) before looping to the next model.
 
-After all are started, share the browser monitoring URLs and note that you'll poll for completion:
-```
-https://tessl.io/eval-runs/<id>
-```
+Update the user as each model finishes (e.g., "✔ haiku complete (`<id>`). Starting sonnet…").
 
 ---
 
-## Phase 4: Poll for completion
+## Phase 4: Poll for completion (per model)
 
-Poll with `tessl eval view <id>` every few minutes, checking for `Status: ✔ Completed` or `Status: ✖ Failed`.
+For the current model's run, poll with `tessl eval view <id>` every few minutes until you see `Status: ✔ Completed` or `Status: ✖ Failed`. Only then loop back to Phase 3 to start the next model.
 
-Report status as runs complete (e.g., haiku ✔, sonnet → In Progress, opus → In Progress).
-
-If a run fails, retry immediately:
+If a run fails, retry it:
 ```bash
 tessl eval retry <id>
 ```
 
-Wait until all runs show `Completed` before proceeding.
+Once every model in the chosen set has reached `Completed`, proceed to Phase 5.
 
 ---
 
@@ -113,7 +133,7 @@ Parse both the **baseline (without skill)** and **with skill** scores for every 
 ### 5.1 Overall summary table
 
 ```
-Model Comparison — <tile-name>
+Model Comparison — <plugin-name>
 
   Model                     Without Skill   With Skill   Delta
   ─────────────────────────────────────────────────────────────
@@ -157,17 +177,13 @@ Criterion Breakdown — with skill
 
 ### 6.1 Baseline interpretation
 
-Assess what baseline (without-skill) scores reveal before discussing the skill's impact:
-
-- **High baseline (≥ 80%):** The base model handles this task on its own — the skill adds little value here.
-- **Low baseline (< 50%):** The base model struggles without guidance — this is where the skill earns its place.
-- **Variable baseline across models:** If haiku struggles but sonnet/opus don't, haiku users benefit more from the skill.
+Before discussing the skill's impact, note what the without-skill scores reveal: high baselines (≥80%) mean the skill adds little; low baselines (<50%) are where the skill earns its place; baselines that diverge across models indicate which tier benefits most from the skill.
 
 ### 6.2 Classify failing criteria
 
 For criteria that score poorly (with skill):
 
-- **"Universal Failure" pattern (all models fail):** Tile gap — instructions are missing, ambiguous, or conflicting. Highest priority.
+- **"Universal Failure" pattern (all models fail):** Plugin gap — instructions are missing, ambiguous, or conflicting. Highest priority.
 - **"Capability Gradient" pattern (haiku fails, sonnet/opus pass):** Instructions too implicit for weaker models. Fix: simpler, more explicit phrasing.
 - **"Model Anomaly" pattern (single-model anomaly):** Likely eval variance. Note but don't prioritize.
 - **"Regression" pattern (without-skill outperforms with-skill):** The skill is actively confusing the model. High priority regardless of which model it affects.
@@ -186,7 +202,7 @@ Give a plain-language summary of the combined baseline + with-skill picture for 
 
 **If all models score well (≥ 80% with skill):**
 ```bash
-tessl tile publish <path/to/tile>
+tessl plugin publish <path/to/plugin>
 ```
 
 **If results are variable / runs=1 was used:** Recommend re-running with `--runs=3` before publishing to average out variance.

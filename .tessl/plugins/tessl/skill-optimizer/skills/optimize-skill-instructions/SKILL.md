@@ -1,29 +1,18 @@
 ---
 name: optimize-skill-instructions
 description: |
-  Review and improve your SKILL.md with actionable recommendations. Reads skill bundle (SKILL.md + related docs), validates syntax, explains rubric, shows before/after scores. Use when reviewing skill quality, improving a skill file, checking skill scoring, making your skill better, or learning the skill rubric. This is the standalone review skill — for the full optimization cycle (review + evals + improve), use the `optimize-skill-performance-and-instructions` skill instead.
+  Review and improve your SKILL.md with actionable recommendations. Reads skill bundle, validates syntax and references, explains rubric, shows before/after scores. Use when reviewing skill quality, improving a SKILL.md file, checking scoring dimensions and quick wins, auditing progressive disclosure and orphaned bundle files, generating improvement recommendations, running a post-edit quality audit, creating approval-gated change proposals, or automating the skill review workflow. For the full optimization cycle (review + evals + improve), use `optimize-skill-performance-and-instructions`.
 ---
 
 # Review Best Practices
 
 Improve your SKILL.md using `tessl skill review` plus validation and context: reads your full skill bundle, validates syntax, explains WHY changes help, and catches mistakes before applying.
 
-## How It Works
-
-- Runs `tessl skill review` to get baseline and judge feedback
-- Reads full skill bundle for context (SKILL.md + related files)
-- Validates syntax before applying changes
-- Explains WHY changes improve scores
-- Final accuracy check to prevent mistakes
-
 ## Guiding Principles
 
-- Unsure about details, domain terms, or best practices → ask the user
-- Don't invent code examples, command flags, or workflow steps
-- Judge suggestion conflicts with skill's purpose → discuss trade-offs
-- Some skills need verbose explanations or specialized structure
-- The rubric optimizes for routing, not domain excellence
-- When in doubt, confirm with user
+- The rubric optimizes for routing, not domain excellence — some skills legitimately need verbose explanations or specialized structure
+- A judge suggestion that conflicts with the skill's purpose should be discussed as a trade-off, not silently applied
+- Don't invent rubric dimensions, score deltas, or `tessl skill review` flags — derive them from actual review output
 
 ## Workflow
 
@@ -50,18 +39,36 @@ If bundle has reference files (REFERENCE.md, etc.), recommend linking instead of
 
 **CRITICAL: Validate before applying changes**
 
-Validate Python syntax (`ast.parse`), command flags (check `--help`), file references, and JavaScript (`node --check`). See [references/REFERENCE.md](references/REFERENCE.md) for detailed validation examples and common mistakes.
+Run each validation step and show the output — do not just describe what you would run:
+- Python: run `ast.parse` on any Python code blocks and show the output (including any SyntaxError details)
+- JavaScript: run `node --check <file>` and show the result
+- Commands: consult `--help` output to verify flags are valid
+- Files: check that every referenced file path exists
+- Frontmatter `description:` field: verify it contains a "Use when..." trigger clause (check the YAML header, not the body)
+- Content: flag any concepts the agent already knows (explain nothing obvious)
+
+See [references/REFERENCE.md](references/REFERENCE.md) for examples. When producing an automation script, include each step as executable code (not comments).
 
 ### Phase 5: Present Recommendations
 
-Show summary with priorities (Critical/High/Medium) and expected improvement. For each: current score, issue, before/after, impact, educational WHY.
+**Start with a priority summary table** before individual details:
+
+```
+Priority | Recommendation           | Score impact | Dimension
+---------|--------------------------|-------------|----------
+Critical | Add "Use when..." clause  | +15% overall | Completeness 0→3
+High     | Remove HMAC explanation  | +8% overall  | Conciseness 1→2
+Medium   | Add retry example        | +5% overall  | Actionability 2→3
+```
+
+Then for each recommendation: current dimension score, issue, before/after examples, numeric score impact estimate (e.g. "+8% overall, Actionability 2→3"), and educational WHY.
 
 **Discuss trade-offs, not just score gains:**
 - "This would improve Conciseness but removes domain context—worth it?"
 - "The judge suggests X, but it might not fit your skill's purpose—thoughts?"
 - Present options when recommendations have trade-offs
 
-Get user approval before applying.
+Frame changes as proposals (e.g., "I recommend X" or "I suggest removing Y") rather than imperative instructions. Get user approval before applying.
 
 ### Phase 6: Apply Changes
 
@@ -120,7 +127,7 @@ grep -oE '\[[^]]*\]\(([^)]+\.md)\)' SKILL.md | cut -d'(' -f2 | cut -d')' -f1
 
 **For each orphaned file, recommend:**
 - ✅ Link it with clear routing signals: "See [FILE.md] for X when Y"
-- ❌ Remove it: "FILE.md exists but is never referenced—remove to reduce tile bloat?"
+- ❌ Remove it: "FILE.md exists but is never referenced—remove to reduce plugin bloat?"
 
 Don't leave unreferenced files in the bundle. They waste space and confuse maintainers.
 
