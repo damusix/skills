@@ -1,0 +1,88 @@
+# Release with release-please — version + changelog from conventional commits,
+# then attach platform binaries. Copy to .github/workflows/release-please.yml.
+#
+# Prerequisites (both at repo root, committed):
+#   - release-please-config.json
+#   - release-please-manifest.json   (e.g. {".": "0.1.0"})
+#   See references/release.md for their contents.
+#
+# Optional: set a RELEASE_PLEASE_TOKEN secret (a PAT or GitHub App token) so the
+# release PR's checks run as a real actor. With the default GITHUB_TOKEN the
+# PR's own push events won't trigger other workflows.
+#
+# Placeholders:
+#   src/cli.ts   -> your CLI entrypoint
+#   my-cli       -> your binary name
+#   main         -> your default branch
+name: release-please
+
+on:
+    push:
+        branches: [main]
+
+permissions:
+    contents: write
+    pull-requests: write
+
+jobs:
+    release-please:
+        runs-on: ubuntu-latest
+        outputs:
+            release_created: ${{ steps.release.outputs.release_created }}
+            tag_name: ${{ steps.release.outputs.tag_name }}
+        steps:
+            - uses: googleapis/release-please-action@v4
+              id: release
+              with:
+                  config-file: release-please-config.json
+                  manifest-file: release-please-manifest.json
+                  token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Build + attach binaries in the SAME run as the release. release-please
+    # creates the tag with GITHUB_TOKEN, and a tag pushed by a workflow token
+    # does NOT trigger a separate `on: push: tags` workflow — a standalone
+    # tag-triggered release.yml would silently never run. Gating on
+    # release_created keeps the build in the push-to-main run that always fires.
+    # ──────────────────────────────────────────────────────────────────────
+    build:
+        needs: release-please
+        if: ${{ needs.release-please.outputs.release_created == 'true' }}
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: oven-sh/setup-bun@v2
+              with:
+                  bun-version: latest
+
+            - run: bun install --frozen-lockfile
+
+            - name: Compile binaries for all platforms
+              run: |
+                  set -e
+                  mkdir -p dist/release
+                  for t in bun-darwin-arm64 bun-darwin-x64 bun-linux-x64 bun-linux-arm64; do
+                    bun build --compile --target="$t" src/cli.ts \
+                      --outfile "dist/release/my-cli-${t#bun-}"
+                  done
+                  # Windows needs the .exe suffix.
+                  bun build --compile --target=bun-windows-x64 src/cli.ts \
+                    --outfile dist/release/my-cli-windows-x64.exe
+
+            - name: Generate checksums
+              working-directory: dist/release
+              run: shasum -a 256 my-cli-* > checksums.txt
+
+            - name: Attach binaries to the release
+              uses: softprops/action-gh-release@v2
+              with:
+                  tag_name: ${{ needs.release-please.outputs.tag_name }}
+                  files: |
+                      dist/release/my-cli-*
+                      dist/release/checksums.txt
+                  fail_on_unmatched_files: true
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

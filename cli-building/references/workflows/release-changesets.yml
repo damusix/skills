@@ -1,0 +1,112 @@
+# Release with Changesets — publishes to npm, optionally attaches a binary.
+# Copy to .github/workflows/release.yml and adjust the marked placeholders.
+#
+# Prerequisites:
+#   - `bunx changeset init` has been run (.changeset/config.json committed)
+#   - package.json scripts: "version": "changeset version",
+#                           "release": "bun run build && changeset publish"
+#   - npm auth: either npm OIDC trusted publishing (keep id-token: write below
+#     and register this repo as a trusted publisher on npmjs.com), OR an
+#     NPM_TOKEN secret (uncomment it under the changesets step, drop id-token).
+#
+# Placeholders:
+#   src/cli.ts   -> your CLI entrypoint
+#   my-cli       -> your binary name
+#   main         -> your default branch
+name: Release
+
+on:
+    push:
+        branches: [main]
+
+# One release run at a time.
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+    contents: write # create tags + GitHub Releases
+    pull-requests: write # open/update the "Version Packages" PR
+    id-token: write # npm OIDC trusted publishing (drop if you use NPM_TOKEN)
+
+jobs:
+    release:
+        runs-on: ubuntu-latest
+        outputs:
+            published: ${{ steps.changesets.outputs.published }}
+            publishedPackages: ${{ steps.changesets.outputs.publishedPackages }}
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  registry-url: 'https://registry.npmjs.org'
+
+            - uses: oven-sh/setup-bun@v2
+
+            - run: bun install --frozen-lockfile
+
+            - run: bun run build
+
+            # On a push with pending .changeset/*.md files, the action opens or
+            # updates a "Version Packages" PR (bumps + CHANGELOG). When that PR
+            # is merged and no changesets remain, the same action publishes.
+            - name: Create Release PR or publish to npm
+              id: changesets
+              uses: changesets/action@v1
+              with:
+                  version: bun run version
+                  publish: bun run release
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  # NPM_TOKEN: ${{ secrets.NPM_TOKEN }}  # uncomment if not using OIDC
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Optional: attach compiled binaries when a publish actually happened.
+    # Gate on the publish output, NOT on a tag-push event — a tag created by
+    # changeset publish via GITHUB_TOKEN would not trigger `on: push: tags`.
+    # For a monorepo, narrow the condition, e.g.:
+    #   if: needs.release.outputs.published == 'true' &&
+    #       contains(needs.release.outputs.publishedPackages, '@myorg/cli')
+    # ──────────────────────────────────────────────────────────────────────
+    build-binaries:
+        needs: release
+        if: needs.release.outputs.published == 'true'
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: oven-sh/setup-bun@v2
+
+            - run: bun install --frozen-lockfile
+
+            - name: Read released version
+              id: v
+              run: echo "tag=v$(jq -r .version package.json)" >> "$GITHUB_OUTPUT"
+
+            - name: Compile binaries (cross-compiled from one runner)
+              run: |
+                  set -e
+                  mkdir -p dist/release
+                  for t in bun-darwin-arm64 bun-darwin-x64 bun-linux-x64 bun-linux-arm64; do
+                    bun build --compile --target="$t" src/cli.ts \
+                      --outfile "dist/release/my-cli-${t#bun-}"
+                  done
+                  bun build --compile --target=bun-windows-x64 src/cli.ts \
+                    --outfile dist/release/my-cli-windows-x64.exe
+
+            - name: Generate checksums
+              working-directory: dist/release
+              run: shasum -a 256 my-cli-* > checksums.txt
+
+            - name: Attach binaries to the release
+              uses: softprops/action-gh-release@v2
+              with:
+                  tag_name: ${{ steps.v.outputs.tag }}
+                  files: |
+                      dist/release/my-cli-*
+                      dist/release/checksums.txt
+                  fail_on_unmatched_files: true
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

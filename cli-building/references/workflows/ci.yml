@@ -1,0 +1,70 @@
+# CI gate — runs on every push and PR. Keep this green before any release.
+# Copy to .github/workflows/ci.yml and adjust the marked placeholders.
+#
+# Placeholders:
+#   src/cli.ts   -> your CLI entrypoint
+#   main         -> your default branch
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+
+jobs:
+    ci:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: oven-sh/setup-bun@v2
+              with:
+                  bun-version: latest
+
+            # --frozen-lockfile fails if the lockfile drifts from the manifest,
+            # so CI never resolves a different dependency tree than the commit.
+            - name: Install
+              run: bun install --frozen-lockfile
+
+            # Cheapest checks first: a lint error fails in seconds, not after tests.
+            - name: Lint
+              run: bun run lint
+
+            - name: Typecheck
+              run: bun run typecheck
+
+            - name: Build
+              run: bun run build
+
+            - name: Test
+              run: bun test
+
+            # Optional but cheap: catch a CLI that builds but won't compile to a
+            # standalone binary, before a release run discovers it. Drop if you
+            # ship npm-only.
+            - name: Smoke-compile binary
+              run: bun build --compile src/cli.ts --outfile /tmp/cli-smoke
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Optional: integration tests against a real service. Uncomment and adapt
+    # if your CLI talks to a database/queue/etc. Service containers get health
+    # checks so steps don't start before the service is ready.
+    # ──────────────────────────────────────────────────────────────────────
+    # integration:
+    #     runs-on: ubuntu-latest
+    #     needs: ci
+    #     services:
+    #         postgres:
+    #             image: postgres:17-alpine
+    #             ports: ['5432:5432']
+    #             env:
+    #                 POSTGRES_PASSWORD: test
+    #             options: >-
+    #                 --health-cmd "pg_isready" --health-interval 5s --health-retries 5
+    #     steps:
+    #         - uses: actions/checkout@v4
+    #         - uses: oven-sh/setup-bun@v2
+    #         - run: bun install --frozen-lockfile
+    #         - run: bun run build
+    #         - run: bun test tests/integration

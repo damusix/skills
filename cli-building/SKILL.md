@@ -1,6 +1,6 @@
 ---
 name: cli-building
-description: "Use when building TypeScript CLIs. Guides command structure, interactive prompts, and tab completion using citty, `@clack/prompts`, and `@bomb.sh/tab`."
+description: "Use when building TypeScript CLIs. Guides command structure, interactive prompts, and tab completion using citty, `@clack/prompts`, and `@bomb.sh/tab` — and shipping them: CI gates, versioning (Changesets / release-please), and npm or single-binary release."
 ---
 
 # Citty CLI
@@ -41,6 +41,7 @@ See [architecture](references/architecture.md) for the full `cli/` layout with c
 4. Scaffold `cli/` if multi-command — [architecture](references/architecture.md)
 5. Configure bin entry — [sidecar setup](references/sidecar-setup.md)
 6. **Verify** — run with `--help` to confirm command registration
+7. Ship it — CI gates, versioning, npm or binary release — [release](references/release.md)
 
 ## References
 
@@ -51,3 +52,4 @@ See [architecture](references/architecture.md) for the full `cli/` layout with c
 - [Tab Completion](references/tab-completion.md) — `@bomb.sh/tab` adapter
 - [Sidecar Setup](references/sidecar-setup.md) — bin entry, build config
 - [Citty API](references/citty-api.md) — Resolvable, plugins, CLIError
+- [Release](references/release.md) — CI gates, Changesets/release-please, npm + binary distribution
