@@ -1,0 +1,9 @@
+{
+  "name": "alonso-skills/hurl",
+  "version": "0.1.0",
+  "description": "Write and run HTTP API tests in Hurl's plain-text format — requests, assertions, captures, CI reports, and executable API documentation",
+  "private": false,
+  "skills": [
+    "SKILL.md"
+  ]
+}

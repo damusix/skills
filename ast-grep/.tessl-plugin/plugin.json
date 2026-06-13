@@ -1,0 +1,9 @@
+{
+  "name": "alonso-skills/ast-grep",
+  "version": "0.1.0",
+  "description": "AST-based code search, lint, and rewrite using ast-grep patterns and rules",
+  "private": false,
+  "skills": [
+    "SKILL.md"
+  ]
+}

@@ -1,20 +1,18 @@
 ---
 name: ghost-theme
 description: >-
-  Build, customize, and deploy Ghost CMS themes. Use this skill whenever the user
-  mentions Ghost themes, Ghost CMS, Handlebars templates (.hbs files), Ghost
-  Admin, Ghost membership/subscription integration, Ghost custom settings, or
-  Ghost content API — even if they don't say "theme" explicitly. Trigger on:
-  building a blog theme, creating a Ghost site, editing .hbs templates, adding
-  member-only content, Ghost hero sections, Ghost routing (routes.yaml), Ghost
-  image optimization, Ghost dark mode, Ghost search, Ghost deploy, gscan
-  validation, Ghost JSON-LD/SEO, or any mention of {{ghost_head}}, {{ghost_foot}},
-  {{#foreach}}, {{#get}}, {{img_url}}, {{asset}}, `@custom`, `@member`, or Portal.
-  Also use when the user has an existing Ghost theme they want to modify, extend,
-  or debug — not just for new themes. Also trigger on: Koenig editor cards, .kg-
-  CSS classes, kg-image-card, kg-gallery-card, kg-bookmark-card, kg-callout-card,
-  kg-toggle-card, kg-header-card, kg-signup-card, card_assets, cards.min.css,
-  content card styling, breakout image layout, wide/full-width cards.
+  Build, customize, and deploy Ghost CMS themes. Use whenever the user mentions
+  Ghost themes, Ghost CMS, Handlebars templates (.hbs), Ghost Admin,
+  membership/subscription integration, custom settings, or the content API — even
+  without saying "theme". Trigger on: building a blog theme, creating a Ghost
+  site, editing .hbs templates, member-only content, hero sections, routing
+  (routes.yaml), image optimization, dark mode, search, deploy, gscan validation,
+  JSON-LD/SEO, or any mention of {{ghost_head}}, {{ghost_foot}}, {{#foreach}},
+  {{#get}}, {{img_url}}, {{asset}}, @custom, @member, or Portal. Also use to
+  modify, extend, or debug an existing theme. Also trigger on Koenig editor cards
+  and .kg-* card styling (kg-image-card, kg-gallery-card, kg-bookmark-card,
+  kg-callout-card, kg-toggle-card, kg-header-card, kg-signup-card), card_assets,
+  cards.min.css, and breakout/wide/full-width card layout.
 ---
 
 # Ghost Theme Skill

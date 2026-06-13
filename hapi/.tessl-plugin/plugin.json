@@ -1,0 +1,9 @@
+{
+  "name": "alonso-skills/hapi",
+  "version": "0.1.1",
+  "description": "Creates, configures, and debugs `@hapi/hapi` servers — implements routes, plugins, auth schemes, validation, caching, and request lifecycle hooks. Use when building HTTP APIs, setting up stale-while-revalidate caching, registering server methods, configuring views, managing startup sequences, or troubleshooting response marshalling.",
+  "private": false,
+  "skills": [
+    "SKILL.md"
+  ]
+}
