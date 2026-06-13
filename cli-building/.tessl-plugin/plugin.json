@@ -1,8 +1,8 @@
 {
   "name": "alonso-skills/cli-building",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Skill for building TypeScript CLIs using citty, @clack/prompts, and @bomb.sh/tab",
-  "private": true,
+  "private": false,
   "skills": [
     "SKILL.md"
   ]
