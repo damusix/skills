@@ -53,3 +53,4 @@ See [architecture](references/architecture.md) for the full `cli/` layout with c
 - [Sidecar Setup](references/sidecar-setup.md) — bin entry, build config
 - [Citty API](references/citty-api.md) — Resolvable, plugins, CLIError
 - [Release](references/release.md) — CI gates, Changesets/release-please, npm + binary distribution
+- [Update Command](references/update-command.md) — ask-first self-update: install-mode routing, checksum-verified atomic swap, passive banner

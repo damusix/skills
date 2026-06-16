@@ -8,6 +8,8 @@ The skill so far takes a CLI from its first command to a `bin` entry. This is th
 
 Make those two calls, then wire up CI. This skill ships ready-to-copy GitHub Actions files in [`workflows/`](workflows/) — pick the ones that match your decisions, drop them in `.github/workflows/`, and adjust the placeholders.
 
+Once it ships, give users a way to stay current without reinstalling: a self-update command. That is its own concern — see [update-command](update-command.md), especially if you distribute a binary, where there is no package manager to update it for them.
+
 
 ## Decision 1 — Distribution
 
