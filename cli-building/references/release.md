@@ -48,6 +48,8 @@ Ship the npm package *and* attach binaries to the same release. The Node crowd g
 
 ## Decision 2 — Versioning
 
+The tools below own *how* the version bumps; deciding *which* bump (patch / minor / major), when to stay in `0.x` versus cut `1.0`, and whether to ship `alpha`/`beta`/`rc` pre-releases is a separate, policy call — see [versioning](versioning.md) for that decision matrix and what each choice communicates to users.
+
 Two tools own "bump the version, write the changelog, cut the tag." They differ mainly in *where the release intent comes from*.
 
 | | Changesets | release-please |
