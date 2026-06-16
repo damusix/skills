@@ -13,3 +13,4 @@ CLAUDE.md
 private
 !ghost-themes/base-template/.github
 !ghost-themes/base-template/.mcp.json
+.DS_Store
