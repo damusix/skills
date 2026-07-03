@@ -49,4 +49,4 @@ All reference material is derived from official htmx documentation and source co
 | htmx GitHub repo | https://github.com/bigskysoftware/htmx |
 | htmx extensions | https://htmx.org/extensions/ |
 
-htmx 4 annotations (tagged `[htmx 4]`, `[htmx 4 change]`, `[htmx 4 removed]`) were sourced from the v4 beta documentation at `four.htmx.org` as of v4.0.0-beta4 (May 2026).
+htmx 4 annotations (tagged `[htmx 4]`, `[htmx 4 change]`, `[htmx 4 removed]`) were sourced from the v4 beta documentation at `four.htmx.org` and the four-branch repo docs as of v4.0.0-beta5 (June 2026).

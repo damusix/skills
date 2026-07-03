@@ -236,7 +236,7 @@ htmx.removeClass(elt, 'active', 500);  // remove after 500ms
 htmx.toggleClass(elt, 'active');
 
 // Take class from siblings (only this element gets it)
-// [htmx 4 removed] moved to hx-live extension: htmx.live.take(elt, 'selected')
+// [htmx 4 removed] moved to hx-live extension: htmx.live.take(elt, '.selected', scopeSelector?)
 htmx.takeClass(elt, 'selected');
 
 // Navigate via AJAX (v2 only — use htmx.ajax() in v4)
@@ -389,7 +389,7 @@ htmx.config.historyCacheSize = 20;
 
 ### All Configuration Options
 
-> **[htmx 4 change]** Several config keys are renamed: `defaultSwapStyle` → `defaultSwap`, `globalViewTransitions` → `transitions`, `historyEnabled` → `history`, `includeIndicatorStyles` → `includeIndicatorCSS`, `timeout` → `defaultTimeout`. Default timeout changed from `0` to `60000` (60s). Default settle delay changed from `20` to `1`. Many keys are removed (see notes below). New keys: `extensions`, `mode` (replaces `selfRequestsOnly`), `inlineScriptNonce`, `metaCharacter`, `morphIgnore`, `morphSkip`, `morphSkipChildren`.
+> **[htmx 4 change]** Several config keys are renamed: `defaultSwapStyle` → `defaultSwap`, `globalViewTransitions` → `transitions`, `historyEnabled` → `history`, `includeIndicatorStyles` → `includeIndicatorCSS`, `timeout` → `defaultTimeout`. Default timeout changed from `0` to `60000` (60s). Default settle delay changed from `20` to `1`. Many keys are removed (see notes below). New keys: `extensions`, `mode` (replaces `selfRequestsOnly`), `inlineScriptNonce`, `metaCharacter`, `morphIgnore`, `morphSkip` (defaults to `[hx-morph-skip]` as of beta5), `morphSkipChildren` (defaults to `[hx-morph-skip-children]`), `defaultSwapEmpty` (beta5 — whether empty response bodies perform the main swap; override per element with the `swapEmpty` swap modifier). Structured config attributes (`<meta name="htmx-config">`, `hx-config`, `hx-swap`/`hx-trigger` modifiers) parse as HCON — htmx Configuration Object Notation: space/comma-separated `key:value` pairs, bare keys as boolean flags, dotted paths for nesting (`sse.reconnect:true`); values starting with `{` fall back to JSON.
 
 | Option | Default | Description |
 |---|---|---|

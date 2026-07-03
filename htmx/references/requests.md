@@ -53,14 +53,14 @@ Use these classes for loading indicators, animations, and transitions.
 
 HTMX automatically includes these headers with every request:
 
-> **[htmx 4 change]** `HX-Trigger` → `HX-Source` (format changed to `tagName#id`). `HX-Target` format changed to `tagName#id`. `HX-Trigger-Name` and `HX-Prompt` are removed. New headers: `HX-Request-Type` (`"full"` or `"partial"`), `Accept: text/html`.
+> **[htmx 4 change]** `HX-Trigger` → `HX-Source` (format changed to `tagName#id`). `HX-Target` format changed to `tagName#id`. `HX-Trigger-Name` is removed; `HX-Prompt` is removed from core but restored by the `hx-prompt` extension (beta5). New headers: `HX-Request-Type` (`"full"` or `"partial"`), `Accept: text/html`.
 
 | Header | Value | Purpose |
 |---|---|---|
 | `HX-Boosted` | `true` | Present when request is via `hx-boost` |
 | `HX-Current-URL` | Current browser URL | Lets server know the user's current page |
 | `HX-History-Restore-Request` | `true` | Present when request is for history cache miss restoration |
-| `HX-Prompt` | User's response | Present when `hx-prompt` was used. **[htmx 4 removed]** |
+| `HX-Prompt` | User's response | Present when `hx-prompt` was used. **[htmx 4 change]** Removed from core; sent by the `hx-prompt` extension (beta5) |
 | `HX-Request` | `true` | Always present on HTMX requests |
 | `HX-Target` | Target element's `id` | The target element for the response |
 | `HX-Trigger` | Triggering element's `id` | The element that triggered the request. **[htmx 4 change]** Renamed to `HX-Source` |
@@ -413,7 +413,7 @@ document.body.addEventListener('htmx:confirm', function(event) {
 
 ### Prompt
 
-> **[htmx 4 removed]** `hx-prompt` is removed. Use `hx-confirm` with `js:` prefix instead.
+> **[htmx 4 change]** `hx-prompt` is removed from core but restored by the official `hx-prompt` extension (beta5) — load `dist/ext/hx-prompt.js` and the attribute and `HX-Prompt` header work as in v2. Without the extension, use `hx-confirm` with `js:` prefix or set the header via `hx-on::config:request="ctx.request.headers['HX-Prompt'] = prompt('...') ?? event.preventDefault()"`.
 
 ```html
 <button hx-post="/rename" hx-prompt="Enter new name:">Rename</button>
@@ -429,4 +429,4 @@ The user's response is available in the `HX-Prompt` request header.
 
 [^3]: htmx documentation — CSRF, security, and request configuration. <https://htmx.org/docs/#security>
 
-[^4]: htmx 4 migration guide — header renames (`HX-Trigger` → `HX-Source`), removed headers (`HX-Prompt`, `HX-Trigger-Name`, `HX-Trigger-After-Settle`, `HX-Trigger-After-Swap`), new headers (`HX-Request-Type`, `Accept`), fetch replacing XHR, default timeout change. <https://four.htmx.org/docs/get-started/migration/>
+[^4]: htmx 4 migration guide — header renames (`HX-Trigger` → `HX-Source`), removed headers (`HX-Trigger-Name`, `HX-Trigger-After-Settle`, `HX-Trigger-After-Swap`; `HX-Prompt` restored via the `hx-prompt` extension in beta5), new headers (`HX-Request-Type`, `Accept`), fetch replacing XHR, default timeout change. <https://four.htmx.org/docs/get-started/migration/>

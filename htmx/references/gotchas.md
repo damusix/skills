@@ -403,7 +403,7 @@ Avoid combining HTMX with React, Vue, or other frameworks that manage their own 
 
 ### HTMX 2.x to 4.0 changes (The Fetchening)
 
-htmx 4.0 is in beta (v4.0.0-beta4, Summer 2026 stable target). Current stable: htmx 2.0.9.
+htmx 4.0 is in beta (v4.0.0-beta5, released 2026-06-26; beta3 was designated release candidate 1). Current stable: htmx 2.0.10.
 
 **Quick restore of v2 behavior:**
 
@@ -437,7 +437,7 @@ Or load the `htmx-2-compat` extension which restores implicit inheritance, legac
 
 ### Removed attributes
 
-`hx-vars` (use `hx-vals` with `js:`), `hx-params` (use `htmx:config:request` event), `hx-prompt` (use `hx-confirm` with `js:`), `hx-ext` (extensions auto-register), `hx-disinherit` / `hx-inherit` (inheritance is explicit), `hx-request` (use `hx-config`), `hx-history` (no localStorage caching)
+`hx-vars` (use `hx-vals` with `js:`), `hx-params` (use `htmx:config:request` event), `hx-prompt` (restored by the official `hx-prompt` extension as of beta5; without it, use `hx-confirm` with `js:`), `hx-ext` (extensions auto-register), `hx-disinherit` / `hx-inherit` (inheritance is explicit), `hx-request` (use `hx-config`), `hx-history` (no localStorage caching)
 
 ### New features
 
@@ -449,6 +449,10 @@ Or load the `htmx-2-compat` extension which restores implicit inheritance, legac
 - **`hx-config`** — per-element request configuration
 - **Short swap aliases** — `before`, `after`, `prepend`, `append`
 - **JSX compatibility** — `htmx.config.metaCharacter = "-"` replaces `:` with `-` in attribute names
+- **`swapEmpty` swap modifier + `htmx.config.defaultSwapEmpty`** (beta5) — control whether an empty response body clears the target; SSE messages default to not swapping empty responses
+- **Declarative morph freezing** (beta5) — `hx-morph-skip` / `hx-morph-skip-children` attributes in server templates freeze elements (or their children) during `innerMorph`/`outerMorph`
+- **`ctx` in `js:` expressions** (beta5) — `hx-vals`, `hx-headers`, and `hx-confirm` `js:` expressions receive the request context object
+- **HCON** — htmx Configuration Object Notation, the formalized mini-language for structured attributes (`key:value` pairs, bare boolean flags, dotted nesting, JSON fallback for values starting with `{`)
 
 HTMX 2.x will continue to be supported. No rush to migrate, but be aware when starting new projects. Each reference file in this skill is annotated with `[htmx 4]`, `[htmx 4 change]`, and `[htmx 4 removed]` admonitions at the relevant sections.
 

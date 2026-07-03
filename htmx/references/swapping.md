@@ -89,6 +89,7 @@ Append modifiers to `hx-swap` separated by spaces. Each modifier uses `key:value
 | `show:window:bottom` | Scroll viewport to the bottom of the window | — |
 | `show:none` | Disable all scroll-into-view behavior | — |
 | `focus-scroll:true` | Auto-scroll to focused element after swap | `false` |
+| `swapEmpty:<bool>` | **[htmx 4]** Whether an empty response body still performs the main swap (beta5). `swapEmpty:false` leaves the target unchanged; `swapEmpty:true` (or bare `swapEmpty`) forces the swap, clearing the target. Default from `htmx.config.defaultSwapEmpty`; when unset, empty responses swap except `<hx-partial>`-only responses. SSE messages default to `swapEmpty:false` | — |
 
 ### Scroll Examples
 
@@ -196,7 +197,7 @@ Server returns one response that updates several page areas:
 
 Morphing merges new HTML into existing DOM, preserving focus, scroll position, and element state. Requires an extension.
 
-> **[htmx 4 change]** Idiomorph is built into core — no extension needed. Use `hx-swap="innerMorph"` or `hx-swap="outerMorph"` directly. New config keys `morphIgnore`, `morphSkip`, `morphSkipChildren` control morph behavior via CSS selectors.
+> **[htmx 4 change]** Idiomorph is built into core — no extension needed. Use `hx-swap="innerMorph"` or `hx-swap="outerMorph"` directly. New config keys `morphIgnore`, `morphSkip`, `morphSkipChildren` control morph behavior via CSS selectors. As of beta5, `morphSkip` defaults to `[hx-morph-skip]` and `morphSkipChildren` to `[hx-morph-skip-children]` — add `hx-morph-skip` to any element in server templates to freeze it entirely during a morph, or `hx-morph-skip-children` to update its attributes while leaving its children untouched (declarative, server-driven morph freezing; no config needed).
 
 ### Idiomorph (Recommended)
 

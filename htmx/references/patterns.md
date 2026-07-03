@@ -492,7 +492,7 @@ Server-driven tabs using hypermedia.
 
 **Use `htmx.takeClass`** to toggle the active class:
 
-> **[htmx 4 removed]** `htmx.takeClass()` moved to `hx-live` extension. Use `htmx.live.take(this, 'active')` in v4, or use a plain JS equivalent: `this.parentElement.querySelectorAll('.active').forEach(el => el.classList.remove('active')); this.classList.add('active')`.
+> **[htmx 4 removed]** `htmx.takeClass()` moved to the `hx-live` extension. In v4 use the `take()` helper inside `hx-on` — `hx-on:click="take('.active', 'a')"` (scope defaults to siblings as of beta5) — or `htmx.live.take(elt, '.active', scope)` from JS, or a plain JS equivalent: `this.parentElement.querySelectorAll('.active').forEach(el => el.classList.remove('active')); this.classList.add('active')`.
 
 ```html
 <a hx-get="/tabs/details"
@@ -526,6 +526,8 @@ Client-side tab switching without server requests.
 <!-- Prompt -->
 <button hx-post="/rename" hx-prompt="New name:">Rename</button>
 ```
+
+> **[htmx 4 change]** In v4, `hx-prompt` requires the official `hx-prompt` extension (restored in beta5); `hx-confirm` works in core unchanged.
 
 ### Custom Modal Dialog
 

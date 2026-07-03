@@ -222,6 +222,8 @@ Add extra values to the request as a JSON object.
 <button hx-post="/action" hx-vals='js:{timestamp: Date.now()}'>Submit</button>
 ```
 
+> **[htmx 4]** `js:` expressions in `hx-vals`, `hx-headers`, and `hx-confirm` receive the request context object `ctx` in scope (beta5) — e.g. `hx-vals='js:{method: ctx.request.method}'`. Expressions may return a Promise for async value resolution.
+
 ### hx-vars (deprecated — use hx-vals with js: prefix)
 
 > **[htmx 4 removed]** `hx-vars` is removed. Use `hx-vals` with `js:` prefix instead.
@@ -266,6 +268,8 @@ Filter which parameters are submitted.
 ### hx-encoding
 
 Set the encoding type for the request.
+
+> **[htmx 4]** When `hx-encoding` is absent, htmx falls back to the form's native `enctype` attribute (beta5) — `<form enctype="multipart/form-data">` works without duplication.
 
 ```html
 <!-- Required for file uploads -->
@@ -384,9 +388,11 @@ Show a browser `confirm()` dialog before issuing the request.
 
 Use `hx-confirm="unset"` on a child to disable an inherited confirm.
 
+> **[htmx 4]** `hx-confirm` accepts a `js:` expression (beta5) evaluated with `ctx` in scope — a truthy result proceeds, replacing `window.confirm`. The `htmx:confirm` event detail carries `ctx` plus `issueRequest()` / `dropRequest()` callbacks for async custom dialogs.
+
 ### hx-prompt
 
-> **[htmx 4 removed]** `hx-prompt` is removed. Use `hx-confirm` with `js:` prefix instead.
+> **[htmx 4 change]** `hx-prompt` is removed from core but restored by the official `hx-prompt` extension (beta5). Load `dist/ext/hx-prompt.js` and the attribute works as in v2, including the `HX-Prompt` request header. Cancel aborts the request; a cancelable `htmx:prompt` event fires after a valid answer; assign `window.htmxPrompt = (question) => answer` for a custom synchronous dialog. Without the extension, use `hx-on::config:request="ctx.request.headers['HX-Prompt'] = prompt('...') ?? event.preventDefault()"`.
 
 Show a browser `prompt()` dialog. The user's response is sent in the `HX-Prompt` request header.
 
@@ -472,6 +478,8 @@ Convert standard anchors and forms into AJAX requests targeting the `<body>`.
 ```
 
 Boosted anchors push the URL into browser history. **Boosted forms do NOT push URL** — add `hx-push-url="true"` explicitly if needed. Boosted pages must serve full HTML pages. They degrade gracefully when JS is disabled. Only same-domain links are boosted; local anchor links are ignored.
+
+> **[htmx 4]** Links with a `download` attribute are never boosted (beta5) — the browser's native download behavior is preserved.
 
 ### hx-ext
 
@@ -612,6 +620,6 @@ Replaces v2's `hx-disable`. Completely prevents htmx processing on the element a
 
 [^2]: htmx documentation. <https://htmx.org/docs/> — attribute inheritance, triggering, swapping, and request behavior.
 
-[^3]: htmx 4 migration guide. <https://four.htmx.org/docs/get-started/migration/> — attribute removals (`hx-params`, `hx-prompt`, `hx-disinherit`, `hx-ext`, `hx-request`, `hx-history`), new attributes (`hx-action`, `hx-method`, `hx-status`, `hx-config`, `hx-ignore`), and explicit inheritance via `:inherited` suffix.
+[^3]: htmx 4 migration guide. <https://four.htmx.org/docs/get-started/migration/> — attribute removals (`hx-params`, `hx-disinherit`, `hx-ext`, `hx-request`, `hx-history`; `hx-prompt` restored via extension in beta5), new attributes (`hx-action`, `hx-method`, `hx-status`, `hx-config`, `hx-ignore`), and explicit inheritance via `:inherited` suffix.
 
 [^4]: htmx GitHub repository. <https://github.com/bigskysoftware/htmx> — source code and per-attribute behavior.

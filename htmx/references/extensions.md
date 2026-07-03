@@ -1,5 +1,5 @@
 ---
-description: Official HTMX extensions — WebSockets, SSE, Idiomorph, response targets, head support, and preload.
+description: Official HTMX extensions — WebSockets, SSE, Idiomorph, response targets, head support, preload, and htmx 4 extensions (hx-live reactivity, hx-prompt).
 globs: "*.html"
 ---
 
@@ -8,7 +8,7 @@ globs: "*.html"
 
 Official extensions that add functionality beyond core HTMX. Each extension is enabled via `hx-ext="<name>"` and inherits to child elements.
 
-> **[htmx 4 change]** Extensions no longer require the `hx-ext` attribute. Include the extension script and it auto-registers. Restrict allowed extensions with `<meta name="htmx-config" content='{"extensions": "sse, ws"}'>`. Nine extensions are bundled in htmx 4 core: `alpine-compat`, `browser-indicator`, `head-support`, `htmx-2-compat`, `optimistic`, `preload`, `sse`, `upsert`, `ws`. The `response-targets` extension is replaced by the native `hx-status` attribute.
+> **[htmx 4 change]** Extensions no longer require the `hx-ext` attribute. Include the extension script and it auto-registers. Restrict allowed extensions with `<meta name="htmx-config" content='{"extensions": "sse, ws"}'>`. As of beta5, 16 official extensions ship in the htmx package under `dist/ext/` (all `hx-`-prefixed): `hx-sse`, `hx-ws`, `hx-head` (was head-support), `hx-preload`, `hx-optimistic`, `hx-download`, `hx-upsert`, `hx-targets`, `hx-ptag`, `hx-browser-indicator`, `hx-alpine-compat`, `hx-history-cache`, `hx-csp`, `hx-live`, `hx-prompt`, and `htmx-2-compat`. The `htmax.js` bundled distribution includes core plus eight of them: `hx-sse`, `hx-ws`, `hx-preload`, `hx-browser-indicator`, `hx-download`, `hx-optimistic`, `hx-targets`, `hx-live`. The `response-targets` extension is replaced by the native `hx-status` attribute. See "htmx 4 Extensions" below for `hx-live` and `hx-prompt`.
 
 ## Contents
 
@@ -19,6 +19,7 @@ Official extensions that add functionality beyond core HTMX. Each extension is e
 - Response Targets (`response-targets`)
 - Head Support (`head-support`)
 - Preload (`preload`)
+- htmx 4 Extensions (`hx-live`, `hx-prompt`)
 
 ## Installation
 
@@ -31,7 +32,7 @@ Extensions are separate packages loaded after the core htmx library. Enable them
 ```html
 <head>
     <!-- Core htmx (always first) -->
-    <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.8/dist/htmx.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js"></script>
 
     <!-- Then the extension(s) you need -->
     <script src="https://cdn.jsdelivr.net/npm/htmx-ext-ws@2.0.4"></script>
@@ -178,6 +179,8 @@ Uni-directional real-time updates over standard HTTP using the EventSource API. 
 ```
 
 The event name in `sse-swap` must exactly match the server's `event:` field. Unnamed server messages use `message`.
+
+> **[htmx 4 change]** SSE messages default to `swapEmpty:false` (beta5): a message containing only `hx-swap-oob` or `<hx-partial>` elements leaves the connected element untouched instead of clearing it. Override per element with `hx-swap="innerHTML swapEmpty:true"`.
 
 ### Triggering Requests from SSE
 
@@ -406,10 +409,58 @@ All preload requests include `HX-Preloaded: true`.
 - Responses are only cached if server response headers allow it (e.g., `Cache-Control: private, max-age=60`). `Cache-Control: no-cache` prevents caching.
 - Touch devices get an `ontouchstart` handler (fires immediately, no delay) alongside `mouseover`/`mousedown`.
 
+## htmx 4 Extensions
+
+> **[htmx 4]** These extensions exist only on the htmx 4 line (ship in `dist/ext/` of the htmx package). Highlights below; full docs at <https://four.htmx.org/extensions/>.
+
+### hx-live (DOM reactivity)
+
+Lightweight reactivity backed by the DOM — expressions in HTML attributes re-run whenever the page changes (input/change events, mutations, htmx swap completion). Expanded significantly in beta5 from a single-attribute escape hatch into a declarative binding system. Included in the `htmax.js` bundle.
+
+```html
+<!-- Bind any attribute with the : prefix (long form: hx-live:<attr>) -->
+<input id="name">
+<button :disabled="!q('#name').value">Submit</button>
+
+<!-- :text, :html, :class, :.single-class, :style bindings -->
+<p :text="'Hello, ' + q('previous input').value"></p>
+<div :.warn="q('#qty').valueAsNumber < 0">Negative</div>
+
+<!-- hx-live attribute for multi-step logic / side effects -->
+<div hx-live="await debounce(250); this.textContent = q('#search').value"></div>
+```
+
+Key pieces:
+
+- **`q(selector)` proxy** — jQuery-like set proxy: read from first match, write to all. Directional selectors `first`/`last`/`next`/`previous`/`closest` and `'.foo in #scope'` scoping; `.q()` chains per-element; built-in `attr`/`toggle`/`take`/`trigger`/`insert` methods.
+- **Helpers in expression scope** (also in `hx-on` handlers): `attr()`, `toggle(name, values?)` (cycle via `'a|b|c'`), `take(name, scope?)` (move a class/attribute from siblings to this element — scope defaults to siblings as of beta5), `data` (JSON-serializing proxy over `data-*` attributes on the closest ancestor — booleans/numbers/arrays round-trip), `debounce(ms)`, `forEvent(...)`, `nextFrame()`, `matches()`, `trigger()`, `insert()`.
+- **Public API**: same helpers under `htmx.live.*` (e.g. `htmx.live.q`, `htmx.live.take(target, name, scope)`); `htmx.live.refresh()` forces a recompute after mutating non-DOM state.
+- **Alpine.js conflict handling** (beta5): if `window.Alpine` is detected at init, the `:` short form is disabled (long form `hx-live:<attr>` always works). Configure via `config.live.bindPrefix` (`''` disables, `'hx:'` custom prefix).
+- **Morph caveat**: server responses overwrite `data-*` state during `innerMorph`/`outerMorph` — protect with `morphIgnore:["data-"]`.
+
+### hx-prompt (restored from v2)
+
+New in beta5. Restores the htmx 2 `hx-prompt` attribute: browser prompt before the request, answer sent as the `HX-Prompt` header, cancel aborts. Supports `:inherited`, composes with `hx-confirm` (prompt runs first), fires a cancelable `htmx:prompt` event (`detail.prompt`, `detail.target`), and honors a custom synchronous dialog via `window.htmxPrompt = (question) => answer | null`.
+
+### hx-optimistic + hx-live templates
+
+The `hx-optimistic` extension captures string request parameters as `data-*` attributes on the optimistic element (multi-value fields as JSON arrays). With `hx-live` loaded (beta5), optimistic templates can render the submitted values declaratively:
+
+```html
+<template id="msg-opt">
+    <li><strong :text="data.author"></strong>: <span :text="data.body"></span></li>
+</template>
+
+<form hx-post="/message" hx-target="#messages" hx-swap="beforeend" hx-optimistic="#msg-opt">
+    <input name="author"><input name="body">
+    <button type="submit">Send</button>
+</form>
+```
+
 ## Sources
 
 [^1]: htmx extensions directory. <https://htmx.org/extensions/> — official and community extension list with install instructions.
 
 [^2]: htmx documentation — extensions. <https://htmx.org/docs/#extensions>
 
-[^3]: htmx 4 migration guide — extension auto-registration (no `hx-ext` attribute needed), `defineExtension` → `registerExtension`, 9 bundled extensions (`alpine-compat`, `browser-indicator`, `head-support`, `htmx-2-compat`, `optimistic`, `preload`, `sse`, `upsert`, `ws`), Idiomorph superseded by `innerMorph`/`outerMorph`, `response-targets` superseded by `hx-status`. <https://four.htmx.org/docs/get-started/migration/>
+[^3]: htmx 4 extension docs (as of 4.0.0-beta5) — extension auto-registration (no `hx-ext` attribute needed), `defineExtension` → `registerExtension`, 16 official extensions in `dist/ext/`, `htmax.js` bundle composition, `hx-live` and `hx-prompt` extension pages, Idiomorph superseded by `innerMorph`/`outerMorph`, `response-targets` superseded by `hx-status`. <https://four.htmx.org/extensions/>

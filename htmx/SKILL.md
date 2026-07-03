@@ -58,7 +58,7 @@ The default swap is `innerHTML` — the response replaces the target's children.
 - Swap methods, targets, OOB swaps, morphing, view transitions: `references/swapping.md`
 - Events, JS API, configuration, extensions, debugging: `references/events-api.md`
 - Common UI patterns and examples: `references/patterns.md`
-- Official extensions (WS, SSE, Idiomorph, response-targets, head-support, preload): `references/extensions.md`
+- Official extensions (WS, SSE, Idiomorph, response-targets, head-support, preload, hx-live, hx-prompt): `references/extensions.md`
 - Gotchas, pitfalls, and practical guidance: `references/gotchas.md`
 - Cross-file index and routing: `references/REFERENCE.md`
 
