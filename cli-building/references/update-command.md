@@ -113,17 +113,19 @@ if (!opts.yes) {
 
 ## Mechanics
 
-Downloading and replacing the running binary. The asset name and `checksums.txt` come straight from the release artifacts [`release.md`](release.md) already produces — reuse the same naming scheme.
+Downloading and replacing the running binary. The asset name and `checksums.txt` come straight from the release artifacts [`release.md`](release.md) already produces — reuse the same naming scheme. This block is the verify-and-swap shell; the download itself streams to disk with a stall timeout and resume — see [Download robustness](#download-robustness) below.
 
 ```typescript
-import { chmodSync, renameSync, unlinkSync } from 'node:fs';
+import { chmodSync, renameSync, statSync, unlinkSync } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 
 /** Throws on a genuine checksum mismatch; returns quietly when the sums are unreachable. */
-async function verifyChecksum(base: string, asset: string, bytes: Uint8Array): Promise<void> {
+async function verifyChecksum(base: string, asset: string, staged: string): Promise<void> {
     let expected: string | undefined;
     try {
-        const res = await fetch(`${base}/checksums.txt`);
+        // Same gotcha as the asset download: fetch() never times out on its own.
+        const res = await fetch(`${base}/checksums.txt`, { signal: AbortSignal.timeout(10_000) });
         if (!res.ok) return;                       // no sums published — skip
         expected = parseChecksums(await res.text())[asset];
     } catch {
@@ -131,7 +133,9 @@ async function verifyChecksum(base: string, asset: string, bytes: Uint8Array): P
     }
     if (!expected) return;                         // asset not listed — skip
 
-    const actual = await sha256(bytes);
+    // sha256File: createHash('sha256') fed from a createReadStream — hashes the
+    // assembled file from disk, never buffers the binary whole.
+    const actual = await sha256File(staged);
     if (actual !== expected) {
         throw new Error(`checksum mismatch for ${asset} (expected ${expected}, got ${actual})`);
     }
@@ -142,18 +146,13 @@ async function downloadAndReplace(tag: string, target: string): Promise<void> {
     if (!asset) throw new Error(`no prebuilt binary for ${process.platform}/${process.arch}`);
     const base = `https://github.com/${REPO}/releases/download/${tag}`;
 
-    const res = await fetch(`${base}/${asset}`);
-    if (!res.ok) throw new Error(`download failed (HTTP ${res.status}) for ${asset}`);
-    const bytes = new Uint8Array(await res.arrayBuffer());
-
-    await verifyChecksum(base, asset, bytes); // throws on mismatch; silent when sums unreachable
-
     // Stage next to the target (same filesystem), then rename over it.
     const tmp = join(dirname(target), `.${basename(target)}.update-${process.pid}`);
-    await Bun.write(tmp, bytes);
-    chmodSync(tmp, 0o755);
 
     try {
+        await downloadWithResume(`${base}/${asset}`, tmp); // streams to tmp — see below
+        await verifyChecksum(base, asset, tmp);            // throws on mismatch; silent when sums unreachable
+        chmodSync(tmp, 0o755);
         renameSync(tmp, target);
     } catch (err) {
         try { unlinkSync(tmp); } catch { /* best effort: original target is untouched */ }
@@ -162,13 +161,94 @@ async function downloadAndReplace(tag: string, target: string): Promise<void> {
 }
 ```
 
+### Download robustness
+
+A compiled binary is tens of megabytes, and `fetch()` has no default timeout — two facts that make the naive `new Uint8Array(await res.arrayBuffer())` a trap. On a stalled connection the promise never settles: there is no error to catch (a try/catch cannot catch a promise that never resolves), and the command sits on `Installing...` forever. And because the body is buffered, there is nothing to print while it downloads, so a slow connection is indistinguishable from a frozen one. Stream to the staged file, reset a stall timer on every chunk, and resume interrupted transfers:
+
+```typescript
+const STALL_MS = 30_000;   // abort when no bytes arrive for this long
+const MAX_ATTEMPTS = 4;    // first try + up to three resumes
+
+const isRetriable = (status: number) => status === 408 || status === 429 || status >= 500;
+const mb = (n: number) => (n / 1e6).toFixed(1);
+
+async function downloadWithResume(url: string, tmp: string): Promise<void> {
+    let etag: string | null = null;
+
+    for (let attempt = 1; ; attempt++) {
+        const ctl = new AbortController();
+        let timer = setTimeout(() => ctl.abort(), STALL_MS);
+
+        try {
+            const offset = statSync(tmp, { throwIfNoEntry: false })?.size ?? 0;
+            const headers: Record<string, string> = {};
+            if (offset > 0 && etag) {
+                headers.Range = `bytes=${offset}-`; // resume from the bytes on disk…
+                headers['If-Range'] = etag;         // …only if the asset has not changed
+            }
+
+            const res = await fetch(url, { signal: ctl.signal, headers });
+
+            // 404/403 will not get better on retry — surface them immediately.
+            if (!res.ok && !isRetriable(res.status)) {
+                throw Object.assign(new Error(`download failed (HTTP ${res.status}) for ${url}`), { fatal: true });
+            }
+            if (!res.ok || !res.body) throw new Error(`transient HTTP ${res.status}`);
+
+            etag = res.headers.get('etag');
+
+            // 206 appends to the partial; a 200 after a Range request means the
+            // asset changed (or ranges are unsupported) — truncate and start over.
+            const resumed = res.status === 206;
+            let received = resumed ? offset : 0;
+            const total = received + Number(res.headers.get('content-length') ?? 0);
+
+            const file = await open(tmp, resumed ? 'a' : 'w');
+            try {
+                for await (const chunk of res.body) {
+                    clearTimeout(timer);                             // a chunk arrived —
+                    timer = setTimeout(() => ctl.abort(), STALL_MS); // push the stall deadline out
+                    await file.write(chunk);
+                    received += chunk.length;
+                    if (process.stdout.isTTY && total) {
+                        const pct = Math.round((received / total) * 100);
+                        process.stdout.write(`\rDownloading ${mb(received)} / ${mb(total)} MB (${pct}%)`);
+                    }
+                }
+            } finally {
+                await file.close();
+                if (process.stdout.isTTY && total) process.stdout.write('\n');
+            }
+
+            // A cleanly closed but short body is a truncation, not a success.
+            if (total && received < total) {
+                throw new Error(`connection closed early (${received}/${total} bytes)`);
+            }
+            return;
+        } catch (err) {
+            if ((err as { fatal?: boolean }).fatal || attempt >= MAX_ATTEMPTS) throw err;
+            await new Promise((r) => setTimeout(r, 1_000 * 2 ** (attempt - 1))); // backoff: 1s, 2s, 4s
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+}
+```
+
+- **Retriable vs fatal.** Stalls (the abort), dropped connections, truncated bodies, and `408`/`429`/`5xx` retry with exponential backoff and resume from the bytes already on disk. Any other `4xx` (`404` — no such asset on the tag, `403`) fails on the spot; retrying cannot conjure the asset. If you want recovery to be visible, print a one-line `retrying (2/4)…` notice in the catch.
+- **`If-Range` is what makes resume safe.** With a matching ETag the server answers `206 Partial Content` and the partial is appended to; if the asset was re-published (or ranges are unsupported) it answers a full `200` and the code truncates and restarts. Without the guard, resuming across a changed asset splices two different binaries — the checksum would catch it, but only after the whole download is wasted.
+- **Progress is TTY-only.** The `\r` carriage-return line keeps a human informed; under a pipe or in CI nothing is printed, and the stall timer — not a human's patience — is what watches for hangs.
+- **Resume lives within one run.** The staged filename is pid-suffixed and `downloadAndReplace` unlinks it once all attempts are exhausted, so failed updates never litter the bin directory with partials.
+
 <constraints>
 
-Three rules this code encodes — break any of them and the update is unsafe or fails on a real machine:
+Four rules this code encodes — break any of them and the update is unsafe or fails on a real machine:
 
-- **Stage on the same filesystem as the target, then `rename`.** A `rename` is atomic only within one filesystem; staging in `$TMPDIR` (often a different mount) makes the rename fail with `EXDEV`, or worse, fall back to a non-atomic copy that can leave a half-written binary if interrupted. Write the temp file in the target's own directory.
+- **Stage on the same filesystem as the target, then `rename`.** A `rename` is atomic only within one filesystem; staging in `$TMPDIR` (often a different mount) makes the rename fail with `EXDEV`, or worse, fall back to a non-atomic copy that can leave a half-written binary if interrupted. Write the temp file in the target's own directory. (On macOS this bites for real: `os.tmpdir()` lands on `/var/folders`, a different APFS volume than `~/.local/bin`.)
 
-- **Verify the checksum and fail closed on mismatch.** You are about to execute whatever you downloaded with the user's privileges. A mismatch means a corrupted or tampered asset — abort, never run it. A failure to *fetch* `checksums.txt` (offline mid-update) may be treated as non-fatal, but a fetched-and-mismatched sum must abort. This is the same guarantee [`release.md`](release.md)'s `install.sh` makes; the `update` command must not be the weaker path.
+- **Verify the checksum and fail closed on mismatch.** You are about to execute whatever you downloaded with the user's privileges. A mismatch means a corrupted or tampered asset — abort, never run it. A failure to *fetch* `checksums.txt` (offline mid-update) may be treated as non-fatal, but a fetched-and-mismatched sum must abort. This is the same guarantee [`release.md`](release.md)'s `install.sh` makes; the `update` command must not be the weaker path. Streaming moves *where* you hash, not *whether*: verify the fully-assembled staged file before the swap (or hash chunks incrementally as they are written) — never `rename` a file whose sum you have not checked.
+
+- **Give every `fetch` in the update path a timeout — and bound the asset download by silence, not total time.** `fetch()` has no default timeout: on a stalled socket the promise never settles, so no `catch` fires and the command hangs with no output until the user kills it. Small requests (the release check, `checksums.txt`) can take a flat `AbortSignal.timeout(...)`; the asset download cannot, because a flat deadline kills legitimately slow transfers of a large binary. Reset a stall timer on each received chunk instead — silence, not slowness, is the failure signal.
 
 - **Do not try to self-replace a running `.exe` on Windows.** Windows locks the executing image; the rename fails. Detect `win32` and print a manual-download line instead. On Unix the kernel keeps the old inode alive for the running process, so overwriting the file is safe and the new version takes effect on next launch.
 
@@ -219,4 +299,5 @@ For an interactive TUI, the same check can drive an in-app banner with an "updat
 - Default to **ask-first** with `--yes` to bypass, plus a **passive banner** so updates get discovered.
 - **Route by install mode** — never download a binary over an npm-managed install, never overwrite a dev checkout.
 - Reuse the release artifacts: same asset names, same `checksums.txt`, **verify and fail closed**.
+- **Stream the download** with a chunk-reset stall timeout and `Range`/`If-Range` resume — a bare `fetch` + `arrayBuffer()` shows no progress and hangs forever on a stalled socket.
 - Stage-then-rename on the **same filesystem**; special-case **Windows** and **permission** errors with real advice.
