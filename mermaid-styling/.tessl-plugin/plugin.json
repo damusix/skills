@@ -1,0 +1,9 @@
+{
+  "name": "alonso-skills/mermaid-styling",
+  "version": "0.1.0",
+  "description": "Style, theme, and fix Mermaid diagrams in VitePress, in apps that call mermaid directly, and on Markdown hosts: themeVariables, themeCSS, ELK layout, label clipping, label chips, and click-to-zoom",
+  "private": false,
+  "skills": [
+    "SKILL.md"
+  ]
+}
