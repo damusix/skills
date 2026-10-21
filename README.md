@@ -22,6 +22,10 @@ Replace `mssql-server` with the skill name you want to install.
 - [HTMX](https://skills.sh/damusix/skills/htmx) - High-power tools for HTML, enabling modern UIs without heavy JavaScript
 - [Joi](https://skills.sh/damusix/skills/joi) - The most powerful schema description language and data validator for JavaScript
 
+### Diagrams
+
+- [Mermaid Styling](https://skills.sh/damusix/skills/mermaid-styling) - Theme Mermaid diagrams in VitePress, in apps, and on Markdown hosts: themeVariables vs themeCSS, ELK orthogonal edges, label clipping fixes, label chips, and click-to-zoom
+
 ### SQL
 
 - [MSSQL Server](https://skills.sh/damusix/skills/mssql-server) - T-SQL syntax, SQL Server administration, query performance, stored procedures, indexes, and more
