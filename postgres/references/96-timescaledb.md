@@ -29,7 +29,7 @@ When working with time-series, event, or IoT workloads in Postgres — sensor re
 
 Five rules:
 
-1. **TimescaleDB is THE time-series extension for Postgres.** Wholly external, versioned independently (latest stable **v2.27.0** at planning time, released 2026-05-12). Supports PG **15-18** at v2.27.0. PG14 already dropped. **PG15 last-supported in June 2026 release** per official deprecation notice. **Zero TimescaleDB items in PG14/15/16/17/18 release notes** — TimescaleDB evolves on its own cadence.
+1. **TimescaleDB is THE time-series extension for Postgres.** Wholly external, versioned independently (latest stable **v2.32.0**, released 2026-11-11). Supports PG **16-18**. PG14 dropped earlier; **PG15 dropped in 2.29.0** (2026-07-28). PG19 support not announced as of 2.32.0. **Zero TimescaleDB items in PG14/15/16/17/18 release notes** — TimescaleDB evolves on its own cadence.
 
 2. **Hypertable = automatically-chunked Postgres table.** `SELECT create_hypertable('events', by_range('ts'))` (or the modern `CREATE TABLE ... WITH (tsdb.hypertable, ...)` declarative form added in v2.20+) takes a regular table + a time column, transparently partitions it into **chunks** (child tables) bucketed by time. Inserts route automatically to the right chunk. Most SQL works unchanged. Chunks are real Postgres tables — visible in `_timescaledb_internal` schema.
 
@@ -477,20 +477,23 @@ SELECT delete_job(<job_id>);                     -- remove
 | TimescaleDB version | Date | Highlights |
 |---|---|---|
 | 2.13 | 2023-11 | Generalized `create_hypertable()` API with `dimension DIMENSION_INFO`; real-time aggregation **disabled by default** |
-| 2.14 | 2024-01 | Multi-node deprecated; single-node focus |
-| 2.17 | 2024-09 | PG15+ `enable_merge_on_cagg_refresh` |
-| 2.18 | 2024-11 | **Hypercore introduced**; `add_compression_policy` deprecated in favor of `add_columnstore_policy` |
-| 2.19 | 2025-01 | Last version supporting manual hypercore conversion path only |
-| 2.20 | 2025-02 | `CREATE TABLE ... WITH (tsdb.hypertable, ...)` declarative syntax; automatic `add_columnstore_policy` |
-| 2.23 | 2025-07 | Hypercore automatic timestamp partitioning |
-| 2.26 | 2026-03 | PG18 support added |
-| 2.27.0 | 2026-05-12 | Latest stable at planning time. Supports PG **15, 16, 17, 18**. PG14 already dropped |
-| Next (June 2026) | 2026-06 | Per official notice: "last version with support for PostgreSQL 15" |
+| 2.14 | 2024-02 | Multi-node deprecated; single-node focus |
+| 2.17 | 2024-10 | PG15+ `enable_merge_on_cagg_refresh` |
+| 2.18 | 2025-01 | **Hypercore introduced**; `add_compression_policy` deprecated in favor of `add_columnstore_policy` |
+| 2.19 | 2025-03 | Last version supporting manual hypercore conversion path only |
+| 2.20 | 2025-05 | `CREATE TABLE ... WITH (tsdb.hypertable, ...)` declarative syntax; automatic `add_columnstore_policy` |
+| 2.23 | 2025-10 | **PG18 support added**; Hypercore automatic timestamp partitioning |
+| 2.27.0 | 2026-05-12 | `enable_cagg_rewrites` (off), `enable_columnar_scan_filter_pushdown` (on) |
+| 2.28.0 | 2026-06-16 | Last minor with PG15. Incremental `refresh_continuous_aggregate()` batching; `ALTER MATERIALIZED VIEW <cagg> ADD COLUMN ... GENERATED ALWAYS AS (<aggregate>) STORED`; `ANALYZE`/`VACUUM` on caggs; first/last sparse indexes. **Adaptive chunking removed**; `_timescaledb_catalog.chunk_constraint` replaced by a compatibility view |
+| 2.29.0 | 2026-07-28 | **PG15 removed** (supports 16-18). `compact_chunk()`; `recompress_unordered` columnstore policy option; `tsdb.direct_compress`; `ALTER EXTENSION timescaledb UPDATE` allowed in a transaction block. 2.29.1 = security fixes (GHSA-hcfx-29v5-2rcw) |
+| 2.30.0 | 2026-09-08 | `DeferredChunkAppend` custom scan (`enable_deferred_chunk_append`, on) |
+| 2.31.0 | 2026-10-20 | `move_to_columnstore()` compresses without blocking DML; `timescaledb.cagg_refresh_stats_level`; `enable_columnarscan` renamed `debug_enable_columnarscan`; **pgaudit must come after timescaledb in `shared_preload_libraries`** |
+| 2.32.0 | 2026-11-11 | Latest. Adaptive Integer Compression **on by default**; background-worker scheduler runs as the database owner, not superuser; `bloom1_contains` removed; many security fixes ("upgrade as soon as possible") |
 
 PostgreSQL release notes: **PG14, PG15, PG16, PG17, PG18** all contain ZERO TimescaleDB items. TimescaleDB is wholly external.
 
-> [!WARNING] PG15 support ends with the June 2026 TimescaleDB release
-> Tiger Data has announced: "the upcoming TimescaleDB release in June 2026 will officially be the last version with support for PostgreSQL 15." If you're on PG15 + TimescaleDB and plan to stay on the latest extension version, schedule a PG16+ upgrade. Cross-reference [`87-major-version-upgrade.md`](./87-major-version-upgrade.md) for upgrade strategy.
+> [!WARNING] PG15 support removed in 2.29.0
+> "TimescaleDB 2.29.0 removes support for PostgreSQL 15. This release supports PostgreSQL 16, 17, and 18." PG15 clusters are capped at 2.28.x patch releases, which miss the 2.29.1 and 2.32.0 security fixes. Upgrade to PG16+.[^23] Cross-reference [`87-major-version-upgrade.md`](./87-major-version-upgrade.md) for upgrade strategy.
 
 ## Examples / Recipes
 
@@ -782,7 +785,7 @@ Use logical replication for zero-downtime variant (cross-ref [`74-logical-replic
 
 5. **ROW LEVEL SECURITY on columnstore chunks not supported** (verbatim from hypercore docs). RLS on the parent hypertable applies only to row-store chunks. Forces a choice: RLS or columnstore, not both.
 
-6. **PG14 dropped, PG15 deprecated** — TimescaleDB v2.27.0 supports PG15-18; PG15 support ends with June 2026 release. Plan PG16+ upgrade before that window.
+6. **PG14 and PG15 dropped** — TimescaleDB 2.29.0+ supports PG16-18 only. PG15 is capped at 2.28.x.
 
 7. **`UPDATE` / `DELETE` on compressed chunk is slow path** — must decompress affected rows in place. Time-series workload should be append-only or recent-only mutations.
 
@@ -812,7 +815,7 @@ Use logical replication for zero-downtime variant (cross-ref [`74-logical-replic
 
 20. **`CREATE EXTENSION timescaledb` requires superuser** in most setups — extensions modifying system catalogs need superuser. Managed providers may require contacting support for upgrade.
 
-21. **`shared_preload_libraries = 'timescaledb'` requires server restart** — not a reload. Cross-reference [`53-server-configuration.md`](./53-server-configuration.md) gotcha #4.
+21. **`shared_preload_libraries = 'timescaledb'` requires server restart** — not a reload. Since 2.31.0, list `pgaudit` after `timescaledb` when both are loaded. Cross-reference [`53-server-configuration.md`](./53-server-configuration.md) gotcha #4.
 
 22. **License-DBaaS clause** — running TimescaleDB-with-TSL-features as your-branded managed Postgres is contractually prohibited without Tiger Data agreement. Self-hosting and using internally is fine.
 
@@ -850,7 +853,7 @@ Use logical replication for zero-downtime variant (cross-ref [`74-logical-replic
 [^4]: Compression overview (now redirects to GitHub markdown source). Retrieved 2026-05-14. <https://docs.tigerdata.com/use-timescale/latest/compression/>
 [^5]: Continuous aggregates overview. Retrieved 2026-05-14. <https://docs.tigerdata.com/use-timescale/latest/continuous-aggregates/>
 [^6]: Data retention overview. Retrieved 2026-05-14. <https://docs.tigerdata.com/use-timescale/latest/data-retention/>
-[^7]: TimescaleDB releases page (v2.27.0, 2026-05-12). Retrieved 2026-05-14. <https://github.com/timescale/timescaledb/releases>
+[^7]: TimescaleDB releases page (v2.32.0, 2026-11-11). Retrieved 2026-11-14. <https://github.com/timescale/timescaledb/releases>
 [^8]: Timescale License (TSL) text — DBaaS prohibition + value-added-product clause. Retrieved 2026-05-14. <https://github.com/timescale/timescaledb/blob/main/tsl/LICENSE-TIMESCALE>
 [^9]: Apache 2.0 license (core / community parts). Retrieved 2026-05-14. <https://github.com/timescale/timescaledb/blob/main/LICENSE-APACHE>
 [^10]: `create_hypertable` function reference (v2.13+ generalized form). Retrieved 2026-05-14. <https://www.tigerdata.com/docs/api/latest/hypertable/create_hypertable>
@@ -866,3 +869,4 @@ Use logical replication for zero-downtime variant (cross-ref [`74-logical-replic
 [^20]: PostgreSQL 16 release notes — verified zero TimescaleDB items. Retrieved 2026-05-14. <https://www.postgresql.org/docs/16/release-16.html>
 [^21]: PostgreSQL 17 release notes — verified zero TimescaleDB items. Retrieved 2026-05-14. <https://www.postgresql.org/docs/17/release-17.html>
 [^22]: PostgreSQL 18 release notes — verified zero TimescaleDB items. Retrieved 2026-05-14. <https://www.postgresql.org/docs/18/release-18.html>
+[^23]: TimescaleDB CHANGELOG — <https://github.com/timescale/timescaledb/blob/main/CHANGELOG.md> — 2.28.0 through 2.32.0 entries, PG15 removal in 2.29.0, corrected 2.14–2.23 release dates, PG18 support in 2.23.0. Retrieved 2026-11-14.

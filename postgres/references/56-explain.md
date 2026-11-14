@@ -143,6 +143,9 @@ Verbatim from docs: *"Carry out the command and show actual run times and other 
 > [!WARNING] `EXPLAIN ANALYZE` is not free
 > Per-node timing instrumentation adds overhead via `gettimeofday()` calls. On systems with slow clock sources, the overhead can be 30%+ of execution time and skew totals. Use `TIMING OFF` if you only care about rows and buffers.[^timing]
 
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 adds the `timing_clock_source` GUC, which affects `EXPLAIN (ANALYZE, TIMING)` and `pg_test_timing`. `EXPLAIN` also adds Memoize cache and lookup estimates, `EXPLAIN (ANALYZE, IO)`, and WAL full-page-write bytes.[^pg19-explain]
+
 For mutating statements (`INSERT`/`UPDATE`/`DELETE`/`MERGE`/`CREATE TABLE AS`/`EXECUTE`), wrap in a transaction:
 
 ```sql
@@ -452,6 +455,7 @@ auto_explain.log_parameter_max_length = 1024
 | PG16 | `GENERIC_PLAN` option: *"Add EXPLAIN option GENERIC_PLAN to display the generic plan for a parameterized query (Laurenz Albe)."*[^generic-plan-rel] Plus *"Allow memoize atop a UNION ALL"*[^pg16-memoize-union] and the auto_explain parameter-logging admonition above. |
 | PG17 | `SERIALIZE` option: *"Add EXPLAIN option SERIALIZE to report the cost of converting data for network transmission (Stepan Rutz, Matthias van de Meent)."*[^serialize-rel] `MEMORY` option: *"Allow EXPLAIN to report optimizer memory usage (Ashutosh Bapat). The option is called MEMORY."*[^memory-rel] Plus *"Add local I/O block read/write timing statistics to EXPLAIN's BUFFERS output (Nazir Bilal Yavuz)."*[^pg17-local-io] Plus *"Improve EXPLAIN's display of SubPlan nodes and output parameters (Tom Lane, Dean Rasheed)."*[^pg17-subplan] Plus *"Add JIT deform_counter details to EXPLAIN (Dmitry Dolgov)."*[^pg17-jit] |
 | PG18 | `BUFFERS` is automatic with `ANALYZE`: *"Automatically include BUFFERS output in EXPLAIN ANALYZE (Guillaume Lelarge, David Rowley)."*[^pg18-buffers-auto] Plus *"Add full WAL buffer count to EXPLAIN (WAL) output (Bertrand Drouvot)."*[^pg18-wal] Plus *"In EXPLAIN ANALYZE, report the number of index lookups used per index scan node (Peter Geoghegan)."*[^pg18-index-lookups] Plus *"Modify EXPLAIN to output fractional row counts."*[^pg18-frac-rows] Plus *"Add memory and disk usage details to Material, Window Aggregate, and common table expression nodes to EXPLAIN output."*[^pg18-mem-disk] Plus *"Add details about window function arguments to EXPLAIN output (Tom Lane)."*[^pg18-window-args] Plus *"Add Parallel Bitmap Heap Scan worker cache statistics to EXPLAIN ANALYZE."*[^pg18-parallel-bitmap] Plus *"Indicate disabled nodes in EXPLAIN ANALYZE output."*[^pg18-disabled] |
+| PG19 (RC) | `EXPLAIN (ANALYZE, IO)`; Memoize cache and lookup estimates; WAL full-page-write bytes; `timing_clock_source` GUC affecting `TIMING` and `pg_test_timing`.[^pg19-explain] Core `pg_plan_advice` and `pg_stash_advice` modules; `auto_explain.log_extension_options`.[^pg19-advice] |
 
 > [!NOTE] FORMAT JSON/YAML/XML stability
 > Across PG14, PG15, PG16, PG17, and PG18, no release-note items change the `FORMAT` enum or alter the structural shape of JSON/YAML/XML output. New fields are *added* with new options (e.g., PG18's `Disabled: true` indicator), but existing fields remain stable. Plan-visualizer tooling (depesz.com, pgMustard, pev2) generally handles new-version output by ignoring unknown fields.
@@ -502,7 +506,10 @@ If the generic plan picks `Seq Scan` but custom plans for specific bind values p
 
 - `SET plan_cache_mode = force_custom_plan` for the session/role using this query.
 - Restructure the predicate to be more selective.
-- Add `pg_hint_plan` (third-party extension) for surgical hints.
+- On PG14–18, add `pg_hint_plan` (third-party extension) for surgical hints.
+
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 ships two core modules for this: `pg_plan_advice`, which stabilizes and controls planner decisions, and `pg_stash_advice`, which lets you specify advice per query ID. `auto_explain` gains `auto_explain.log_extension_options`. See the [`pg_plan_advice`](https://www.postgresql.org/docs/19/pgplanadvice.html) and [`pg_stash_advice`](https://www.postgresql.org/docs/19/pgstashadvice.html) pages.[^pg19-advice]
 
 ### Recipe 4: Pre-PG16 alternative — peek at generic plan via PREPARE
 
@@ -837,3 +844,7 @@ PG18 marks plan nodes that were forced into the plan despite a relevant `enable_
 [^pg18-parallel-bitmap]: PostgreSQL 18 release notes: *"Add Parallel Bitmap Heap Scan worker cache statistics to EXPLAIN ANALYZE (David Geier, Heikki Linnakangas, Donghang Lin, Alena Rybakina, David Rowley)."* https://www.postgresql.org/docs/release/18.0/
 
 [^pg18-disabled]: PostgreSQL 18 release notes: *"Indicate disabled nodes in EXPLAIN ANALYZE output (Robert Haas, David Rowley, Laurenz Albe)."* https://www.postgresql.org/docs/release/18.0/
+
+[^pg19-explain]: PostgreSQL 19 release notes (RC2), EXPLAIN and Optimizer: Memoize cache and lookup estimates, `EXPLAIN (ANALYZE, IO)`, WAL full-page-write bytes, and the `timing_clock_source` GUC. https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-EXPLAIN
+
+[^pg19-advice]: PostgreSQL 19 release notes (RC2), Modules: *"Add pg_plan_advice module to stabilize and control planner decisions"*; *"Add extension pg_stash_advice to allow per-query-id advice to be specified"*; `auto_explain.log_extension_options`. https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MODULES , https://www.postgresql.org/docs/19/pgplanadvice.html , https://www.postgresql.org/docs/19/pgstashadvice.html

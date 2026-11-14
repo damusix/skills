@@ -491,6 +491,9 @@ Used in: pre-restore validation, pg_rewind preflight, disaster-recovery diagnosi
     # Force-set XID/MXID/etc when pg_control itself is damaged
     pg_resetwal -f -x 50000000 $PGDATA
 
+> [!WARNING] Minor releases 2026-08-13 / 2026-11-12
+> psql: CVE-2026-6464 (CVSS 8.1, 2026-08-13 minors, 18.6 and the matching older branches). When a `COPY ... FROM STDIN` fails early, psql now skips its inline data, so test scripts that intentionally fail need a `\.` terminator. 18.7 fixed a regression so that multiple `COPY ... FROM STDIN` in one command string work again.[^minor-18-6][^minor-18-7] CVE-2026-18408 (CVSS 8.8, 2026-08-13) concerns psql `\unrestrict`.[^minor-aug-announce] `reindexdb`: CVE-2026-116325 (quoting, CVSS 8.0, 2026-11-12).[^minor-nov-announce] Full CVE list: <https://www.postgresql.org/support/security/>.
+
 ## Per-version timeline
 
 | Version | psql / wrapper changes |
@@ -922,3 +925,12 @@ Or grep the binary for documented options:
 [^pgservicefile]: PostgreSQL 16 — Connection Service File. <https://www.postgresql.org/docs/16/libpq-pgservice.html>. `~/.pg_service.conf` and `pg_service.conf` system-wide.
 
 [^pgpass]: PostgreSQL 16 — Password File. <https://www.postgresql.org/docs/16/libpq-pgpass.html>. `~/.pgpass` mode `0600` for credential storage.
+
+
+[^minor-18-6]: PostgreSQL 18.6 release notes (2026-08-13), psql `COPY ... FROM STDIN` and CVE-2026-6464. <https://www.postgresql.org/docs/release/18.6/>
+
+[^minor-18-7]: PostgreSQL 18.7 release notes (2026-11-12), `COPY ... FROM STDIN` regression fix. <https://www.postgresql.org/docs/release/18.7/>
+
+[^minor-aug-announce]: PostgreSQL 18.6, 17.11, 16.15, 15.19, 14.24, and 19 Beta 3 released (2026-08-13). <https://www.postgresql.org/about/news/postgresql-186-1711-1615-1519-1424-and-19-beta-3-released-3365/>
+
+[^minor-nov-announce]: PostgreSQL 18.7, 17.12, 16.16, 15.20, 14.25, and 19 RC 2 released (2026-11-12). <https://www.postgresql.org/about/news/postgresql-187-1712-1616-1520-1425-and-19-rc-2-released-3442/>

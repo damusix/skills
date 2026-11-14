@@ -61,11 +61,11 @@ This file is the **picker** for which view answers which question. The per-view 
 | Table/index buffer hit rate | `pg_statio_user_tables` / `pg_statio_user_indexes` | `heap_blks_hit::float / NULLIF(heap_blks_hit + heap_blks_read, 0)` | conflating "hit rate" with "performance" |
 | Per-relation I/O attribution (PG16+) | `pg_stat_io` | `GROUP BY backend_type, context` | pre-PG16 (use pg_stat_bgwriter + pg_statio_*) |
 | WAL volume rate (PG14+) | `pg_stat_wal` | two snapshots over time | reading without time delta |
-| Long-running VACUUM | `pg_stat_progress_vacuum` JOIN `pg_stat_activity` | `WHERE wait_event_type IS NOT NULL` flags blocking | confusing with VACUUM FULL (use `pg_stat_progress_cluster`) |
+| Long-running VACUUM | `pg_stat_progress_vacuum` JOIN `pg_stat_activity` | `WHERE wait_event_type IS NOT NULL` flags blocking | confusing with VACUUM FULL (PG14–18: use `pg_stat_progress_cluster`; PG19: `pg_stat_progress_repack`) |
 | Long-running CREATE INDEX (CONCURRENTLY) | `pg_stat_progress_create_index` | `WHERE phase = 'waiting for writers before build'` flags long-running-tx blocker | reading without `xact_start` join |
 | Replication lag per standby | `pg_stat_replication` on primary | `pg_wal_lsn_diff(sent_lsn, replay_lsn)` and the time-lag columns | reading `replay_lag = NULL` as "no lag" (it's NULL on idle replicas) |
 | Slot WAL retention | `pg_replication_slots` | `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)` | ignoring abandoned slots that pin disk |
-| Subscriber-side conflicts (PG15+) | `pg_stat_subscription_stats` | `WHERE apply_error_count > 0 OR sync_error_count > 0` | pre-PG15 (no view; read from logs) |
+| Subscriber-side conflicts (PG15+) | `pg_stat_subscription_stats` | `WHERE apply_error_count > 0 OR sync_error_count > 0` (PG15–18; PG19 renames `sync_error_count`, see `pg_stat_subscription_stats` below) | pre-PG15 (no view; read from logs) |
 
 **Smell signals.**
 
@@ -130,7 +130,7 @@ Wait events are categorized by `wait_event_type` into nine top-level classes:[^m
 | Type | What it indicates |
 |---|---|
 | `Activity` | Server process is idle. This is the wait-event type used by background processes (e.g., the WAL writer, the checkpointer) waiting for activity in their main processing loop. Generally a *good* state — these are not blocking anything. |
-| `BufferPin` | Waiting to acquire an exclusive pin on a buffer. Buffer-pin waits can occur if another process is reading data into the buffer or if VACUUM is waiting to clean a buffer. |
+| `BufferPin` (PG14–18; type `Buffer`, event `BufferCleanup` in PG19) | Waiting to acquire an exclusive pin on a buffer. Buffer-pin waits can occur if another process is reading data into the buffer or if VACUUM is waiting to clean a buffer. |
 | `Client` | Waiting for activity from a client process (e.g., reading from or writing to a socket). |
 | `Extension` | Waiting in an extension. Use the specific `wait_event` to disambiguate. |
 | `IO` | Waiting for an I/O operation. Common `wait_event` values: `DataFileRead`, `DataFileWrite`, `DataFileFlush`, `WALRead`, `WALWrite`, `WALSync`, `BufFileRead`, `BufFileWrite`, `RelationMapRead`. |
@@ -138,6 +138,9 @@ Wait events are categorized by `wait_event_type` into nine top-level classes:[^m
 | `Lock` | Verbatim: *"The server process is waiting for a heavyweight lock. Heavyweight locks, also known as lock manager locks or simply locks, primarily protect SQL-visible objects such as tables."* The specific `wait_event` names the lock type (`relation`, `tuple`, `transactionid`, `virtualxid`, `extend`, `page`, `frozenid`, `object`, `userlock`, `advisory`, `applytransaction` PG16+). Cross-reference [`43-locking.md`](./43-locking.md). |
 | `LWLock` | Verbatim: *"The server process is waiting for a lightweight lock. Most such locks protect a particular data structure in shared memory."* The specific `wait_event` names the LWLock (`WALWrite`, `LockManager`, `BufferContent`, `XidGen`, `ProcArray`, etc.). |
 | `Timeout` | Waiting for a timeout to expire (statement_timeout, lock_timeout, idle_in_transaction_session_timeout, recovery_apply_delay). |
+
+> [!WARNING] PostgreSQL 19
+> PostgreSQL 19 renames wait event type `BufferPin` to `Buffer` (`BUFFERPIN` to `BUFFER` in the release notes, which use the internal names) and wait event `BufferPin` to `BufferCleanup`. It also removes wait event `BufferContent` and adds the more precise `BufferShared`, `BufferShareExclusive`, and `BufferExclusive`. It adds wait events for `commit_delay`, WAL write and flush LSNs, and `COPY` I/O. Update any query that filters on `wait_event_type = 'BufferPin'` or `wait_event = 'BufferContent'`.[^pg19-wait-events]
 
 > [!NOTE] PostgreSQL 17
 > *"Add system view `pg_wait_events` that reports wait event types (Bertrand Drouvot). This is useful for adding descriptions to wait events reported in `pg_stat_activity`."*[^pg17-wait-events] Join to it for human-readable descriptions of the cryptic `wait_event` names.
@@ -300,7 +303,10 @@ PG17+ `pg_stat_checkpointer` columns: `num_timed`, `num_requested`, `restartpoin
 
 `pg_stat_subscription`: one row per logical-replication subscription (and per parallel apply worker on PG16+ where `leader_pid` is non-NULL).
 
-`pg_stat_subscription_stats` (PG15+): error counts per subscription. Columns: `subid`, `subname`, `apply_error_count`, `sync_error_count`, `stats_reset`. PG18 added `confl_*` columns for conflict tracking.
+`pg_stat_subscription_stats` (PG15+): error counts per subscription. Columns (PG15–18): `subid`, `subname`, `apply_error_count`, `sync_error_count`, `stats_reset`. PG18 added `confl_*` columns for conflict tracking.
+
+> [!WARNING] PostgreSQL 19
+> PostgreSQL 19 renames `pg_stat_subscription_stats.sync_error_count` to `sync_table_error_count` and adds `sync_seq_error_count` for sequence synchronization errors. It also adds the `update_deleted` column. Queries that reference `sync_error_count` fail on PG19.[^pg19-sub-stats]
 
 ### `pg_stat_progress_*` family
 
@@ -317,6 +323,9 @@ Verbatim docs note:[^progress-reporting] *"Whenever `VACUUM` is running, the `pg
 
 > [!WARNING] `pg_stat_progress_vacuum` shows only LAZY VACUUM
 > VACUUM FULL is implemented as a CLUSTER-style table rewrite, so it appears in `pg_stat_progress_cluster` with `command = 'VACUUM FULL'`, not in `pg_stat_progress_vacuum`. Monitoring queries that join `pg_stat_progress_vacuum` to find "any vacuum" miss FULL operations.
+
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 adds `pg_stat_progress_repack`, which covers `REPACK`, `CLUSTER`, and `VACUUM FULL`. `pg_stat_progress_cluster` is kept for backwards compatibility only and translates a `REPACK` command into `CLUSTER`. `pg_stat_progress_vacuum` gains `started_by` and `mode`, and `pg_stat_progress_analyze` gains `started_by`.[^pg19-progress]
 
 ### Snapshot semantics and resetting
 
@@ -342,6 +351,7 @@ Stats persist across clean restart (written to `pg_stat/` directory at shutdown)
 | **PG16** | `pg_stat_io` view added;[^pg16-io] `last_seq_scan` / `last_idx_scan` columns added to per-table/per-index stats;[^pg16-last-scan] `n_tup_newpage_upd` column added to `pg_stat_*_tables`;[^pg16-newpage] `leader_pid` added to `pg_stat_subscription`;[^pg16-leader-pid] `SpinDelay` wait event added;[^pg16-spindelay] `pg_stat_io` is the recommended replacement for `pg_stat_bgwriter.buffers_backend`. |
 | **PG17** | `pg_stat_checkpointer` view created (split from `pg_stat_bgwriter`); `buffers_backend` and `buffers_backend_fsync` removed from `pg_stat_bgwriter`; `pg_stat_progress_vacuum` columns renamed (`max_dead_tuples` → `max_dead_tuple_bytes`, `num_dead_tuples` → `num_dead_item_ids`, new `dead_tuple_bytes`); `indexes_total` and `indexes_processed` columns added to `pg_stat_progress_vacuum`; `pg_stat_statements` column renames (`blk_read_time` → `shared_blk_read_time`); savepoint names replaced with placeholders in `pg_stat_statements`; `pg_wait_events` system view added; `pg_stat_progress_copy.tuples_skipped` column added. |
 | **PG18** | `pg_stat_io` adds bytes columns (`read_bytes`, `write_bytes`, `extend_bytes`), removes `op_bytes`; `pg_stat_io` adds WAL rows; `pg_stat_get_backend_io()` added; `pg_stat_reset_backend_stats(pid)` added; `pg_stat_checkpointer.num_done` and `.slru_written` columns added; `pg_stat_database.parallel_workers_to_launch` / `parallel_workers_launched` columns added;[^pg18-parallel] `pg_stat_wal` loses `wal_write`/`wal_sync`/`wal_write_time`/`wal_sync_time` (relocated to `pg_stat_io`); `pg_aios` view added (async I/O subsystem); VACUUM and ANALYZE delay tracking with `track_cost_delay_timing`;[^pg18-cost-delay] `pg_stat_subscription_stats` gains conflict-tracking `confl_*` columns. |
+| **PG19** (RC) | New views `pg_stat_lock` (and `pg_stat_get_lock()`), `pg_stat_recovery`, `pg_stat_progress_repack`, `pg_stat_autovacuum_scores`, `pg_dsm_registry_allocations`; `stats_reset` added to `pg_stat_all_tables`, `pg_stat_all_indexes`, `pg_statio_all_sequences` (and sys/user variants), `pg_stat_user_functions`, `pg_stat_database_conflicts`; `pg_stat_wal` and `pg_stat_get_backend_wal()` report full-page-image bytes; `pg_stat_progress_basebackup.backup_type` (`full` / `incremental`); wait-event renames (`BUFFERPIN` to `BUFFER`, `BufferPin` to `BufferCleanup`); `sync_error_count` renamed `sync_table_error_count`; `pg_stat_statements` groups `FETCH` sizes and adds generic/custom plan counts.[^pg19-monitoring] |
 
 ## Examples / Recipes
 
@@ -520,7 +530,7 @@ Phase interpretation:
 - `vacuuming indexes` — Per-index cleanup. If `index_vacuum_count > 1` for one VACUUM run, `maintenance_work_mem` is too small and VACUUM has to scan indexes multiple times to clean accumulated dead tuples.
 - `vacuuming heap` / `cleaning up indexes` / `truncating heap` / `performing final cleanup` — Wrap-up phases.
 
-If `wait_event_type = 'Lock'` or `wait_event_type = 'BufferPin'` for a long-running anti-wraparound VACUUM, something is blocking it. Anti-wraparound VACUUM cannot be canceled by `lock_timeout` (cross-reference [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md) gotcha #4).
+If `wait_event_type = 'Lock'` or `wait_event_type = 'BufferPin'` (PG14–18; `wait_event_type = 'Buffer' AND wait_event = 'BufferCleanup'` on PG19) for a long-running anti-wraparound VACUUM, something is blocking it. Anti-wraparound VACUUM cannot be canceled by `lock_timeout` (cross-reference [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md) gotcha #4).
 
 ### Recipe 8: Streaming replication lag per standby
 
@@ -666,7 +676,7 @@ SELECT pg_terminate_backend(<pid>);
 
 7. **`pg_stat_io.op_bytes` was removed in PG18.** Computing volume as `reads * op_bytes` returns NULL on PG18. Use `read_bytes` / `write_bytes` / `extend_bytes` directly.
 
-8. **`pg_stat_progress_vacuum` does NOT show `VACUUM FULL`.** VACUUM FULL is implemented as a CLUSTER and reports through `pg_stat_progress_cluster` with `command = 'VACUUM FULL'`.
+8. **`pg_stat_progress_vacuum` does NOT show `VACUUM FULL`.** On PG14–18, VACUUM FULL is implemented as a CLUSTER and reports through `pg_stat_progress_cluster` with `command = 'VACUUM FULL'`. PG19 reports it through `pg_stat_progress_repack`.
 
 9. **`pg_stat_activity` shows logical-replication apply workers as `backend_type = 'logical replication worker'`** but the `query` column may be empty or hold the most recent applied statement. Replication apply progress lives in `pg_stat_subscription`, not in `pg_stat_activity.query`.
 
@@ -775,3 +785,11 @@ SELECT pg_terminate_backend(<pid>);
 [^pg18-parallel]: PostgreSQL 18 release notes. https://www.postgresql.org/docs/release/18.0/ — verbatim: *"Add columns to `pg_stat_database` to report parallel worker activity (Benoit Lobréau). The new columns are `parallel_workers_to_launch` and `parallel_workers_launched`."*
 
 [^pg18-cost-delay]: PostgreSQL 18 release notes. https://www.postgresql.org/docs/release/18.0/ — verbatim: *"Add delay time reporting to VACUUM and ANALYZE ... tracking must be enabled with the server variable `track_cost_delay_timing`."*
+
+[^pg19-wait-events]: PostgreSQL 19 release notes (RC2), Migration: *"Rename wait event type `BUFFERPIN` to `BUFFER` and rename wait event `BufferPin` to `BufferCleanup`"*; *"Remove wait event `BufferContent` and add more precise wait events `BufferShared`, `BufferShareExclusive`, and `BufferExclusive`."* https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION
+
+[^pg19-sub-stats]: PostgreSQL 19 release notes (RC2), Migration and Logical Replication: `pg_stat_subscription_stats.sync_error_count` renamed `sync_table_error_count`, new `sync_seq_error_count`, new `update_deleted`. https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION
+
+[^pg19-progress]: PostgreSQL 19 progress reporting: `pg_stat_progress_repack` covers REPACK, CLUSTER, and VACUUM FULL; `pg_stat_progress_cluster` is kept *"for backwards-compatibility purposes only"* and *"will translate a REPACK command into CLUSTER"*. https://www.postgresql.org/docs/19/progress-reporting.html ; `started_by` and `mode` columns: https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-SYSTEM-VIEWS
+
+[^pg19-monitoring]: PostgreSQL 19 release notes (RC2), System Views, Monitoring, and Modules. https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-SYSTEM-VIEWS

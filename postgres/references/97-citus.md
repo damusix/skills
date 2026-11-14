@@ -32,7 +32,7 @@ When single-node Postgres has hit a wall on **write throughput**, **dataset size
 
 Five rules:
 
-1. **Citus is THE distributed-Postgres extension.** Wholly external, versioned independently. Latest stable **Citus 14.0** released 2026-02-17 — supports through PG **18.1**. Apache-2.0 throughout (no license split like TimescaleDB). Microsoft acquired Citus Data in 2019 but the extension stayed open source and provider-agnostic. **Zero Citus items in PG14/15/16/17/18 release notes** — Citus evolves on its own cadence.[^2][^16]
+1. **Citus is THE distributed-Postgres extension.** Wholly external, versioned independently. Latest stable **Citus 14.3.0** (2026-10-23). Citus 14.x supports PG **16-18** (PG15 dropped in 14.0, PG14 dropped in 13.0.1). PG19 support is on master only. Apache-2.0 throughout (no license split like TimescaleDB). Microsoft acquired Citus Data in 2019 but the extension stayed open source and provider-agnostic. **Zero Citus items in PG14/15/16/17/18 release notes** — Citus evolves on its own cadence.[^2][^16]
 
 2. **Coordinator + workers, not a quorum.** One coordinator node (also a Postgres instance with Citus loaded) stores **metadata** about shard placement. N worker nodes store the **shard data** itself (shards = regular Postgres tables named like `events_102008`). Coordinator routes queries; workers do work. Coordinator is single-point-of-config but not single-point-of-data — replace via metadata-restore + failover.
 
@@ -185,6 +185,9 @@ Released 2023-07. Verbatim Microsoft engineering blog:[^11]
 
 > "each tenant has a separate schema with its own set of tables, in the same database"
 
+> [!NOTE] Citus 14.1
+> Schema-based sharding DDL (`CREATE SCHEMA`, `DROP SCHEMA`, `ALTER SCHEMA ... RENAME`, table DDL in distributed schemas) can run from any node, not only the coordinator.[^2]
+
 > Schema-based sharding has "almost no data modelling restrictions or special steps compared to unsharded PostgreSQL." Limitation: "joins and foreign keys should only involve tables from the same schema."
 
 Use case: multi-tenant SaaS where each tenant gets its own schema and you want zero data-model change.
@@ -322,8 +325,12 @@ Citus's own version timeline (not Postgres release notes — Citus is wholly ext
 | 11.3 | 2023-03 | PG15 support | release notes |
 | 12.0 | 2023-07 | **Schema-based sharding** (`citus_schema_distribute`)[^11] | citusdata.com blog |
 | 12.1 | 2023-09 | PG16 support | release notes |
-| 13.0 | 2025-Q1 | PG17 support + perf improvements | release notes |
-| **14.0** | **2026-02-17** | **PG18.1 support, latest at planning time** | github.com/citusdata/citus/releases[^2] |
+| 13.0 | 2025-Q1 | PG17 support + perf improvements; 13.0.1 dropped PG14 | release notes |
+| 14.0 | 2026-02-09 | PG18 support; **PG15 dropped**; virtual generated columns on distributed tables; `citus.enable_statistics_collection` deprecated; colocation rejects mismatched distribution-key collations | CHANGELOG[^2] |
+| 14.0.1 | 2026-04-21 | Extension SQL pins `search_path`; `CREATE STATISTICS` on expressions propagated | CHANGELOG[^2] |
+| 14.1 | 2026-05-14 | Schema-based sharding DDL from any node; `citus_cluster_changes_block()` / `_unblock()` / `_block_status()` for consistent disk-snapshot backups | CHANGELOG[^2] |
+| 14.2 | 2026-08-06 | `citus.allow_unsafe_insert_select_pushdown`; `citus_internal.distribute_object()` repair UDF | CHANGELOG[^2] |
+| **14.3** | **2026-10-23** | **Latest.** Sorted-merge execution for multi-shard `ORDER BY`; `citus.enable_or_clause_arm_pruning`; internal SPI uses empty `search_path` | CHANGELOG[^2] |
 
 PG release notes — explicit zero-changes streak:
 
@@ -566,7 +573,7 @@ Per-node `pg_upgrade` (cross-ref [86](./86-pg-upgrade.md)) is the right tool, bu
 4. `ALTER EXTENSION citus UPDATE` on coordinator + every worker (Citus extension may need bumping for new PG major).
 5. Resume traffic.
 
-Verify Citus version compatibility with target PG major **before** starting. Citus 14.0 supports PG18.1; older Citus on newer PG = unsupported.
+Verify Citus version compatibility with target PG major **before** starting. Citus 14.x supports PG16-18; older Citus on newer PG = unsupported. PG14/15 clusters must move to PG16+ before Citus 14.
 
 ## Gotchas / Anti-patterns
 
@@ -645,7 +652,7 @@ Verify Citus version compatibility with target PG major **before** starting. Cit
 
 [^1]: Citus GitHub repo (README + license). <https://github.com/citusdata/citus> — verified at planning time. Apache-2.0 throughout; README: "PostgreSQL extension that transforms Postgres into a distributed database."
 
-[^2]: Citus releases page. <https://github.com/citusdata/citus/releases> — Citus 14.0 released 2026-02-17, supports PG 18.1.
+[^2]: Citus releases page. <https://github.com/citusdata/citus/releases> — Citus 14.3.0 released 2026-10-23. Release objects were re-created in bulk, so dates come from the CHANGELOG read at the tag: <https://github.com/citusdata/citus/blob/v14.3.0/CHANGELOG.md> (14.0.0 "February 9, 2026"). Checked 2026-11-14.
 
 [^3]: Citus concepts docs (coordinator / worker / table classes). <https://docs.citusdata.com/en/stable/get_started/concepts.html>
 

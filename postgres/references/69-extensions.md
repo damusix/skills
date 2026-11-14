@@ -375,11 +375,14 @@ Not in core. Each maintained independently. Verify version-to-PG-major compatibi
 | pg_repack | <https://github.com/reorg/pg_repack> | Online table+index bloat removal. See [`26-index-maintenance.md`](./26-index-maintenance.md) |
 | pg_squeeze | <https://github.com/cybertec-postgresql/pg_squeeze> | Logical-decoding-based online table compaction |
 | pgaudit | <https://github.com/pgaudit/pgaudit> | Detailed session/object audit logging. See [`51-pgaudit.md`](./51-pgaudit.md) |
-| pg_hint_plan | <https://github.com/ossc-db/pg_hint_plan> | Optimizer hints via SQL comments |
+| pg_hint_plan | <https://github.com/ossc-db/pg_hint_plan> | Optimizer hints via SQL comments (the hinting option for PG14–18; PG19 adds core `pg_plan_advice` and `pg_stash_advice`) |
 | pgrouting | <https://pgrouting.org/> | Geospatial routing built on PostGIS |
 | TimescaleDB Toolkit | <https://github.com/timescale/timescaledb-toolkit> | Advanced analytics functions (percentile_agg, asap, etc.) |
 | pg_jsonschema | <https://github.com/supabase/pg_jsonschema> | JSON Schema validation for JSONB columns |
 | plv8 | <https://github.com/plv8/plv8> | JavaScript stored procedures via V8 |
+
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 ships two new core modules for planner control: `pg_plan_advice`, which stabilizes and controls planner decisions, and `pg_stash_advice`, which lets you specify advice per query ID. `pg_hint_plan` is therefore no longer the only hinting option, and it remains the option for PG14–18. See the [`pg_plan_advice`](https://www.postgresql.org/docs/19/pgplanadvice.html) and [`pg_stash_advice`](https://www.postgresql.org/docs/19/pgstashadvice.html) pages.[^pg19-advice-69]
 
 > [!WARNING] Third-party extension version pinning
 > Each third-party extension supports a specific range of PostgreSQL majors. Pinning policy:
@@ -397,6 +400,7 @@ Not in core. Each maintained independently. Verify version-to-PG-major compatibi
 | 16 | **Symbol visibility:** *"Prevent extension libraries from exporting their symbols by default (Andres Freund, Tom Lane). Functions that need to be called from the core backend or other extensions must now be explicitly marked `PGDLLEXPORT`."*[^pg16-symbol] **`@extschema:name@` syntax** in install scripts to reference dependency schema. **`no_relocate`** clause. |
 | 17 | `adminpack` removed (verbatim "Remove the long-deprecated `adminpack` contrib module"). `ALTER OPERATOR` accepts more optimization attributes for extensions. Extensions can define custom wait events. `pg_dump --exclude-extension`. |
 | 18 | **`extension_control_path` GUC** (verbatim quote in [PG18 `extension_control_path`](#pg18-extension_control_path)). **`default_version` in `\dx` output**. **`PG_MODULE_MAGIC_EXT`** macro and `pg_get_loaded_modules()` function. |
+| 19 (RC) | New core modules `pg_plan_advice` and `pg_stash_advice`. New `location` column in `pg_available_extensions` and `pg_available_extension_versions`. New planner hooks `planner_setup_hook`, `planner_shutdown_hook`, `joinrel_setup_hook`, `join_path_setup_hook`; `get_relation_info_hook` removed and `build_simple_rel_hook` added. C11 is required to build (previously C99).[^pg19-advice-69] |
 
 ## Examples / Recipes
 
@@ -695,6 +699,8 @@ SELECT n.nspname AS schema,
 - [`97-citus.md`](./97-citus.md) — Citus deep dive
 - [`98-pg-cron.md`](./98-pg-cron.md) — pg_cron deep dive
 - [`99-pg-partman.md`](./99-pg-partman.md) — pg_partman deep dive
+- [`103-pg-textsearch.md`](./103-pg-textsearch.md) — pg_textsearch (BM25) deep dive
+- [`104-pgmq.md`](./104-pgmq.md) — pgmq deep dive
 - [`53-server-configuration.md`](./53-server-configuration.md) — `shared_preload_libraries` GUC required by many extensions
 - [`64-system-catalogs.md`](./64-system-catalogs.md) — `pg_extension` catalog table and `pg_available_extensions` view
 - [`101-managed-vs-baremetal.md`](./101-managed-vs-baremetal.md) — extension allowlist constraints in managed environments
@@ -714,6 +720,8 @@ SELECT n.nspname AS schema,
 [^pg18-dx]: PostgreSQL 18 release notes, "Add default_version to the psql \dx extension output (Magnus Hagander)." <https://www.postgresql.org/docs/release/18.0/>
 
 [^pg18-modulemagic]: PostgreSQL 18 release notes, "Add macro PG_MODULE_MAGIC_EXT to allow extensions to report their name and version (Andrei Lepikhov). This information can be accessed via the new function pg_get_loaded_modules()." <https://www.postgresql.org/docs/release/18.0/>
+
+[^pg19-advice-69]: PostgreSQL 19 release notes (RC2), Modules and Source Code: *"Add pg_plan_advice module to stabilize and control planner decisions"*; *"Add extension pg_stash_advice to allow per-query-id advice to be specified"*; new and removed planner hooks; `location` column in `pg_available_extensions`; C11 required. https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MODULES , https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-SOURCE-CODE
 
 - PG16 `CREATE EXTENSION`: <https://www.postgresql.org/docs/16/sql-createextension.html>
 - PG16 `ALTER EXTENSION`: <https://www.postgresql.org/docs/16/sql-alterextension.html>

@@ -45,7 +45,7 @@ Sibling files: [`80-connection-pooling.md`](./80-connection-pooling.md) for WHY 
 
 4. **Console = primary operational surface**. Connect to `pgbouncer` virtual database as `stats_users` / `admin_users`. `SHOW POOLS` for capacity, `SHOW STATS` for throughput, `SHOW CLIENTS` / `SHOW SERVERS` for forensics, `RELOAD` / `PAUSE` / `RESUME` for online ops.
 
-5. **Prepared statements require PG17 libpq + `max_prepared_statements > 0`**[^pg17-libpq]. Default is **200** since pgBouncer 1.21 — not 0[^prepstmt-default]. App driver must use protocol-level prepare (not SQL `PREPARE` / `DEALLOCATE`). Older app drivers using SQL-level PREPARE will not benefit.
+5. **Prepared statements require PG17 libpq + `max_prepared_statements > 0`**[^pg17-libpq]. Default is **200** since pgBouncer 1.24; 1.21 added the feature with default 0[^prepstmt-default]. App driver must use protocol-level prepare (not SQL `PREPARE` / `DEALLOCATE`). Older app drivers using SQL-level PREPARE will not benefit.
 
 ## Decision Matrix
 
@@ -104,7 +104,7 @@ Five operational facts:
 
 3. **Per-`(database, user)` pool**. Two users connecting to same database → two separate pools, two separate `default_pool_size` budgets.
 
-4. **`pgbouncer` virtual database** = console. Connect with `psql -p 6432 -d pgbouncer -U admin` (no password if `admin_users` matches). Cannot run regular SQL — only `SHOW`, `RELOAD`, `PAUSE`, `RESUME`, `KILL`, `SUSPEND`, `SHUTDOWN`, `SET`.
+4. **`pgbouncer` virtual database** = console. Connect with `psql -p 6432 -d pgbouncer -U admin` (no password if `admin_users` matches). Cannot run regular SQL — only `SHOW`, `RELOAD`, `PAUSE`, `RESUME`, `KILL`, `SHUTDOWN`, `SET` (`SUSPEND` removed in 1.26.0).
 
 5. **No query parsing**. pgBouncer forwards bytes. Does NOT understand SQL. Cannot rewrite queries, route based on read/write, or load-balance to replicas. For query-aware routing use pgcat / pgpool-II / app-side logic.
 
@@ -232,7 +232,7 @@ Top settings grouped by concern. Default + production-typical value.
 | `client_tls_ca_file` | — | CA for client cert verification. |
 | `client_tls_protocols` | `secure` | TLS version list. |
 | `client_tls_ciphers` | `default` | TLS<1.3 cipher list. |
-| `client_tls_tls13_ciphers` | (OpenSSL default) | TLS 1.3 ciphersuites (1.25+). |
+| `client_tls13_ciphers` / `server_tls13_ciphers` | (OpenSSL default) | TLS 1.3 ciphersuites (1.25+). |
 
 ### TLS — server side (outgoing to PG)
 
@@ -317,13 +317,13 @@ Connect via `psql -p 6432 -d pgbouncer -U admin -h /run/pgbouncer` (or whatever 
 
 `PAUSE [db]` — *"PgBouncer tries to disconnect from all servers... The command will not return before all server connections have been disconnected."*[^pause]. Use before PG restart or failover.
 
-`RESUME [db]` — *"Resume work from previous KILL, PAUSE, or SUSPEND command."*
+`RESUME [db]` — resume work after `KILL` or `PAUSE`.
 
 `KILL db` — drop all client and server connections on a database immediately.
 
 `KILL_CLIENT client_id` — drop a specific client (1.24+).
 
-`SUSPEND` — flush all sockets, stop reading data. Used before online restart (pass open FDs to new process via socket activation).
+`SUSPEND` — **removed in 1.26.0** together with online restart (`-R`) and `SHOW FDS`. Use a `so_reuseport` rolling restart (Recipe 11).
 
 `SHUTDOWN` — exit.
 
@@ -375,7 +375,7 @@ Mechanism: pgBouncer caches the protocol-level prepared statement per server con
 
 Three requirements:
 
-1. **`max_prepared_statements > 0`** in `pgbouncer.ini`. Default is 200 since 1.21[^prepstmt-default] — already enabled out of the box.
+1. **`max_prepared_statements > 0`** in `pgbouncer.ini`. Default is 200 since 1.24[^prepstmt-default] — already enabled out of the box.
 2. **App driver uses protocol-level prepare** (libpq `PQprepare()` / JDBC `PreparedStatement` / psycopg `prepare()` / pgx `Prepare()`). NOT SQL-level `PREPARE foo AS ...`.
 3. **For full transaction-mode safety, PG 17+ libpq with `PQclosePrepared()` / `PQclosePortal()`** so the protocol-level Close support advertised by pgBouncer is honored.
 
@@ -401,7 +401,7 @@ client_tls_key_file = /etc/pgbouncer/server.key
 client_tls_cert_file = /etc/pgbouncer/server.crt
 client_tls_ca_file = /etc/pgbouncer/clients-ca.crt
 client_tls_protocols = secure
-client_tls_tls13_ciphers = TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256
+client_tls13_ciphers = TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256
 
 server_tls_sslmode = verify-full
 server_tls_key_file = /etc/pgbouncer/pgb-client.key
@@ -413,7 +413,7 @@ Trap: setting only `client_tls_sslmode = require` while leaving `server_tls_sslm
 
 PG 18 + pgBouncer 1.25 → SCRAM passthrough via `auth_type = scram-sha-256` + matching credentials end-to-end with channel binding. Cross-ref [`48-authentication-pg-hba.md`](./48-authentication-pg-hba.md).
 
-PG18 client-side direct TLS startup (skip the StartupMessage TLS request) → pgBouncer 1.25+ supports it server-side.
+Direct TLS startup (`sslnegotiation=direct`, a PG17 libpq feature that skips the SSLRequest round trip) → pgBouncer 1.25+ accepts it from clients; it cannot yet use it toward servers.
 
 ## Authentication
 
@@ -556,8 +556,10 @@ Cross-ref [`78-ha-architectures.md`](./78-ha-architectures.md) for pgBouncer + P
 | 1.25.0 | 2025-11-09 | LDAP auth; client-side direct TLS; transaction timeouts; configurable SCRAM iterations; TLS 1.3 cipher selection |
 | 1.25.1 | 2025-12-03 | CVE-2025-12819 fix |
 | 1.25.2 | 2026-05-08 | CVE-2026-6664 through 6667 fixes |
+| 1.26.0 | 2026-09-23 | **Tracks all server-reported parameters by default**, including `search_path` (PG18+) and `default_transaction_read_only` (PG14+), so `SET search_path` no longer leaks between clients in transaction mode. New `pool_idle_timeout`, `login_notify_message`, per-user/per-database `query_wait_timeout`, `client_login_count` stat. `COPY` outside an explicit transaction works in transaction mode. **Removed** online restart (`-R`), `SUSPEND`, `SHOW FDS`. CVE-2026-19888, CVE-2026-6668, CVE-2026-6669. Needs a C11 compiler |
+| 1.26.1 | 2026-10-14 | CVE-2026-107350 (a second StartupMessage during SCRAM auth allows login as another SCRAM user, 1.17.0–1.26.0), CVE-2026-107349, CVE-2026-107348. `ignore_startup_parameters` now takes precedence over tracked parameters. The release notes say "various bugs were reported around tracking of `search_path`", to be fixed later; adding `search_path` to `ignore_startup_parameters` restores 1.25 behavior |
 
-Latest at write time = **1.25.2** (2026-05-08).
+Latest = **1.26.1** (2026-10-14). Upgrade: 1.26.1 fixes an authentication bypass present since 1.17.0.[^pgb-126]
 
 ## Recipes
 
@@ -690,7 +692,7 @@ Or via systemd: `kill -HUP $(cat /run/pgbouncer/pgbouncer.pid)`.
 ### Recipe 7 — Enable prepared statements + verify
 
 ```ini
-max_prepared_statements = 200       # 1.21+ default — explicit for clarity
+max_prepared_statements = 200       # 1.24+ default — explicit for clarity
 ```
 
 After `RELOAD`, run an app workload that uses protocol-level prepare. Then:
@@ -787,24 +789,24 @@ SHOW PEERS;
 
 Test cancellation via long-running query + Ctrl-C through HAProxy → cancel should hit either instance and route correctly.
 
-### Recipe 11 — Online restart via SUSPEND + socket-passing
+### Recipe 11 — Zero-downtime restart via `so_reuseport` rolling restart
 
-PgBouncer supports zero-downtime restart on Linux via systemd socket activation. Sequence:
+> [!WARNING] pgBouncer 1.26.0 removed online restart
+> 1.26.0 removed online restart (`-R`, socket takeover) and the `SUSPEND` and `SHOW FDS` console commands. Upstream's replacement is a rolling restart with `so_reuseport`.[^pgb-126]
 
-```sql
-SUSPEND;                              -- flush sockets, stop reading
-```
+With `so_reuseport = 1` set in every instance (see [Pattern B](#pattern-b--multi-instance-via-so_reuseport)), start the new process before stopping the old one:
 
 ```bash
-# new pgbouncer process starts with same listening socket inherited
-systemctl restart pgbouncer
+# 1. Start the new pgbouncer on the same port; the kernel spreads new connections across both
+pgbouncer -d /etc/pgbouncer/pgbouncer-new.ini
 ```
 
 ```sql
-RESUME;                               -- on new process
+-- 2. On the OLD instance's console: stop accepting new clients, exit once current clients disconnect
+SHUTDOWN WAIT_FOR_CLIENTS;
 ```
 
-Alternative: rely on peering + rolling restart — drain instance A via `PAUSE`, restart, repeat for B. HAProxy health-check failure routes around the down instance.
+Clients that reconnect land on the new process. With HAProxy in front (Pattern A), drain one instance at a time via `PAUSE` + health-check failure, restart it, repeat.
 
 ### Recipe 12 — Drop a specific client
 
@@ -837,7 +839,7 @@ If clients are leaking (long-lived idle connections from buggy app) — set `cli
 
 ## Gotchas / Anti-patterns
 
-1. **`pool_mode = transaction` + `SET` without `SET LOCAL`** — server-side GUC persists across transactions on the server connection. Next client gets the leaked GUC. Cross-ref [`80-connection-pooling.md`](./80-connection-pooling.md) gotcha #3.
+1. **`pool_mode = transaction` + `SET` without `SET LOCAL`** — server-side GUC persists across transactions on the server connection. Next client gets the leaked GUC. Since 1.26.0, parameters that the server reports (including `search_path` on PG18+ and `default_transaction_read_only`) are tracked per client and no longer leak; other GUCs still do. Cross-ref [`80-connection-pooling.md`](./80-connection-pooling.md) gotcha #3.
 
 2. **`max_client_conn` too low default 100** — most production deployments need 1000-5000. Update first, don't leave at default.
 
@@ -845,7 +847,7 @@ If clients are leaking (long-lived idle connections from buggy app) — set `cli
 
 4. **Pre-1.21 SQL-level PREPARE broken in transaction mode** — every reuse of a server connection wipes the prepared plan. Migrate to protocol-level prepare AND pgBouncer 1.21+.
 
-5. **`max_prepared_statements = 0` disables protocol-level prepared statements entirely**. Default is 200 since 1.21 — only set to 0 if you have a specific reason.
+5. **`max_prepared_statements = 0` disables protocol-level prepared statements entirely**. Default is 200 since 1.24 — only set to 0 if you have a specific reason.
 
 6. **`server_reset_query = DISCARD ALL` does NOT clear protocol-level prepared statement cache** (1.21+). pgBouncer maintains it separately. If you need full reset, restart server connections (kill via `server_lifetime`).
 
@@ -881,7 +883,7 @@ If clients are leaking (long-lived idle connections from buggy app) — set `cli
 
 22. **PG `max_connections` must exceed total pool capacity** — N_instances × default_pool_size × N_(db,user)_pairs + reserve + admin slots. Otherwise pgBouncer queues clients waiting for PG slots that don't exist.
 
-23. **CVE-2025-2291 / CVE-2025-12819 / CVE-2026-6664..6667** — security advisories in 1.24.1, 1.25.1, 1.25.2. Stay on latest patch release.
+23. **CVE-2025-2291 / CVE-2025-12819 / CVE-2026-6664..6667** — security advisories in 1.24.1, 1.25.1, 1.25.2; CVE-2026-19888 / 6668 / 6669 in 1.26.0; CVE-2026-107348..107350 in 1.26.1. Stay on latest patch release.
 
 ## See Also
 
@@ -903,11 +905,11 @@ If clients are leaking (long-lived idle connections from buggy app) — set `cli
 [^poolmodes]: https://www.pgbouncer.org/usage.html — Pool modes section, verbatim definitions for `session`, `transaction`, `statement`.
 [^showpools]: https://www.pgbouncer.org/usage.html — `SHOW POOLS` columns reference.
 [^showstats]: https://www.pgbouncer.org/usage.html — `SHOW STATS` columns reference.
-[^console]: https://www.pgbouncer.org/usage.html — full console-command catalog including `RELOAD`, `PAUSE`, `RESUME`, `KILL`, `KILL_CLIENT`, `SUSPEND`, `SHUTDOWN`, `RECONNECT`, `DISABLE`, `ENABLE`.
+[^console]: https://www.pgbouncer.org/usage.html — full console-command catalog including `RELOAD`, `PAUSE`, `RESUME`, `KILL`, `KILL_CLIENT`, `SHUTDOWN` (and `SHUTDOWN WAIT_FOR_CLIENTS`), `RECONNECT`, `DISABLE`, `ENABLE`.
 [^reload]: https://www.pgbouncer.org/usage.html — *"The PgBouncer process will reload its configuration files and update changeable settings. This includes the main configuration file as well as the files specified by the settings `auth_file` and `auth_hba_file`."*
 [^pause]: https://www.pgbouncer.org/usage.html — *"PgBouncer tries to disconnect from all servers... The command will not return before all server connections have been disconnected."*
 [^prepstmt-changelog]: https://www.pgbouncer.org/changelog.html — 1.21.0 release notes (2023-10-16): *"Add support for protocol-level named prepared statements! This is probably one of the most requested features for PgBouncer. Using prepared statements together with PgBouncer can reduce the CPU load on your system a lot (both at the PgBouncer side and the PostgreSQL side). In synthetic benchmarks this feature was able to increase query throughput anywhere from 15% to 250%, depending on the workload."*
-[^prepstmt-default]: https://www.pgbouncer.org/config.html — `max_prepared_statements` default is **200** since pgBouncer 1.21. Setting to 0 disables prepared statement support entirely.
+[^prepstmt-default]: https://www.pgbouncer.org/config.html — `max_prepared_statements` default is **200** since pgBouncer 1.24.0 (https://github.com/pgbouncer/pgbouncer/releases/tag/pgbouncer_1_24_0); 1.21 introduced the setting with default 0. Setting to 0 disables prepared statement support entirely.
 [^pg17-libpq]: https://www.postgresql.org/docs/17/libpq-exec.html — PG17 added `PQclosePrepared()` and `PQclosePortal()` enabling clean transaction-mode prepared statement use with pgBouncer.
 [^peering]: https://www.pgbouncer.org/changelog.html — 1.23.0 release notes (2024-07-03): *"Add support for peering between PgBouncer processes. This allows configuring PgBouncer such that cancellation requests continue to work when multiple different PgBouncer processes are behind a single load balancer."*
 [^authtype]: https://www.pgbouncer.org/config.html — `auth_type` valid values: `cert`, `md5`, `scram-sha-256`, `plain` (deprecated), `trust`, `any`, `hba`, `ldap` (1.25+), `pam`, `peer`.
@@ -922,4 +924,6 @@ Additional sources:
 - Install + build: https://www.pgbouncer.org/install.html
 - FAQ: https://www.pgbouncer.org/faq.html
 - Full changelog: https://www.pgbouncer.org/changelog.html
-- Latest release at write time: 1.25.2 (2026-05-08).
+- Latest release: 1.26.1 (2026-10-14), checked 2026-11-14.
+
+[^pgb-126]: pgBouncer 1.26.0 and 1.26.1 release notes — https://github.com/pgbouncer/pgbouncer/releases/tag/pgbouncer_1_26_0, https://github.com/pgbouncer/pgbouncer/releases/tag/pgbouncer_1_26_1 — removal of online restart / `SUSPEND` / `SHOW FDS`, parameter tracking default, CVEs. Rolling restart: https://www.pgbouncer.org/usage.html#shutdown-wait_for_clients

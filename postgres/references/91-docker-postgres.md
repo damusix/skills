@@ -30,7 +30,7 @@ Use when running PostgreSQL in Docker containers — local dev, CI integration t
 
 Five rules.
 
-1. **Official `postgres` image is canonical.** Maintained by docker-library team[^docker-library]. Two flavors: **Debian-slim** (default, `bookworm`/`trixie`, ~80MB compressed) + **Alpine** (`alpine3.22`/`alpine3.23`, ~50MB compressed, musl libc). Image tags = `{major}` (latest patch), `{major}.{minor}` (pinned), `{major}-bookworm` (Debian-explicit), `{major}-alpine3.22` (Alpine-explicit). Currently 5 majors published (14, 15, 16, 17, 18).
+1. **Official `postgres` image is canonical.** Maintained by docker-library team[^docker-library]. Two flavors: **Debian-slim** (default **`trixie`**; `bookworm` still published, ~80MB compressed) + **Alpine** (`alpine3.24` default, `alpine3.23`, ~50MB compressed, musl libc). Image tags = `{major}` (latest patch), `{major}.{minor}` (pinned), `{major}-trixie` / `{major}-bookworm` (Debian-explicit), `{major}-alpine3.24` (Alpine-explicit). As of 2026-11-14: `latest` = `18.7` (trixie); majors 14-18 published (14.25 is the final PG14 image); `19rc2` tags exist but no GA `19` tag.
 
 2. **`/docker-entrypoint-initdb.d/` runs on FIRST startup only.** Files matched as `*.sql` / `*.sql.gz` / `*.sh` execute alphabetically when `$PGDATA` is empty. Re-running the container with an existing data dir SKIPS init scripts. Schema migrations need an idempotent tool (Flyway, Liquibase, Alembic, Sqitch, etc.) — `initdb.d` is NOT a migration runner.
 
@@ -48,8 +48,8 @@ Five rules.
 | Throwaway CI test | `--tmpfs /var/lib/postgresql/data` or no volume | Speed; resets per-test |
 | Single-host prod (low scale) | Compose + named volume + healthcheck + scheduled `pg_dump` to S3 | Simplest reproducible setup |
 | Multi-host prod | Kubernetes operator | See [`92-kubernetes-operators.md`](./92-kubernetes-operators.md) |
-| Minimal image | Alpine variant (`postgres:17-alpine3.22`) | ~50MB vs ~80MB |
-| Glibc dependencies (PostGIS, plpython3u, plperl) | Debian variant (`postgres:17` = bookworm) | Some C extensions ship glibc-only binaries |
+| Minimal image | Alpine variant (`postgres:17-alpine3.24`) | ~50MB vs ~80MB |
+| Glibc dependencies (PostGIS, plpython3u, plperl) | Debian variant (`postgres:17` = trixie) | Some C extensions ship glibc-only binaries |
 | Custom extensions | Custom Dockerfile `FROM postgres:17` + install | Build once, version-control the result |
 | Sensitive secrets | Docker secrets via `POSTGRES_PASSWORD_FILE` | No password in image history or process list |
 | Custom `postgresql.conf` | Bind-mount config + `command: postgres -c config_file=...` | Decouple config from image |
@@ -67,14 +67,14 @@ The `docker-library/postgres` repository[^docker-lib-repo] publishes per-major d
 
 | Variant | Base image | Size (rough) | When to pick |
 |---|---|---|---|
-| `bookworm` | `debian:bookworm-slim` | ~80MB | Default; glibc-based; broad extension compat |
-| `trixie` | `debian:trixie-slim` | ~80MB | Newer Debian; check extension availability |
-| `alpine3.22` | `alpine:3.22` | ~50MB | Smallest; musl libc; some C extensions break |
-| `alpine3.23` | `alpine:3.23` | ~50MB | Newest Alpine; verify base image stability |
+| `trixie` | `debian:trixie-slim` | ~80MB | **Default**; glibc-based; broad extension compat |
+| `bookworm` | `debian:bookworm-slim` | ~80MB | Previous Debian; pin it to keep an existing build stable |
+| `alpine3.24` | `alpine:3.24` | ~50MB | Default Alpine; smallest; musl libc; some C extensions break |
+| `alpine3.23` | `alpine:3.23` | ~50MB | Previous Alpine (`alpine3.22` is no longer published) |
 
 Image header note[^dockerfile-17-bookworm]: "THIS DOCKERFILE IS GENERATED VIA 'apply-templates.sh' - PLEASE DO NOT EDIT IT DIRECTLY." The actual templates are `Dockerfile-debian.template` and `Dockerfile-alpine.template` — when forking, edit the templates, not the per-version Dockerfile.
 
-Version pinning example (PG17 bookworm pins `PG_VERSION 17.9-1.pgdg12+1`, `PG_MAJOR 17`)[^dockerfile-17-bookworm] — production should pin to a specific patch tag like `postgres:17.9-bookworm`, not `postgres:17` (which moves with each patch release).
+Version pinning example (the PG17 bookworm Dockerfile pins `PG_VERSION 17.<minor>-1.pgdg12+1`, `PG_MAJOR 17`)[^dockerfile-17-bookworm] — production should pin to a specific patch tag like `postgres:17.12-bookworm`, not `postgres:17` (which moves with each patch release).
 
 ### Environment Variables
 
@@ -88,7 +88,7 @@ Set via `-e VAR=value` or Compose `environment:` block. Documented in the long-f
 | `POSTGRES_INITDB_ARGS` | No | (empty) | Extra flags passed to `initdb` (e.g., `--data-checksums --encoding=UTF8 --locale=C`) |
 | `POSTGRES_INITDB_WALDIR` | No | (none, WAL in `PGDATA`) | Path inside container for separate WAL directory |
 | `POSTGRES_HOST_AUTH_METHOD` | No | `scram-sha-256` (PG14+) | Auth method for non-local connections in generated `pg_hba.conf` |
-| `PGDATA` | No | `/var/lib/postgresql/data` | Override data directory location |
+| `PGDATA` | No | PG14-17: `/var/lib/postgresql/data`; **PG18+: `/var/lib/postgresql/18/docker`** | Override data directory location (see the PG18+ warning below) |
 | `LANG` / `LC_ALL` | No | `en_US.utf8` (Debian) | Locale in shell + initdb |
 | `POSTGRES_INITDB_SKIP_LOCALE` | No | unset | Skip locale initialization |
 | `POSTGRES_PASSWORD_FILE` | No | (none) | Read password from file (Docker secret pattern) |
@@ -159,6 +159,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE EXTENSION IF NOT EXISTS pgcrypto;
 EOSQL
 ```
+
+> [!WARNING] PG18+ images moved PGDATA and the VOLUME
+> From the 18 image on, `ENV PGDATA /var/lib/postgresql/18/docker` and `VOLUME /var/lib/postgresql` (the 19rc2 image uses `/var/lib/postgresql/19/docker`). Dockerfile comment: "in 18+, PGDATA has changed to match the pg_ctlcluster standard directory structure, and the VOLUME has moved from /var/lib/postgresql/data to /var/lib/postgresql". A volume mounted at `/var/lib/postgresql/data` on an 18+ image does **not** hold the cluster, so data is lost when the container is removed. On 18+, mount the volume at `/var/lib/postgresql`. The versioned directory also lets old and new majors sit side by side under one volume for `pg_upgrade --link`. PG14-17 images keep `/var/lib/postgresql/data`.[^dockerfile-18-trixie]
 
 ### Volume Strategy for `$PGDATA`
 
@@ -368,7 +371,7 @@ Every PG14-PG18 release except PG15 added container-relevant `initdb` items. PG1
 # compose.yaml
 services:
     db:
-        image: postgres:17.9-bookworm
+        image: postgres:17.12-bookworm
         restart: unless-stopped
         environment:
             POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
@@ -412,7 +415,7 @@ Files:
 
 ```dockerfile
 # Dockerfile
-FROM postgres:17.9-bookworm
+FROM postgres:17.12-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         postgresql-17-pgvector \
@@ -526,7 +529,7 @@ For production, schedule via cron on host or use a sidecar container with `pg_du
 # compose.test.yaml
 services:
     db:
-        image: postgres:17-alpine3.22
+        image: postgres:17-alpine3.24
         environment:
             POSTGRES_PASSWORD: test
             POSTGRES_HOST_AUTH_METHOD: trust
@@ -559,7 +562,7 @@ Better than `sleep 30` — works with any healthcheck-configured container.
 ```yaml
 services:
     db:
-        image: postgres:17.9-bookworm    # NOT just `postgres:17`
+        image: postgres:17.12-bookworm    # NOT just `postgres:17`
 ```
 
 Production should always pin the patch version. `postgres:17` moves with each minor release and can introduce unexpected behavior changes. Audit:
@@ -573,14 +576,14 @@ docker image ls --format '{{.Repository}}:{{.Tag}} {{.CreatedSince}}' | grep pos
 ```yaml
 services:
     db:
-        image: postgres:18-bookworm
+        image: postgres:18-trixie
         environment:
             POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
             # Default initdb behavior in PG18+: --data-checksums is default
             # Opt out with:
             # POSTGRES_INITDB_ARGS: "--no-data-checksums"
         volumes:
-            - pgdata:/var/lib/postgresql/data
+            - pgdata:/var/lib/postgresql    # 18+: mount the parent; PGDATA is /var/lib/postgresql/18/docker
 ```
 
 PG18 verbatim release note[^pg18-relnotes]: "Change `initdb` to default to enabling checksums" (Greg Sabino Mullane). See [`88-corruption-recovery.md`](./88-corruption-recovery.md) gotcha #11 for `pg_upgrade` interaction.
@@ -629,7 +632,7 @@ Fix: set `POSTGRES_PASSWORD` env var, or `POSTGRES_PASSWORD_FILE=/run/secrets/..
 
 8. **Alpine variant may break extensions with glibc dependencies.** PostGIS in Alpine works; some Python/Perl extensions don't. If unsure, use the Debian variant.
 
-9. **`postgres:17` tag moves with every minor release.** Pin to `postgres:17.9-bookworm` in production. Otherwise `docker pull` weeks apart gets different patch versions silently.
+9. **`postgres:17` tag moves with every minor release.** Pin to `postgres:17.12-bookworm` in production. Otherwise `docker pull` weeks apart gets different patch versions silently.
 
 10. **`pg_isready` exit code 1 (rejecting) during startup is normal.** The server is up but in recovery / not yet accepting clients. Set `start_period: 30s` in healthcheck so initial restarts don't mark the container unhealthy.
 
@@ -639,7 +642,7 @@ Fix: set `POSTGRES_PASSWORD` env var, or `POSTGRES_PASSWORD_FILE=/run/secrets/..
 
 13. **Cross-architecture restore is impossible.** A `pg_basebackup` from an amd64 container cannot restore into an arm64 container. Use `pg_dump -Fp` for cross-arch migration.
 
-14. **`PGDATA` env var override is rarely useful.** The image defaults to `/var/lib/postgresql/data`. Overriding requires also updating volume mount paths. Common source of "volume mounted but database appears empty" confusion.
+14. **`PGDATA` env var override is rarely useful.** The image defaults to `/var/lib/postgresql/data` on PG14-17 and `/var/lib/postgresql/18/docker` on PG18+ (mount the volume at `/var/lib/postgresql` there). Overriding requires also updating volume mount paths. Common source of "volume mounted but database appears empty" confusion.
 
 15. **`docker-entrypoint-initdb.d` script exit codes matter.** `set -e` in `.sh` scripts; `\set ON_ERROR_STOP on` in `.sql` files. A silent failure leaves the database in a half-initialized state on first startup with no clear error.
 
@@ -649,7 +652,7 @@ Fix: set `POSTGRES_PASSWORD` env var, or `POSTGRES_PASSWORD_FILE=/run/secrets/..
 
 18. **Logs go to stdout/stderr.** `docker logs pg17`. No log rotation by default — the JSON file driver fills disk over time. Use `--log-driver=local` with `--log-opt max-size=100m --log-opt max-file=5`, or rely on `log_destination=stderr` + external log shipper.
 
-19. **`postgres:17-alpine` and `postgres:17-alpine3.22` are different tags.** Track Alpine versions explicitly — `alpine` floats, `alpine3.22` pins.
+19. **`postgres:17-alpine` and `postgres:17-alpine3.24` are different tags.** Track Alpine versions explicitly — `alpine` floats, `alpine3.24` pins.
 
 20. **No automated backup in the official image.** Zero. You add `pg_dump` cron, pgBackRest, Barman, or WAL-G as a sidecar — see [`85-backup-tools.md`](./85-backup-tools.md).
 
@@ -683,11 +686,12 @@ Fix: set `POSTGRES_PASSWORD` env var, or `POSTGRES_PASSWORD_FILE=/run/secrets/..
 
 [^docker-library]: docker-library/postgres GitHub repository. https://github.com/docker-library/postgres — verbatim repo description: "Docker Official Image packaging for Postgres."
 
-[^docker-hub-postgres]: Docker Hub `postgres` official image listing. https://hub.docker.com/_/postgres — variants `bookworm`, `trixie`, `alpine3.22`, `alpine3.23` across PG14-18; 10 architectures (`amd64, arm32v5, arm32v6, arm32v7, arm64v8, i386, mips64le, ppc64le, riscv64, s390x`).
+[^docker-hub-postgres]: Docker Hub `postgres` official image listing. https://hub.docker.com/_/postgres — variants `trixie`, `bookworm`, `alpine3.24`, `alpine3.23` across PG14-18 (checked 2026-11-14); 10 architectures (`amd64, arm32v5, arm32v6, arm32v7, arm64v8, i386, mips64le, ppc64le, riscv64, s390x`).
 
 [^docker-lib-repo]: docker-library/postgres source repo structure. https://github.com/docker-library/postgres — top-level dirs `14/`, `15/`, `16/`, `17/`, `18/` plus `Dockerfile-debian.template`, `Dockerfile-alpine.template`, `apply-templates.sh`.
 
-[^dockerfile-17-bookworm]: PG17 bookworm Dockerfile. https://github.com/docker-library/postgres/blob/master/17/bookworm/Dockerfile — auto-generated header: "THIS DOCKERFILE IS GENERATED VIA 'apply-templates.sh' - PLEASE DO NOT EDIT IT DIRECTLY." Pins `PG_VERSION 17.9-1.pgdg12+1`, `PG_MAJOR 17`.
+[^dockerfile-17-bookworm]: PG17 bookworm Dockerfile. https://github.com/docker-library/postgres/blob/master/17/bookworm/Dockerfile — auto-generated header: "THIS DOCKERFILE IS GENERATED VIA 'apply-templates.sh' - PLEASE DO NOT EDIT IT DIRECTLY." Pins `PG_VERSION 17.<minor>-1.pgdg12+1` (17.12 as of 2026-11-14), `PG_MAJOR 17`.
+[^dockerfile-18-trixie]: PG18 trixie Dockerfile. https://github.com/docker-library/postgres/blob/master/18/trixie/Dockerfile — `ENV PGDATA /var/lib/postgresql/18/docker`, `VOLUME /var/lib/postgresql`, and the comment on the change. Tag list: https://github.com/docker-library/official-images/blob/master/library/postgres (checked 2026-11-14).
 
 [^docker-entrypoint-17-bookworm]: PG17 bookworm entrypoint script. https://github.com/docker-library/postgres/blob/master/17/bookworm/docker-entrypoint.sh — implements `file_env()` for `*_FILE` Docker-secret variants, `docker_verify_minimum_env()`, `initdb`, pg_hba auth setup, and `/docker-entrypoint-initdb.d/` execution.
 

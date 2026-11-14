@@ -62,15 +62,17 @@ Five rules.
 
 **Rule 5 — Test the upgrade procedure end-to-end on a disposable replica before doing it for real.** `pg_upgrade --check` is necessary but not sufficient — exercises only catalog-compatibility checks, not application behavior or extension functionality. Standard pre-production drill: take a recent backup, restore to disposable host running new version, run application test suite + smoke tests, time the upgrade window. Repeat until reproducible.
 
-> [!WARNING] PG13 already EOL (Nov 2025); PG14 EOL Nov 2026
-> The PostgreSQL Global Development Group supports each major for 5 years from initial release. As of 2026-05-14:
+> [!WARNING] PG13 and PG14 are EOL (PG13 Nov 2025, PG14 Nov 2026)
+> The PostgreSQL Global Development Group supports each major for 5 years from initial release. As of 2026-11-14:
 >
 > - **PG13: EOL November 13, 2025** — already past end-of-life. No further security/bug fixes from upstream. Anything still on PG13 should be on a written upgrade plan TODAY.
-> - **PG14: EOL November 12, 2026** — ~6 months remain. Plan upgrade NOW.
+> - **PG14: EOL since November 12, 2026.** The final release was 14.25 and PG14 receives no further security or bug fixes.[^pg14-eol] Anything still on PG14 should be on a written upgrade plan TODAY.
 > - **PG15: EOL November 11, 2027.**
 > - **PG16: EOL November 9, 2028.**
 > - **PG17: EOL November 8, 2029.**
 > - **PG18: EOL November 14, 2030.**[^lifecycle]
+>
+> PostgreSQL 19 is not yet released: GA is planned for 2026-11-19 (RC 2 shipped 2026-11-12). Until it ships, the upgrade targets are PG15 to PG18; re-verify before choosing PG19 as a target.[^pg19-rc2]
 
 > [!WARNING] PG18 changes that block in-place upgrades from older clusters
 > PG18 introduced two breaking changes that surface as `pg_upgrade --check` failures:
@@ -247,7 +249,9 @@ Run new-version cluster in parallel as logical replication subscriber. Cutover =
 **Trade-offs:**
 
 - Pros: minutes-of-cutover regardless of cluster size. Old cluster remains live until flip — easy rollback. Cross-architecture, cross-platform, cross-encoding all OK (logical replication is byte-format-independent).
-- Cons: DDL not replicated (schema must be migrated manually). Sequences not replicated (manual sync at cutover). Conflicts on subscriber halt apply worker. Large objects not replicated. Operational complexity high.
+- Cons: DDL not replicated (schema must be migrated manually). Sequences not replicated (manual sync at cutover for PG18 and older sources). Conflicts on subscriber halt apply worker. Large objects not replicated. Operational complexity high.
+
+PG19 adds logical replication of sequences (`ALL SEQUENCES` publications and `ALTER SUBSCRIPTION ... REFRESH SEQUENCES`). The `setval()` sync above stays necessary for PG18 and older sources; with a PG19 source it is no longer needed (GA planned 2026-11-19).[^pg19-seq]
 
 Cross-reference [`74-logical-replication.md`](./74-logical-replication.md) for replication mechanics, conflict handling, REPLICA IDENTITY rules.
 
@@ -310,10 +314,10 @@ PG18 added significant `pg_createsubscriber` flags. Verbatim PG18 release-note: 
 
 PostgreSQL Global Development Group (PGDG) supports each major version for **5 years from initial release**[^lifecycle]. After EOL, no security fixes, no bug fixes from upstream. Distros and managed providers may extend support but not always.
 
-| Version | Released | EOL date | Status (2026-05-14) |
+| Version | Released | EOL date | Status (2026-11-14) |
 |---|---|---|---|
 | PG13 | September 24, 2020 | November 13, 2025 | **EOL — upgrade now** |
-| PG14 | September 30, 2021 | November 12, 2026 | **6 months remaining** |
+| PG14 | September 30, 2021 | November 12, 2026 | **EOL — final release 14.25** |
 | PG15 | October 13, 2022 | November 11, 2027 | Supported |
 | PG16 | September 14, 2023 | November 9, 2028 | Supported |
 | PG17 | September 26, 2024 | November 8, 2029 | Supported |
@@ -667,13 +671,13 @@ The `--analyze-in-stages` mode runs three passes with progressively higher stati
 
 1. **`pg_dump`+restore time is proportional to data size — including indexes.** A 1 TB cluster with heavy indexing can take 6–12 hours to restore. Don't budget based on data-export time alone.
 2. **Logical replication does NOT replicate DDL.** Schema must be migrated manually. Forgetting this = subscription fails on first DDL change.
-3. **Logical replication does NOT replicate sequences.** Manual sync at cutover required (Recipe 3 step 9d).
+3. **Logical replication does NOT replicate sequences (PG18 and older sources).** Manual sync at cutover required (Recipe 3 step 9d). PG19 adds sequence replication.
 4. **Logical replication does NOT replicate large objects.** If application uses `lo_*` API, blue/green won't migrate them. Cross-reference [`71-large-objects.md`](./71-large-objects.md).
 5. **Logical replication apply worker BLOCKS on conflict.** PK violation, FK violation, missing row for UPDATE — apply worker stops. Cross-reference [`74-logical-replication.md`](./74-logical-replication.md).
 6. **`pg_upgrade --link` mode makes old cluster unrecoverable** once new cluster starts. Always have a backup. Cross-reference [`86-pg-upgrade.md`](./86-pg-upgrade.md) gotcha #2.
 7. **Extension binaries must be installed on target BEFORE upgrade.** Otherwise `pg_upgrade --check` fails. For logical replication: subscription creation fails if a referenced extension type is missing.
 8. **PG13 is already EOL** (Nov 2025). Running PG13 in production is unsupported.
-9. **PG14 EOL Nov 2026** — only ~6 months remain (as of 2026-05-14). Plan now.
+9. **PG14 is EOL (since 2026-11-12, final 14.25).** No further security or bug fixes. Upgrade now.
 10. **`pg_createsubscriber` cannot be undone.** Take a base backup of the standby first. Cross-reference [`75-replication-slots.md`](./75-replication-slots.md).
 11. **`pg_upgrade` requires same machine, same architecture.** Doesn't work for x86_64 → arm64 or Linux → Windows.
 12. **PG18 PK/FK collation rule breaks upgrades** when columns use mixed-determinism collations[^pg18-collation]. Audit before upgrade.
@@ -757,3 +761,9 @@ The `--analyze-in-stages` mode runs three passes with progressively higher stati
 [^pg14-analyze]: PostgreSQL 14 Release Notes — <https://www.postgresql.org/docs/release/14.0/>. "Stop pg_upgrade from creating analyze_new_cluster script (Magnus Hagander). Instead, give comparable vacuumdb instructions."
 
 [^pg14-protov2]: PostgreSQL 14 Release Notes. "Remove server and libpq support for the version 2 wire protocol (Heikki Linnakangas). It was last used as the default in PostgreSQL 7.3 (released in 2002)."
+
+[^pg14-eol]: PostgreSQL 18.7, 17.12, 16.16, 15.20, 14.25, and 19 RC 2 released (2026-11-12), "PostgreSQL 14 EOL Notice". "This is the final release of PostgreSQL 14. PostgreSQL 14 is now end-of-life and will no longer receive security and bug fixes." <https://www.postgresql.org/about/news/postgresql-187-1712-1616-1520-1425-and-19-rc-2-released-3442/>
+
+[^pg19-rc2]: PostgreSQL RC 2 announcement (2026-11-12): "The planned date for the general availability of PostgreSQL 19 is November 19, 2026." <https://www.postgresql.org/about/news/postgresql-187-1712-1616-1520-1425-and-19-rc-2-released-3442/>; roadmap: <https://www.postgresql.org/developer/roadmap/>
+
+[^pg19-seq]: PostgreSQL 19 release notes, Logical Replication (RC 2). Adds `CREATE`/`ALTER PUBLICATION ... ALL SEQUENCES` and `ALTER SUBSCRIPTION ... REFRESH SEQUENCES`. <https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-LOGICAL>

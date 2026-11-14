@@ -299,7 +299,7 @@ JIT compilation kicks in based on total plan cost.
 
 | GUC | Default | Effect |
 |---|---|---|
-| `jit` | `on` | Enable JIT globally |
+| `jit` | `on` (PG14–18); `off` (PG19) | Enable JIT globally; see [`61-jit-compilation.md`](./61-jit-compilation.md) |
 | `jit_above_cost` | `100000` | Total plan cost above which JIT is considered |
 | `jit_inline_above_cost` | `500000` | Cost above which JIT inlines functions |
 | `jit_optimize_above_cost` | `500000` | Cost above which JIT applies more expensive optimizations |

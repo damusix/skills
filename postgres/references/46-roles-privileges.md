@@ -313,6 +313,9 @@ A typical batch:
         END LOOP;
     END$$;
 
+> [!WARNING] Minor releases 2026-11-12
+> CVE-2026-120146 (2026-11-12 minors, 18.7 and the matching older branches): `REASSIGN OWNED` now follows the `ALTER OWNER` privilege rules and also checks `CREATEDB` for database ownership.[^minor-18-7] CVE-2026-116311: `DROP OWNED` removed restrictive row-level security policies; see [`47-row-level-security.md`](./47-row-level-security.md).[^minor-nov-announce] Full CVE list: <https://www.postgresql.org/support/security/>.
+
 
 ### Predefined Roles
 
@@ -668,3 +671,6 @@ Pre-PG18, decoding `pg_class.relacl` strings was a manual exercise (see the ACL 
 [^pg18-sigav]: "Add predefined role pg_signal_autovacuum_worker (Kirill Reshke) — This allows sending signals to autovacuum workers." PostgreSQL 18 Release Notes. https://www.postgresql.org/docs/release/18.0/
 [^pg18-ldp]: "Allow ALTER DEFAULT PRIVILEGES to define large object default privileges (Takatsuka Haruka, Yugo Nagata, Laurenz Albe)." PostgreSQL 18 Release Notes. https://www.postgresql.org/docs/release/18.0/
 [^pg18-getacl]: "Add function pg_get_acl() to retrieve database access control details (Joel Jacobson)." PostgreSQL 18 Release Notes. https://www.postgresql.org/docs/release/18.0/
+
+[^minor-18-7]: PostgreSQL 18.7 release notes (2026-11-12). <https://www.postgresql.org/docs/release/18.7/>
+[^minor-nov-announce]: PostgreSQL 18.7, 17.12, 16.16, 15.20, 14.25, and 19 RC 2 released (2026-11-12). <https://www.postgresql.org/about/news/postgresql-187-1712-1616-1520-1425-and-19-rc-2-released-3442/>

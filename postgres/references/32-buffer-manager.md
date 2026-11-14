@@ -292,6 +292,9 @@ SELECT * FROM pg_buffercache_usage_counts();
 > [!NOTE] PostgreSQL 17
 > Added `pg_buffercache_evict(bufferid)` for testing[^pg17-evict]. Verbatim: *"Add pg_buffercache function `pg_buffercache_evict()` to allow shared buffer eviction (Palak Chaturvedi, Thomas Munro). This is useful for testing."*
 
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 adds `pg_buffercache_os_pages` (NUMA) and the `pg_buffercache_mark_dirty*()` functions.[^pg19-buffercache]
+
 ### pg_stat_bgwriter and pg_stat_checkpointer
 
 > [!WARNING] PostgreSQL 17 column moves
@@ -379,8 +382,11 @@ Three relevant GUCs (defaults verified against PG18 docs[^pg18-aio]):
 | GUC | Default | Values | Notes |
 |---|---|---|---|
 | `io_method` | `worker` | `sync`, `worker`, `io_uring` | `worker` uses helper processes; `io_uring` requires Linux kernel io_uring support |
-| `io_workers` | `3` | int | Number of AIO worker processes (only when `io_method = worker`) |
+| `io_workers` | `3` (PG18 only; removed in PG19) | int | Number of AIO worker processes (only when `io_method = worker`) |
 | `io_combine_limit` | `128kB` (16 blocks) | size | Max I/O coalescing per request |
+
+> [!WARNING] PostgreSQL 19
+> PostgreSQL 19 removes the server variable `io_workers`. It is replaced by `io_min_workers` (default 2), `io_max_workers` (default 8), `io_worker_idle_timeout` (default 1 minute), and `io_worker_launch_interval` (default 100ms). Replace any `io_workers` setting with the new variables.[^pg19-io-workers]
 
 PG18 also raised `effective_io_concurrency` and `maintenance_io_concurrency` defaults to 16[^pg18-aio]: *"Increase server variables `effective_io_concurrency`'s and `maintenance_io_concurrency`'s default values to 16 (Melanie Plageman). This more accurately reflects modern hardware."*
 
@@ -399,6 +405,7 @@ Operational impact:
 | PG16 | `pg_stat_io` view[^pg16-pgstatio]; `BUFFER_USAGE_LIMIT` for VACUUM/ANALYZE + `vacuum_buffer_usage_limit` GUC[^pg16-buffer-usage] (default `256kB`); `pg_buffercache_summary()` + `pg_buffercache_usage_counts()` functions[^pg16-buffercache]. |
 | PG17 | `pg_stat_checkpointer` view; `pg_stat_bgwriter` shrunk to 4 columns[^pg17-checkpointer]; `pg_buffercache_evict()` function[^pg17-evict]; `vacuum_buffer_usage_limit` default raised to `2MB`[^pg17-bufferusagelimit]; new VACUUM memory management (removed 1 GB cap); streaming I/O for sequential reads (precursor to PG18 AIO)[^pg17-streaming]; `io_combine_limit` GUC[^pg17-iocombine]. |
 | PG18 | Async I/O subsystem (`io_method`, `io_workers`, `pg_aios`)[^pg18-aio]; `effective_io_concurrency` / `maintenance_io_concurrency` defaults raised to 16; `pg_stat_io` extended with `read_bytes` / `write_bytes` / `extend_bytes`, WAL I/O activity, and per-backend `pg_stat_get_backend_io()`; data checksums enabled by default in `initdb`. |
+| PG19 (RC) | `io_workers` removed; replaced by `io_min_workers`, `io_max_workers`, `io_worker_idle_timeout`, `io_worker_launch_interval`[^pg19-io-workers]; `pg_buffercache_os_pages` and `pg_buffercache_mark_dirty*()`[^pg19-buffercache]. |
 
 ## Examples / Recipes
 
@@ -601,6 +608,9 @@ ALTER SYSTEM SET io_combine_limit = '256kB';
 -- After change, restart (io_method is restart-only)
 ```
 
+> [!NOTE] PostgreSQL 19
+> On PG19 the `pg_settings` filter above no longer matches `io_workers`; use `io_min_workers` and `io_max_workers` instead.[^pg19-io-workers]
+
 Observe AIO inflight via `pg_aios`. Inspect throughput change via `pg_stat_io.reads` / `read_bytes` over a fixed interval before and after.
 
 ### Recipe 11 — cache-hit ratio for a single table (operationally rarely useful, included for completeness)
@@ -772,3 +782,7 @@ A clean COPY shows almost all writes/extends in `context = bulkwrite` with high 
 [^pg17-iocombine]: PostgreSQL 17 release notes — *"Allow the grouping of file system reads with the new system variable `io_combine_limit` (Thomas Munro, Andres Freund, Melanie Plageman, Nazir Bilal Yavuz)"*. https://www.postgresql.org/docs/release/17.0/
 
 [^pg18-aio]: PostgreSQL 18 release notes — *"Add an asynchronous I/O subsystem (Andres Freund, Thomas Munro, Nazir Bilal Yavuz, Melanie Plageman). This feature allows backends to queue multiple read requests, which allows for more efficient sequential scans, bitmap heap scans, vacuums, etc. This is enabled by server variable `io_method`, with server variables `io_combine_limit` and `io_max_combine_limit` added to control it. This also enables `effective_io_concurrency` and `maintenance_io_concurrency` values greater than zero for systems without `fadvise()` support. The new system view `pg_aios` shows the file handles being used for asynchronous I/O."*; *"Increase server variables `effective_io_concurrency`'s and `maintenance_io_concurrency`'s default values to 16 (Melanie Plageman). This more accurately reflects modern hardware."*; *"`pg_stat_io` columns expanded to report I/O activity in bytes with new columns: `read_bytes`, `write_bytes`, and `extend_bytes` (Nazir Bilal Yavuz)"*; *"WAL I/O activity rows added to `pg_stat_io` (Nazir Bilal Yavuz, Bertrand Drouvot, Michael Paquier)"*; *"Per-backend I/O statistics via `pg_stat_get_backend_io()` (Bertrand Drouvot)"*. https://www.postgresql.org/docs/release/18.0/
+
+[^pg19-io-workers]: PostgreSQL 19 release notes (RC2), Migration: *"Remove server variable `io_workers`"*, replaced by `io_min_workers`, `io_max_workers`, `io_worker_idle_timeout`, and `io_worker_launch_interval`; defaults at https://www.postgresql.org/docs/19/runtime-config-resource.html . Release notes: https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION
+
+[^pg19-buffercache]: PostgreSQL 19 release notes (RC2): `pg_buffercache_os_pages` (NUMA) and `pg_buffercache_mark_dirty*()`. https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MODULES

@@ -202,7 +202,10 @@ Advisory locks are stored in the same shared-memory lock pool as relation locks,
 total_lock_slots ≈ max_locks_per_transaction × (max_connections + max_prepared_transactions)
 ```
 
-Default values: `max_locks_per_transaction = 64`, `max_connections = 100`, `max_prepared_transactions = 0`. Default total ≈ 6,400 slots — shared across all backends, all lock types.
+Default values on PG14–18: `max_locks_per_transaction = 64`, `max_connections = 100`, `max_prepared_transactions = 0`. Default total ≈ 6,400 slots — shared across all backends, all lock types.
+
+> [!WARNING] PostgreSQL 19
+> PostgreSQL 19 changes the default of `max_locks_per_transaction` from 64 to 128 and changes how lock memory is sized: *"Lock size allocation has changed, so effectively settings must now be doubled to match their capacity in previous releases."* The default capacity stays about the same, and the formula above overstates PG19 capacity by about 2x. Double any value tuned on an earlier release.[^pg19-max-locks-44]
 
 Verbatim warning: *"Care must be taken not to exhaust this memory or the server will be unable to grant any locks at all. This imposes an upper limit on the number of advisory locks grantable by the server, typically in the tens to hundreds of thousands depending on how the server is configured."*[^shared-pool]
 
@@ -253,6 +256,7 @@ Rule: **never call an advisory-lock function directly in a SELECT's target list 
 | PG16 | **None** | Zero advisory-lock items in PG16 release notes. The PG16 *"Simplify permissions for `LOCK TABLE`"* change applies to `LOCK TABLE` statements only, not to advisory locks. |
 | PG17 | **None** | Zero advisory-lock items in PG17 release notes. |
 | PG18 | **None** | Zero advisory-lock items in PG18 release notes. The PG18 `log_lock_failures` GUC logs `SELECT … NOWAIT` failures but does not cover `pg_try_advisory_lock` returning `false` (those are not failures — they are the documented "lock not available" return). |
+| PG19 (RC) | Shared lock pool default grows | `max_locks_per_transaction` default changes from 64 to 128 to keep the same capacity under the new lock-size allocation; double tuned values.[^pg19-max-locks-44] |
 
 **Five consecutive major versions with zero advisory-lock changes.** The semantics, function signatures, key spaces, scoping rules, and `pg_locks` encoding documented in this file apply identically to every supported PG release. If you find a Stack Overflow answer claiming "in PG16 advisory locks now do X" — verify against the release notes; the claim is wrong.
 
@@ -678,3 +682,5 @@ If the count is non-zero immediately after promotion, you have applications that
 - PostgreSQL 16 release notes. https://www.postgresql.org/docs/release/16.0/
 - PostgreSQL 17 release notes. https://www.postgresql.org/docs/release/17.0/
 - PostgreSQL 18 release notes. https://www.postgresql.org/docs/release/18.0/
+
+[^pg19-max-locks-44]: PostgreSQL 19 release notes (RC2), Migration: *"Change default of `max_locks_per_transaction` from 64 to 128... effectively settings must now be doubled to match their capacity in previous releases."* https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION ; docs: https://www.postgresql.org/docs/19/runtime-config-locks.html

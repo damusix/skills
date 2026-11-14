@@ -123,6 +123,12 @@ PG18 adds:
     FORCE_NOT_NULL { ( cols ) | * }
     FORCE_NULL     { ( cols ) | * }
 
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 lets `COPY TO` output JSON (`FORMAT json`, with the `FORCE_ARRAY` option); `json` is allowed only in `COPY TO`, and `COPY (query) TO ... (FORMAT json)` uses the query's column names and aliases as keys. `COPY TO` now also works on partitioned tables, which also improves logical replication table synchronization. Text and CSV `COPY FROM` are SIMD-accelerated, and COPY I/O on pipe, file, and program has new wait events.[^pg19-copy]
+
+> [!WARNING] PostgreSQL 19
+> PostgreSQL 19 disallows system columns in `COPY FROM ... WHERE`. Remove such predicates before upgrading.[^pg19-copy]
+
 ### Server-side `COPY` vs Client-side `\copy`
 
 Server-side `COPY` reads/writes file paths from the server's filesystem perspective. Requires elevated privilege.
@@ -199,6 +205,9 @@ Scope of "error" for `ON_ERROR ignore`: **type-conversion errors only**. Constra
 
 Verbatim REJECT_LIMIT docs[^copy18]: *"Specifies the maximum number of errors tolerated while converting a column's input value to its data type, when `ON_ERROR` is set to `ignore`. If the input causes more errors than the specified value, the COPY command fails, even with `ON_ERROR` set to `ignore`. This clause must be used with `ON_ERROR=ignore` and maxerror must be positive bigint. If not specified, `ON_ERROR=ignore` allows an unlimited number of errors, meaning COPY will skip all erroneous data."*
 
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 adds `ON_ERROR SET_NULL` alongside `stop` and `ignore`. The `ON_ERROR` and `REJECT_LIMIT` behavior above is the PG17–18 baseline.[^pg19-copy]
+
 ### HEADER MATCH (PG15+)
 
 > [!NOTE] PostgreSQL 15
@@ -211,6 +220,9 @@ Three header modes:
 | `HEADER` or `HEADER true` | Output column names on COPY TO; skip first line on COPY FROM |
 | `HEADER false` | No header (default) |
 | `HEADER MATCH` (PG15+, FROM only) | Skip first line AND verify column names match table columns in order |
+
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 lets `COPY FROM` skip multiple header lines: the option becomes `HEADER [ boolean | integer | MATCH ]`.[^pg19-copy]
 
 `HEADER MATCH` catches "I added a column in the middle of the table" mistakes early. Strongly recommended for production ETL.
 
@@ -237,6 +249,7 @@ Managed-environment caveat: most managed Postgres services strip these role-memb
 | **PG16** | `COPY FROM` value can map to column DEFAULT via `DEFAULT 'string'` option[^pg16-rel]; COPY into foreign tables batches inserts[^pg16-rel] |
 | **PG17** | `ON_ERROR ignore`/`stop`[^pg17-rel]; `LOG_VERBOSITY default`/`verbose`[^pg17-rel]; `pg_stat_progress_copy.tuples_skipped`[^pg17-rel] |
 | **PG18** | `REJECT_LIMIT`[^pg18-rel]; `LOG_VERBOSITY silent`[^pg18-rel]; `FORCE_NOT_NULL *` / `FORCE_NULL *`[^pg18-rel]; `COPY TO` from populated matview[^pg18-rel]; `COPY FREEZE` on foreign tables now errors instead of silently no-op[^pg18-rel]; **incompatibility**: `\.` no longer EOF for CSV server-side[^pg18-eof] |
+| **PG19** (RC) | `ON_ERROR SET_NULL`; `HEADER` accepts an integer to skip multiple header lines on `COPY FROM`; `COPY TO` JSON (`FORMAT json`, `FORCE_ARRAY`); `COPY TO` on partitioned tables; system columns disallowed in `COPY FROM ... WHERE`; SIMD-accelerated text/CSV `COPY FROM`; new COPY I/O wait events[^pg19-copy] |
 
 ## Examples / Recipes
 
@@ -628,3 +641,5 @@ Run this before any security-review milestone. Membership in `pg_execute_server_
 [^pg18-eof]: PostgreSQL 18 release notes, incompatibility. https://www.postgresql.org/docs/18/release-18.html — verbatim: *"Prevent COPY FROM from treating \\. as an end-of-file marker when reading CSV files (Daniel Vérité, Tom Lane). psql will still treat \\. as an end-of-file marker when reading CSV files from STDIN. Older psql clients connecting to PostgreSQL 18 servers might experience \\copy problems. This release also enforces that \\. must appear alone on a line."*
 
 [^populate]: PostgreSQL 16 docs, populating a database. https://www.postgresql.org/docs/16/populate.html — section 14.4 covers bulk-load recommendations: use COPY (verbatim *"Use COPY to load all the rows in one command, instead of using a series of INSERT commands. The COPY command is optimized for loading large numbers of rows; it is less flexible than INSERT, but incurs significantly less overhead for large data loads."*), remove indexes, remove foreign keys, increase maintenance_work_mem and max_wal_size, disable WAL archival/streaming for non-critical loads, run ANALYZE afterwards.
+
+[^pg19-copy]: PostgreSQL 19 release notes (RC2), COPY: *"Allow multiple headers lines to be skipped by `COPY FROM`"*, `ON_ERROR SET_NULL`, *"Allow `COPY TO` to output JSON format"*, `COPY TO` on partitioned tables, *"Disallow system columns from being used in `COPY FROM ... WHERE`"*, SIMD-accelerated text/CSV `COPY FROM`. https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-COPY

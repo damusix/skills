@@ -362,6 +362,9 @@ WHERE c.relkind IN ('r', 'p')
 ORDER BY rls_enabled DESC, n.nspname, c.relname;
 ```
 
+> [!WARNING] Minor releases 2026-08-13 / 2026-11-12
+> Row-level security fixes to apply by upgrading to the current minors. CVE-2026-14666 (2026-08-13): RLS caching ignored role changes.[^minor-aug-announce] CVE-2026-116311 (2026-11-12): `DROP OWNED` removed restrictive policies. CVE-2026-120154 (2026-11-12): `INSERT ... ON CONFLICT` read rows despite RLS. CVE-2026-116327 (2026-11-12): `security_barrier` exposure.[^minor-nov-announce] Full CVE list: <https://www.postgresql.org/support/security/>.
+
 
 ### Per-Version Timeline
 
@@ -817,3 +820,8 @@ Additional release notes consulted for absence-of-changes confirmation:
 
 - PostgreSQL 14.0 release notes — zero RLS-related items. https://www.postgresql.org/docs/release/14.0/
 - PostgreSQL 17.0 release notes — zero RLS-related items. https://www.postgresql.org/docs/release/17.0/
+
+
+[^minor-aug-announce]: PostgreSQL 18.6, 17.11, 16.15, 15.19, 14.24, and 19 Beta 3 released (2026-08-13). <https://www.postgresql.org/about/news/postgresql-186-1711-1615-1519-1424-and-19-beta-3-released-3365/>
+
+[^minor-nov-announce]: PostgreSQL 18.7, 17.12, 16.16, 15.20, 14.25, and 19 RC 2 released (2026-11-12). <https://www.postgresql.org/about/news/postgresql-187-1712-1616-1520-1425-and-19-rc-2-released-3442/>

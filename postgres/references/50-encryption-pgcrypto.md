@@ -249,6 +249,9 @@ FROM secrets WHERE name = 'api_key';
 
 If decryption fails (wrong password, tampered ciphertext, MDC mismatch), `pgp_sym_decrypt` raises an error — it does not silently return NULL or garbage. Wrap in `EXCEPTION WHEN OTHERS` only if you genuinely want to swallow the error class (rarely correct).
 
+> [!WARNING] Minor releases 2026-08-13
+> CVE-2026-14663 (fixed in the 2026-08-13 minors, 18.6 and the matching older branches): PGP encryption with an unsupported cipher (`cipher-algo` of `bf`, `twofish`, `cast5`, or `3des` under FIPS or without the legacy provider) silently produced cleartext. Decrypt now fails by default for such data. The new `ignore-cipher-failure=1` option on `pgp_sym_decrypt()` and `pgp_pub_decrypt()` changes that.[^minor-18-6] Full CVE list: <https://www.postgresql.org/support/security/>.
+
 ## PGP Asymmetric Encryption: pgp_pub_encrypt() / pgp_pub_decrypt()
 
 ```sql
@@ -781,3 +784,5 @@ Adopt a column-naming convention (`*_encrypted` suffix or column comment contain
 [^pg18-builtin]: PostgreSQL 18.0 release notes, E.4.3.9.2 pgcrypto. Verbatim: *"Add pgcrypto server variable `builtin_crypto_enabled` to allow disabling builtin non-FIPS mode cryptographic functions (Daniel Gustafsson, Joe Conway) — This is useful for guaranteeing FIPS mode behavior."* PG18 pgcrypto.html: *"`pgcrypto.builtin_crypto_enabled` determines if the built in crypto functions `gen_salt()`, and `crypt()` are available for use. Setting this to `off` disables these functions. `on` (the default) enables these functions to work normally. `fips` disables these functions if OpenSSL is detected to operate in FIPS mode."* https://www.postgresql.org/docs/release/18.0/ and https://www.postgresql.org/docs/18/pgcrypto.html
 [^pg-tde]: Percona pg_tde, Transparent Data Encryption for PostgreSQL. GitHub repository tagline: *"Transparent Data Encryption for PostgreSQL."* Provides `tde_heap` access method encrypting tuples, WAL, and indexes; targets Percona Server for PostgreSQL 17 and 18; supports file-based KMS and external KMS via Global Key Provider interface. https://github.com/percona/pg_tde
 [^edb-tde]: EDB Postgres Advanced Server product page mentions TDE as a security feature: *"Keep customer information secure at all layers with Transparent Data Encryption (TDE), supply chain security measures, and hardened container images."* https://www.enterprisedb.com/products/edb-postgres-advanced-server
+
+[^minor-18-6]: PostgreSQL 18.6 release notes (2026-08-13), pgcrypto and CVE-2026-14663. <https://www.postgresql.org/docs/release/18.6/>

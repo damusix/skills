@@ -77,17 +77,17 @@ Three smell signals:
 
 ## Tool Comparison
 
-Three-tool matrix. All facts verified against tool docs at planning time (Jan 2026).
+Three-tool matrix. Facts verified against tool docs; versions checked 2026-11-14.
 
 | Property | pgBackRest | Barman | WAL-G |
 |---|---|---|---|
 | License | MIT | GPL 3.0 | Apache 2.0 |
-| Latest stable (Jan 2026) | 2.58.0 (Jan 2025) | 3.18.0 (Mar 2026) | 3.0.8 (Jan 2026) |
+| Latest stable (checked 2026-11-14) | 2.60.0 (2026-10-18) | 3.20.1 (2026-09-29) | 3.0.9 (2026-08-20) |
 | Primary language | C + Perl wrappers | Python | Go |
-| PG versions supported | 9.4 → 18 (incl. experimental PG18 in 2.55+) | 9.4 → 18 | 9.6 → 18 |
+| PG versions supported | 9.4 → 19 (PG18 in 2.55+, PG19 in 2.59+) | 9.4 → 18 (PG19 not announced) | 9.6 → 18 (PG19 not announced) |
 | Repository model | Multi-tier (local + remote) | Server-side catalog | Object-storage-first |
 | Backup model | Push (from PG host) | Pull (rsync over ssh) OR streaming (pg_basebackup) | Push (from PG host) |
-| Block-level incremental | Yes (since 2.32) | Limited (relies on rsync) | Delta (file-level) |
+| Block-level incremental | Yes (2.46+; needs `repo-block` + `repo-bundle`) | Limited (relies on rsync) | Delta (file-level) |
 | Parallel backup | Yes (`process-max`) | Yes (`parallel_jobs`) | Yes (`WALG_UPLOAD_CONCURRENCY`) |
 | Parallel restore | Yes | Yes (file-level) | Yes |
 | Compression | gz / lz4 / zstd / bz2 (configurable per stanza) | gz / bz2 / xz / pigz / pbzip2 | lz4 (default) / lzma / zstd / brotli |
@@ -158,7 +158,6 @@ Primary `postgresql.conf`:
 ```conf
 archive_mode = on
 archive_command = 'pgbackrest --stanza=main archive-push %p'
-# OR (PG15+ preferred) archive_library = 'pgbackrest-archive-push'
 ```
 
 ### Operational commands
@@ -194,7 +193,7 @@ sudo -u postgres pgbackrest --stanza=main \
 
 ### Incremental backup mechanism
 
-pgBackRest performs **block-level** incremental backup since version 2.32. Each backup tracks per-file modification timestamps + checksums to identify changed blocks. Restore reconstructs from full + diff/incr chain. No dependency on PG17+ `pg_basebackup --incremental`.
+pgBackRest performs **block-level** incremental backup since version 2.46 (beta in 2.45), enabled with `repo-block=y` plus `repo-bundle=y`. Without block incremental, diff/incr backups copy whole changed files, identified by per-file timestamps + checksums. Restore reconstructs from full + diff/incr chain. No dependency on PG17+ `pg_basebackup --incremental`.
 
 ### Multi-repository (redundancy)
 
@@ -208,9 +207,15 @@ Configure `repo1-*` and `repo2-*`. Each backup goes to all configured repos. Ret
 
 - PG10+: required.
 - PG12+: full PITR via standby.signal + recovery_target_* GUCs.
-- PG15+: can use `archive_library = 'pgbackrest-archive-push'` instead of shell `archive_command`. Reduces overhead.
+- PG15+: `archive_library` exists in core, but pgBackRest's user guide documents only `archive_command`. Use `archive-async=y` to cut per-segment overhead (Recipe 6).
 - PG17+: pgBackRest has *its own* incremental mechanism; does NOT use `pg_basebackup --incremental`.
-- PG18: experimental support since pgBackRest 2.55 (April 2024).
+- PG18: supported since pgBackRest 2.55.0 (2025-04-21).
+- PG19: supported since 2.59.0 (2026-07-20; beta builds through 2.59.2).
+
+> [!WARNING] pgBackRest 2.59 / 2.60 breaking changes
+> - **2.59.0:** only `restore` may run as root by default. Other commands as root need `allow-root`.
+> - **2.59.3:** security fix: weak encryption subkeys or salts could be generated if reading system random data failed. Upgrade if you use repository encryption.
+> - **2.60.0:** `restore` errors if any restored file has an invalid page checksum, and `expire` refuses to expire when the oldest retained backup would contain checksum errors (which also stops WAL archive expiry). `checksum-page-error=n` restores the old warn-only behavior.[^pgbackrest-releases]
 
 ### Strengths
 
@@ -229,7 +234,7 @@ Configure `repo1-*` and `repo2-*`. Each backup goes to all configured repos. Ret
 
 ## Barman
 
-Author: EnterpriseDB (formerly 2ndQuadrant). License: GPL 3.0. Site: https://pgbarman.org/. Docs: https://docs.pgbarman.org/release/3.18.0/.
+Author: EnterpriseDB (formerly 2ndQuadrant). License: GPL 3.0. Site: https://pgbarman.org/. Docs: https://docs.pgbarman.org/. Latest 3.20.1 (2026-09-29), which fixes CVE-2026-93853 (a tampered `backup.info` could delete unrelated cloud snapshots); **3.20.0 requires Python 3.12+**.
 
 ### Design
 
@@ -321,7 +326,7 @@ Barman 3.x added **cloud_storage_provider** for direct-to-S3 backup (`barman-clo
 ### Notable PG-version interaction
 
 - Supports PG 9.4 → 18.
-- PG15+: `archive_library` not natively supported by Barman as of 3.18.0; continue using `archive_command = 'barman-wal-archive ...'`. Verify against current docs.
+- PG15+: `archive_library` not natively supported by Barman as of 3.20.1; continue using `archive_command = 'barman-wal-archive ...'`. Verify against current docs.
 - PG17+: pg_basebackup --incremental is NOT used by Barman; Barman uses its own rsync-based incremental.
 
 ### Strengths
@@ -472,9 +477,9 @@ PG15+ adds `archive_library`: load WAL archival as a shared library called from 
 
 | Tool | `archive_command` support | `archive_library` support |
 |---|---|---|
-| pgBackRest | Yes (default) | Yes (since 2.42) |
-| Barman | Yes (default) | Not as of 3.18.0 |
-| WAL-G | Yes (default) | Not natively |
+| pgBackRest | Yes (default) | Not documented in the user guide; use `archive-async` |
+| Barman | Yes (default) | Not as of 3.20.1 |
+| WAL-G | Yes (default) | Unreleased: master docs describe a `walg_archive` extension for PG15+; verify against your release |
 
 > [!WARNING] PG16: `archive_command` and `archive_library` mutually exclusive
 > Verbatim from PG16 release notes: *"Prevent `archive_library` and `archive_command` from being set at the same time (Nathan Bossart). Previously `archive_library` would override `archive_command`."* If both are set on PG16+, server fails to start. Use exactly one.
@@ -513,13 +518,13 @@ Pair with [`82-monitoring.md`](./82-monitoring.md). Alert on:
 | PG version | Backup-tool-relevant change |
 |---|---|
 | **PG14** | `recovery_init_sync_method=syncfs` reduces fsync time on Linux during restore. `pg_stat_wal` view added. |
-| **PG15** | `archive_library` GUC introduced. Verbatim: *"Allow archiving via loadable modules (Nathan Bossart). The new server variable `archive_library` can be set to specify a library to be called for archiving."* pgBackRest 2.42+ supports it. |
+| **PG15** | `archive_library` GUC introduced. Verbatim: *"Allow archiving via loadable modules (Nathan Bossart). The new server variable `archive_library` can be set to specify a library to be called for archiving."* None of the three tools documents an archive module in a released version. |
 | **PG15** | `pg_basebackup --target=server` server-side backup target. Server-side LZ4/Zstd compression in `pg_basebackup`. |
 | **PG16** | `archive_library` and `archive_command` mutually exclusive — server fails to start if both set. Verbatim: *"Prevent `archive_library` and `archive_command` from being set at the same time (Nathan Bossart)."* |
 | **PG16** | `pg_basebackup` fix for tablespaces in `$PGDATA`. |
 | **PG17** | `pg_basebackup --incremental` introduced. Verbatim: *"Add support for incremental file system backup (Robert Haas, Jakub Wartak, Tomas Vondra). Incremental backups can be created using `pg_basebackup`'s new `--incremental` option."* `pg_combinebackup` for combining chains. WAL summarization (`summarize_wal` GUC, `pg_walsummary` tool). |
 | **PG17** | None of pgBackRest/Barman/WAL-G *use* `pg_basebackup --incremental` as of late 2026 — all three have their own established incremental mechanisms. Use core tool if you want PG17+ native incremental. |
-| **PG18** | `pg_combinebackup -k / --link` hard-link mode. `pg_verifybackup` tar support. Experimental support in pgBackRest 2.55+. |
+| **PG18** | `pg_combinebackup -k / --link` hard-link mode. `pg_verifybackup` tar support. Supported by pgBackRest 2.55.0+. |
 
 ## Recipes
 
@@ -740,31 +745,25 @@ echo "Restore drill OK"
 
 Run weekly via cron. Alert on failure. Cross-reference [`90-disaster-recovery.md`](./90-disaster-recovery.md) for full DR drill procedure.
 
-### Recipe 6 — Migrate from `archive_command` (shell) to `archive_library` PG15+ with pgBackRest
+### Recipe 6 — Speed up pgBackRest WAL archiving with async archive-push
 
-```bash
-# Pre-check version
-psql -c "SHOW server_version_num;"  # expect >= 150000
+pgBackRest archives through `archive_command`; its user guide documents no `archive_library` module. When WAL is generated faster than one `archive-push` per segment can ship it, enable asynchronous archiving: `archive-push` returns as soon as the segment is queued in a local spool directory, and a background process pushes segments in parallel.
 
-# Verify pgBackRest version supports archive_library
-pgbackrest --version  # expect >= 2.42
+```ini
+# /etc/pgbackrest/pgbackrest.conf
+[global]
+archive-async=y
+spool-path=/var/spool/pgbackrest
+
+[global:archive-push]
+process-max=4
 ```
 
 ```sql
--- Replace archive_command with archive_library
--- Do NOT set both — PG16+ refuses to start
-ALTER SYSTEM SET archive_command = '';
-ALTER SYSTEM SET archive_library = 'pgbackrest-archive-push';
-SELECT pg_reload_conf();
-SHOW archive_library;
-SHOW archive_command;  -- should be empty
-```
-
-Trigger a WAL switch and verify archival:
-
-```sql
+-- archive_command is unchanged
+SHOW archive_command;  -- pgbackrest --stanza=main archive-push %p
 SELECT pg_switch_wal();
-SELECT pg_stat_archiver();
+SELECT * FROM pg_stat_archiver;
 -- last_archived_wal should advance; failed_count should be 0
 ```
 
@@ -917,7 +916,7 @@ Then have an external listener (systemd unit listening on the NOTIFY channel) tr
 14. **WAL-G env vars are not encrypted at rest in `/etc/wal-g/wal-g.env`.** Use systemd `EnvironmentFile=` with file mode 0600, or fetch from Vault on service start.
 15. **K8s operators (CNPG) abstract a lot of this away.** If you're using CNPG/Zalando, configure backups via the CR, not by SSHing into pods to invoke `pgbackrest` directly. Direct invocation may conflict with operator-managed state.
 16. **None of these tools use `pg_basebackup --incremental` (PG17+) yet.** Each has its own incremental mechanism. If you specifically want core PG17+ incremental, use `pg_basebackup --incremental` + `pg_combinebackup` directly (cross-reference [`84-backup-physical-pitr.md`](./84-backup-physical-pitr.md)).
-17. **Tool version compatibility with PG major.** pgBackRest 2.55+ for PG18 experimental, Barman 3.x for PG14+, WAL-G 3.x for PG18. Verify before deploying.
+17. **Tool version compatibility with PG major.** pgBackRest 2.55+ for PG18 and 2.59+ for PG19, Barman 3.x for PG14+ (3.20+ needs Python 3.12), WAL-G 3.x for PG18. Verify before deploying.
 18. **Pull-model (Barman) requires SSH connectivity at backup time.** Network partition between Barman host and PG host = backup fails silently if not alerted.
 19. **Push-model (pgBackRest, WAL-G) requires outbound network from PG host.** In locked-down environments this can be blocked. Open egress to backup target before deployment.
 20. **Restore performance is rarely tested.** A 5-hour restore is fine if you tested it. Untested 5-hour restore is a 24-hour outage. Time your restores.
@@ -953,7 +952,7 @@ Then have an external listener (systemd unit listening on the NOTIFY channel) tr
 - pgBackRest releases (GitHub): <https://github.com/pgbackrest/pgbackrest/releases>[^pgbackrest-releases]
 - pgBackRest source: <https://github.com/pgbackrest/pgbackrest>[^pgbackrest-source]
 - Barman project home: <https://pgbarman.org/>[^barman-home]
-- Barman 3.18.0 docs: <https://docs.pgbarman.org/release/3.18.0/>[^barman-docs]
+- Barman docs: <https://docs.pgbarman.org/>[^barman-docs]
 - Barman source + releases: <https://github.com/EnterpriseDB/barman>[^barman-source]
 - WAL-G source + releases: <https://github.com/wal-g/wal-g>[^walg-source]
 - WAL-G docs: <https://wal-g.readthedocs.io/>[^walg-docs]
@@ -967,15 +966,15 @@ Then have an external listener (systemd unit listening on the NOTIFY channel) tr
 - PG18 release notes: <https://www.postgresql.org/docs/release/18.0/>[^pg18-notes]
 - CloudNativePG (mentions barman-cloud + WAL archival): <https://cloudnative-pg.io/>[^cnpg]
 
-[^pgbackrest-home]: pgBackRest project home page. MIT license, version 2.58.0 (Jan 2025).
+[^pgbackrest-home]: pgBackRest project home page. MIT license. Current stable 2.60.0 (2026-10-18); 2.58.0 was 2026-01-19.
 [^pgbackrest-config]: pgBackRest configuration reference — all stanza options.
 [^pgbackrest-command]: pgBackRest command reference — backup, restore, info, verify, expire.
-[^pgbackrest-releases]: pgBackRest releases on GitHub — verified active development (3 releases July 2024 → Jan 2025).
+[^pgbackrest-releases]: pgBackRest releases on GitHub — <https://github.com/pgbackrest/pgbackrest/releases> — 2.59.0 (2026-07-20, PG19, `allow-root`), 2.59.3 (encryption salt fix), 2.60.0 (2026-10-18, `checksum-page-error`). User guide (archiving via `archive_command` only): <https://raw.githubusercontent.com/pgbackrest/pgbackrest/main/doc/xml/user-guide.xml>. Checked 2026-11-14.
 [^pgbackrest-source]: pgBackRest source repository.
 [^barman-home]: Barman project home page. GPLv3, EnterpriseDB-maintained.
-[^barman-docs]: Barman 3.18.0 release docs. Released March 2026.
+[^barman-docs]: Barman releases <https://github.com/EnterpriseDB/barman/releases> — 3.20.1 (2026-09-29); 3.20.0 requires Python 3.12+.
 [^barman-source]: Barman GitHub repository.
-[^walg-source]: WAL-G GitHub repository. Apache 2.0. Version 3.0.8 (Jan 2026). Multi-engine (PG, MySQL, MongoDB, Redis, FoundationDB).
+[^walg-source]: WAL-G GitHub repository. Apache 2.0. Version 3.0.9 (2026-08-20). Multi-engine (PG, MySQL, MongoDB, Redis, FoundationDB).
 [^walg-docs]: WAL-G documentation on ReadTheDocs.
 [^pg16-backup]: PostgreSQL 16 official Backup and Restore chapter.
 [^pg16-archive]: PostgreSQL 16 Continuous Archiving and PITR chapter.

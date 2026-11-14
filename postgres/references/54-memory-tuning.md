@@ -352,6 +352,7 @@ Transparent huge pages (THP) are different from explicit huge pages. THP is dyna
 | **PG16** | `vacuum_buffer_usage_limit` GUC + `BUFFER_USAGE_LIMIT` VACUUM/ANALYZE option (default 256 kB)[^pg16-vbul-intro]; no `work_mem` / `shared_buffers` / `maintenance_work_mem` changes | |
 | **PG17** | `maintenance_work_mem` 1 GB silent cap removed for vacuum[^pg17-mwm]; `vacuum_buffer_usage_limit` default raised 256 kB → 2 MB[^pg17-vbul-default]; `io_combine_limit` GUC[^pg17-io] | The most impactful release for memory-tuning since PG13 |
 | **PG18** | Async I/O subsystem (`io_method`, `io_workers`, `io_combine_limit`, `io_max_combine_limit`, `pg_aios`)[^pg18-aio]; `effective_io_concurrency` / `maintenance_io_concurrency` defaults 1 → 16[^pg18-eio]; no `work_mem` / `shared_buffers` / `maintenance_work_mem` changes | Memory-sizing surface unchanged; only I/O parallelism defaults |
+| **PG19** (RC) | `io_workers` removed; replaced by `io_min_workers` (2), `io_max_workers` (8), `io_worker_idle_timeout` (1 minute), `io_worker_launch_interval` (100ms)[^pg19-io-workers-54] | Single worker count replaced by min/max settings |
 
 
 ## Examples / Recipes
@@ -672,8 +673,11 @@ SHOW maintenance_io_concurrency;         -- PG18 default: 16 (was 10 in PG17)
 
 PG18 async I/O adds memory commitment in two places:
 
-- `io_workers` extra backend processes (default 3, costs ~10 MB each).
+- `io_workers` extra backend processes (PG18 default 3, costs ~10 MB each; the variable is removed in PG19).
 - DSM for the I/O queue, scoped within `min_dynamic_shared_memory` or dynamically allocated.
+
+> [!WARNING] PostgreSQL 19
+> PostgreSQL 19 removes the server variable `io_workers`. It is replaced by `io_min_workers` (default 2), `io_max_workers` (default 8), `io_worker_idle_timeout` (default 1 minute), and `io_worker_launch_interval` (default 100ms), so `SHOW io_workers` above applies to PG18 only.[^pg19-io-workers-54]
 
 For most workloads the additional memory commitment is negligible (~30 MB). The `effective_io_concurrency` default jump from 1 to 16 changes planner behavior more than memory commitment — index scans become preferred over sequential scans in more cases.[^pg18-eio]
 
@@ -725,6 +729,9 @@ For most workloads the additional memory commitment is negligible (~30 MB). The 
 22. **`max_stack_depth` default is 2 MB on most platforms** — the docs warn that setting it higher than the OS-imposed stack limit (typically 8 MB on Linux) can produce SIGSEGV.[^maxstack] Almost never needs tuning.
 
 23. **PG18 `io_workers` are extra processes**, not threads. Each one is a real OS process with its own RSS (~10 MB). Default 3 workers adds ~30 MB cluster-wide.[^pg18-aio]
+
+    > [!NOTE] PostgreSQL 19
+    > PostgreSQL 19 replaces `io_workers` with `io_min_workers` and `io_max_workers` (defaults 2 and 8).[^pg19-io-workers-54]
 
 
 ## See Also
@@ -797,3 +804,5 @@ For most workloads the additional memory commitment is negligible (~30 MB). The 
 [^pg18-aio]: PostgreSQL 18 release notes — async I/O subsystem. Verbatim: *"Add an asynchronous I/O subsystem ... This is enabled by server variable `io_method`, with server variables `io_combine_limit` and `io_max_combine_limit` added to control it. This also enables `effective_io_concurrency` and `maintenance_io_concurrency` values greater than zero for systems without fadvise() support. The new system view `pg_aios` shows the file handles being used for asynchronous I/O."* https://www.postgresql.org/docs/release/18.0/
 
 [^pg18-eio]: PostgreSQL 18 release notes — `effective_io_concurrency` and `maintenance_io_concurrency` defaults raised to 16. Verbatim: *"Increase server variables `effective_io_concurrency`'s and `maintenance_io_concurrency`'s default values to 16 (Melanie Plageman) ... This more accurately reflects modern hardware."* https://www.postgresql.org/docs/release/18.0/
+
+[^pg19-io-workers-54]: PostgreSQL 19 release notes (RC2), Migration: *"Remove server variable `io_workers`"*; replacement variables and defaults at https://www.postgresql.org/docs/19/runtime-config-resource.html . Release notes: https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION

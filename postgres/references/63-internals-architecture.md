@@ -93,6 +93,9 @@ The full PG16 catalog (14 base types plus extension-registered):
 > [!NOTE] PostgreSQL 18
 > `io_method = worker` introduces a new pool of **I/O worker processes** (`io_workers` GUC, default 3) that run asynchronous I/O on behalf of regular backends. These workers do not appear as a new `backend_type` value — they are auxiliary processes the same way the WAL writer and checkpointer are.[^pg18-io-workers] PG18 also added `autovacuum_worker_slots` (typically 16) as the explicit cap on autovacuum worker slots, decoupled from `max_worker_processes`.[^pg18-av-slots] See [Per-version Timeline](#per-version-timeline) for the full list of PG18 process-model changes.
 
+> [!WARNING] PostgreSQL 19
+> PostgreSQL 19 removes the server variable `io_workers`. It is replaced by `io_min_workers` (default 2), `io_max_workers` (default 8), `io_worker_idle_timeout` (default 1 minute), and `io_worker_launch_interval` (default 100ms). Every mention of `io_workers` in this file describes PG18.[^pg19-io-workers-63]
+
 ## Syntax / Mechanics
 
 ### The two-tier model
@@ -200,7 +203,7 @@ The persistent per-cluster processes:
 
 **`logical replication launcher`** — always present. Idle when no subscriptions exist. When subscriptions are active, the launcher dispatches per-subscription / per-table `logical replication worker` processes. See [74-logical-replication.md](./74-logical-replication.md).
 
-**`io worker`** (PG18+) — only present when `io_method = worker`. A configurable pool (`io_workers`, default 3) that runs asynchronous I/O on behalf of regular backends.[^pg18-aio]
+**`io worker`** (PG18+) — only present when `io_method = worker`. A configurable pool (PG18: `io_workers`, default 3; replaced by `io_min_workers` / `io_max_workers` in PG19) that runs asynchronous I/O on behalf of regular backends.[^pg18-aio]
 
 ### Parallel workers
 
@@ -347,7 +350,7 @@ Sizing the process tree:
 | `max_wal_senders` | `10` | Yes | Concurrent replication connections (standbys + logical subscribers) |
 | `max_replication_slots` | `10` | Yes | Replication slots (physical + logical) |
 | `max_logical_replication_workers` | `4` | Yes | Logical-replication apply workers on subscriber |
-| `io_workers` (PG18+) | `3` | Reload | I/O worker pool (only used when `io_method = worker`)[^pg18-io-workers] |
+| `io_workers` (PG18 only; removed in PG19) | `3` | Reload | I/O worker pool (only used when `io_method = worker`)[^pg18-io-workers] |
 | `min_dynamic_shared_memory` | `0` | Yes | Pre-allocated DSM pool for parallel queries[^pg14-min-dsm] |
 
 The combined worker budget formula (good back-of-envelope sanity check):
@@ -355,7 +358,7 @@ The combined worker budget formula (good back-of-envelope sanity check):
     max_worker_processes  ≥  autovacuum_max_workers
                             + max_parallel_workers (queries)
                             + max_logical_replication_workers (subscriber-side)
-                            + (PG18+) io_workers (if io_method=worker)
+                            + (PG18 only) io_workers (if io_method=worker)
                             + (sum of extension-registered bgworkers, e.g. pg_cron usually 1)
 
 If the sum exceeds `max_worker_processes`, the highest-priority workloads succeed and the others silently get fewer workers than configured.
@@ -379,6 +382,7 @@ This is the kernel-resource sizing input for SysV semaphores on platforms that n
 | **PG16** | **No process model changes.** Several parallel-query feature improvements: parallel `string_agg()`/`array_agg()` aggregates, parallel application of logical replication, parallelization of FULL and right OUTER hash joins.[^pg16-release] |
 | **PG17** | **`pg_stat_checkpointer` system view created** (verbatim *"Create system view `pg_stat_checkpointer`"*); `buffers_backend` and `buffers_backend_fsync` columns *removed* from `pg_stat_bgwriter`.[^pg17-checkpointer-split] SLRU buffer sizes configurable for the first time (seven new GUCs).[^pg17-slru] |
 | **PG18** | **Async I/O subsystem** added (verbatim *"Add an asynchronous I/O subsystem"*); `io_method` GUC accepts `sync`/`worker`/`io_uring`; with `worker`, a pool of **I/O worker processes** (`io_workers` GUC, default 3) services async reads.[^pg18-aio] **`autovacuum_worker_slots`** GUC added; `autovacuum_max_workers` reclassified to reloadable.[^pg18-av-slots] `pg_aios` system view exposes in-flight async I/O. `effective_io_concurrency` and `maintenance_io_concurrency` defaults raised from 1 to 16. |
+| **PG19** (RC) | `io_workers` removed; replaced by `io_min_workers`, `io_max_workers`, `io_worker_idle_timeout`, `io_worker_launch_interval`.[^pg19-io-workers-63] |
 
 ## Examples / Recipes
 
@@ -512,7 +516,7 @@ SHOW io_method;
 -- Inspect in-flight async I/O (PG18+ only)
 SELECT * FROM pg_aios LIMIT 20;
 
--- Check I/O worker pool size
+-- Check I/O worker pool size (PG18 only; PG19 uses io_min_workers / io_max_workers)
 SHOW io_workers;
 ```
 
@@ -528,7 +532,7 @@ SHOW io_workers;
 
 4. **The stats collector is gone in PG15+.** Old tutorials, monitoring tools written before 2022, and Stack Overflow answers from that era describe a process that no longer exists. Verify against the verbatim PG15 release-note quote.[^pg15-stats]
 
-5. **`max_worker_processes` is restart-only.** Raising it requires a server restart, not a reload. The same applies to `max_connections`, `max_wal_senders`, `max_replication_slots`, `superuser_reserved_connections`, and `io_workers` (PG18+).
+5. **`max_worker_processes` is restart-only.** Raising it requires a server restart, not a reload. The same applies to `max_connections`, `max_wal_senders`, `max_replication_slots`, `superuser_reserved_connections`, and `io_workers` (PG18 only).
 
 6. **Over-committing `max_parallel_workers` against `max_worker_processes` silently fails.** A parallel query that requests workers when the budget is exhausted gets fewer (or zero) workers and the plan degrades to a non-parallel execution silently. There is no error. Check `pg_stat_activity` for `parallel worker` count vs `max_parallel_workers`.
 
@@ -634,3 +638,5 @@ SHOW io_workers;
 [^pg18-io-workers]: PostgreSQL 18 docs, `io_workers`: *"Selects the number of I/O worker processes to use. The default is 3. This parameter can only be set in the `postgresql.conf` file or on the server command line. Only has an effect if `io_method` is set to `worker`."* https://www.postgresql.org/docs/18/runtime-config-resource.html
 
 [^pg18-av-slots]: PostgreSQL 18 release notes and docs: *"Add server variable `autovacuum_worker_slots` to specify the maximum number of background workers (Nathan Bossart). With this variable set, `autovacuum_max_workers` can be adjusted at runtime up to this maximum without a server restart."* https://www.postgresql.org/docs/release/18.0/ and https://www.postgresql.org/docs/18/runtime-config-autovacuum.html
+
+[^pg19-io-workers-63]: PostgreSQL 19 release notes (RC2), Migration: *"Remove server variable `io_workers`"*; replacement variables and defaults at https://www.postgresql.org/docs/19/runtime-config-resource.html . Release notes: https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION

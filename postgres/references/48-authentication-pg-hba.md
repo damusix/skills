@@ -31,7 +31,7 @@ Use this file when the question is "can this client connect, and what proof do w
 - Setting up authentication for a new cluster or new role.
 - Diagnosing a failed connection ("password authentication failed", "no pg_hba.conf entry for host", "Ident authentication failed").
 - Hardening a cluster: replacing `trust` with `scram-sha-256`, replacing `md5` with `scram-sha-256`, adding certificate-based auth.
-- Setting up LDAP / Kerberos / RADIUS / PAM integration.
+- Setting up LDAP / Kerberos / RADIUS (PG14–18 only) / PAM integration.
 - Upgrading across PG14 → PG16 → PG18 where `pg_hba.conf` semantics or available methods changed.
 - Migrating a managed-cluster workload to bare metal (most managed providers expose `pg_hba.conf` through an abstraction; bare metal exposes the file directly).
 
@@ -186,7 +186,7 @@ Eleven methods. Pick from this catalog:
 | `gss` | Kerberos / GSSAPI. Unix-side. Service principal `postgres/hostname@REALM`. |
 | `sspi` | Windows native GSS-compatible. *"On Windows, use SSPI instead of Kerberos."* |
 | `ldap` | LDAP. Two modes: simple-bind or search+bind.[^ldap] |
-| `radius` | RADIUS server delegated auth.[^radius] |
+| `radius` | RADIUS server delegated auth (PG14–18; removed in PG19).[^radius] |
 | `pam` | OS-level PAM stack.[^pam] |
 | `bsd` | OpenBSD-only `auth-postgresql` login class.[^bsd] |
 | `oauth` | **PG18+:** OAuth 2.0 bearer tokens (RFC 6750).[^pg18-oauth] |
@@ -244,7 +244,10 @@ Use `gss` on Unix-side servers; `sspi` on Windows-side servers. Verbatim: *"SSPI
 
 #### `radius`
 
-Delegates password verification to a RADIUS server. The role must still exist in `pg_authid`. No accounting. Options: `radiusservers`, `radiussecrets` (≥16 chars recommended), `radiusports` (default 1812), `radiusidentifiers` (default `"postgresql"`).
+Delegates password verification to a RADIUS server. The role must still exist in `pg_authid`. No accounting. Options: `radiusservers`, `radiussecrets` (≥16 chars recommended), `radiusports` (default 1812), `radiusidentifiers` (default `"postgresql"`). This method exists on PG14–18 only.
+
+> [!WARNING] PostgreSQL 19
+> PostgreSQL 19 removes RADIUS support. The release notes give the reason: PostgreSQL only supported RADIUS over UDP, which is unfixably insecure. Move `radius` entries in `pg_hba.conf` to another method (`scram-sha-256`, `ldap`, `gss`, `cert`, or `oauth`) before upgrading.[^pg19-radius]
 
 #### `pam`
 
@@ -265,6 +268,9 @@ Verbatim PG18 release-note quote: *"Add support for the OAuth authentication met
 - Requires `oauth_validator_libraries` GUC pointing at a validation library (provided by an extension, not built into core).
 - Build must include `--with-libcurl`.
 - Tokens are bearer tokens — opaque strings honored by the validator. The server does not implement the OAuth flow itself; that lives in the client.
+
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 lets OAuth validators register custom `pg_hba.conf` authentication options. libpq gains `oauth_ca_file` (environment variable `PGOAUTHCAFILE`) and `PGOAUTHDEBUG` options.[^pg19-oauth]
 
 ### Include directives (PG16+)
 
@@ -355,6 +361,7 @@ Use `pg_hba_file_rules` to validate a reload before applying — same shape as R
 | PG16 | `include` / `include_if_exists` / `include_dir` directives[^pg16-include]; regex on `database` / `user`[^pg16-regex]; `pg_ident.conf` user-column parity (`all`, `+role`, regex)[^pg16-ident-parity]; libpq `require_auth`[^pg16-require-auth]; Kerberos credential delegation[^pg16-gssdelegation]; `sslcertmode` libpq parameter |
 | PG17 | `db_user_namespace` GUC removed[^pg17-db-user-ns]; `sslnegotiation=direct`[^pg17-sslneg]; `log_connections` line emitted for `trust` connections[^pg17-trust-log]; libpq `PQchangePassword()` |
 | PG18 | **`oauth` auth method added**[^pg18-oauth]; **MD5 deprecation warnings**[^pg18-md5-deprecation]; `ssl_groups` GUC (renamed from `ssl_ecdh_curve`); `ssl_tls13_ciphers` GUC; SCRAM passthrough for `postgres_fdw` / `dblink` (`scram_client_key` / `scram_server_key`)[^pg18-scram-passthrough]; 256-bit cancel keys (protocol 3.2); `sslkeylogfile` debugging |
+| PG19 (RC) | **RADIUS support removed**[^pg19-radius]; OAuth validators can register custom `pg_hba.conf` options, libpq `oauth_ca_file` / `PGOAUTHCAFILE`[^pg19-oauth]; warning after successful MD5 authentication, `password_expiration_warning_threshold` (default 7 days)[^pg19-md5-warn] |
 
 ## Examples / Recipes
 
@@ -553,6 +560,9 @@ Same pattern as Recipe 5: parse-check first, reload only if clean.
 
 > [!NOTE] PostgreSQL 18
 > PG18 emits a warning on `CREATE ROLE` / `ALTER ROLE` when an MD5 password is set, controlled by `md5_password_warnings` (default `on`)[^pg18-md5-deprecation]. Plan a complete MD5 removal before the future PG major that removes support.
+
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 issues a warning after a successful MD5 password authentication, and adds `password_expiration_warning_threshold` (default 7 days).[^pg19-md5-warn]
 
 ### Recipe 8: Audit roles by auth strength
 
@@ -794,3 +804,6 @@ If the server requests `md5`, `password`, `trust`, or any non-SCRAM method, libp
 [^pg18-oauth]: *"Add support for the OAuth authentication method (Jacob Champion, Daniel Gustafsson, Thomas Munro). This adds an oauth authentication method to pg_hba.conf, libpq OAuth options, a server variable oauth_validator_libraries to load token validation libraries, and a configure flag --with-libcurl to add the required compile-time libraries."* https://www.postgresql.org/docs/18/release-18.html
 [^pg18-md5-deprecation]: *"Deprecate MD5 password authentication (Nathan Bossart). Support for MD5 passwords will be removed in a future major version release. CREATE ROLE and ALTER ROLE now emit deprecation warnings when setting MD5 passwords. These warnings can be disabled by setting the md5_password_warnings parameter to off."* https://www.postgresql.org/docs/18/release-18.html
 [^pg18-scram-passthrough]: *"Allow SCRAM passwords to be passed through from postgres_fdw and dblink (Matheus Alcantara, Peter Eisentraut). The scram_client_key and scram_server_key options of postgres_fdw and dblink store the SCRAM secret values."* https://www.postgresql.org/docs/18/release-18.html
+[^pg19-radius]: PostgreSQL 19 release notes (RC2), Migration: *"Remove RADIUS support... PostgreSQL only supported RADIUS over UDP, which is unfixably insecure."* https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION
+[^pg19-oauth]: PostgreSQL 19 release notes (RC2): *"Allow OAuth validators to register custom `pg_hba.conf` authentication options"*; libpq `oauth_ca_file` / `PGOAUTHCAFILE` and `PGOAUTHDEBUG` options. https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-LIBPQ
+[^pg19-md5-warn]: PostgreSQL 19 release notes (RC2), Migration: *"Issue a warning after successful MD5 password authentication"*; `password_expiration_warning_threshold` (default 7 days). https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION

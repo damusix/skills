@@ -126,6 +126,9 @@ The right time to run `VACUUM FULL` is *after* a one-time `DELETE` of most of a 
 
 > Progress for VACUUM FULL commands is reported via pg_stat_progress_cluster because both VACUUM FULL and CLUSTER rewrite the table, while regular VACUUM only modifies it in place.
 
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 adds `REPACK`, which replaces `VACUUM FULL` and `CLUSTER` (the old commands are retained for compatibility); `REPACK ... CONCURRENTLY` rebuilds a table without access-exclusive locking. The new view `pg_stat_progress_repack` reports progress for REPACK, CLUSTER, and VACUUM FULL, and `pg_stat_progress_cluster` is kept for backwards compatibility only. See [`26-index-maintenance.md`](./26-index-maintenance.md#repack-pg19).[^pg19-repack-28]
+
 ### VACUUM FREEZE
 
 `VACUUM (FREEZE)` forces aggressive freeze. Verbatim:[^vacuum]
@@ -349,6 +352,9 @@ For parallel vacuum (PG13+), the delay is computed per worker:[^vacuum]
 
 > For parallel vacuum, each worker sleeps in proportion to the work done by that worker.
 
+> [!WARNING] PostgreSQL 19
+> PostgreSQL 19 changes parallel vacuum leaders and workers to share the cost-based vacuum delay limit. A `VACUUM` with parallel workers and cost-based delay enabled might run slower than on previous releases.[^pg19-av-parallel]
+
 > [!NOTE] PostgreSQL 14
 > *"Reduce the default value of vacuum_cost_page_miss to better reflect current hardware capabilities."*[^pg14-costmiss] Default `vacuum_cost_page_miss` dropped from 10 to 2. If you're tuning a PG14+ cluster using PG13-era cookbook values, you're throttling vacuum 5× more than intended.
 
@@ -386,10 +392,22 @@ Four operational consequences:
 
 - **Parallelism only helps the *index* phase**, not the heap scan. A table with one giant index but a small heap will not benefit much. A table with many indexes will.
 - **`PARALLEL` cannot be combined with `FULL`** — verbatim: *"This option can't be used with the FULL option."*[^vacuum]
-- **Autovacuum does not parallelize**, only manual `VACUUM (PARALLEL n)`. If you have a known-bloated table and want to vacuum it faster, you must invoke VACUUM manually.
+- **Autovacuum does not parallelize on PG13–18**, only manual `VACUUM (PARALLEL n)`. If you have a known-bloated table and want to vacuum it faster, you must invoke VACUUM manually. PG19 adds parallel autovacuum (see below).
 - **`PARALLEL 0` disables it** — verbatim: *"To disable this feature, one can use PARALLEL option and specify parallel workers as zero."*[^vacuum]
 
 The relevant GUC is `max_parallel_maintenance_workers`, default 2, which caps the worker count whatever you ask for.
+
+### Parallel autovacuum and autovacuum scoring (PG19)
+
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 lets autovacuum use parallel workers and orders the tables it processes by a score.[^pg19-av-parallel]
+
+- **Parallel autovacuum:** the cluster-wide GUC is `autovacuum_max_parallel_workers` and the per-table storage parameter is `autovacuum_parallel_workers`.
+- **Scoring:** autovacuum scores tables to decide the order in which it processes them. The weight GUCs are `autovacuum_freeze_score_weight`, `autovacuum_multixact_freeze_score_weight`, `autovacuum_vacuum_score_weight`, `autovacuum_vacuum_insert_score_weight`, and `autovacuum_analyze_score_weight`. The new view `pg_stat_autovacuum_scores` exposes the scores.
+- **Logging:** the new `log_autoanalyze_min_duration` controls logging of autoanalyze, and `log_autovacuum_min_duration` now only controls logging of vacuum operations by autovacuum. Verbose vacuum and autovacuum logs add memory usage, parallelism, and WAL full-page-write bytes.
+- **Progress views:** `pg_stat_progress_vacuum` gains `started_by` and `mode`, and `pg_stat_progress_analyze` gains `started_by`.
+- **Visibility map:** table scans can mark pages all-visible; before PG19 only `VACUUM` and `COPY ... FREEZE` did.
+- **Wraparound warnings:** the XID and multixact wraparound warnings now start at 100 million remaining transactions (previously 40 million), and `pg_get_multixact_stats()` is added.[^pg19-av-parallel]
 
 ## Progress Reporting: pg_stat_progress_vacuum
 
@@ -463,6 +481,8 @@ If `index_vacuum_count > 1` in `pg_stat_progress_vacuum`, the table was too big 
 | **18** | `VACUUM ONLY` / `ANALYZE ONLY` skips partition children.[^pg18-only] | [^pg18-only] |
 | **18** | Data checksums enabled by default in `initdb`. *"Change initdb default to enable data checksums."*[^pg18-checksums] | [^pg18-checksums] |
 | **18** | Async I/O subsystem speeds up vacuum scans.[^pg18-aio] | [^pg18-aio] |
+| **19** (RC) | Parallel autovacuum (`autovacuum_max_parallel_workers`, `autovacuum_parallel_workers`); autovacuum scoring (`autovacuum_*_score_weight`, `pg_stat_autovacuum_scores`); `log_autoanalyze_min_duration`; parallel vacuum workers share the cost-based delay limit.[^pg19-av-parallel] | [^pg19-av-parallel] |
+| **19** (RC) | `REPACK` replaces `VACUUM FULL` / `CLUSTER`; `pg_stat_progress_repack`.[^pg19-repack-28] | [^pg19-repack-28] |
 
 ## Examples / Recipes
 
@@ -525,7 +545,10 @@ If `dead_pct` is high *and* `last_autovacuum` is recent — autovacuum ran but c
     JOIN pg_stat_activity a USING (pid)
     ORDER BY v.heap_blks_total DESC;
 
-If `index_vacuum_count > 1`, the table is too big for one pass — raise `maintenance_work_mem` (recipe 6). If `phase = 'vacuuming indexes'` and stuck, check `pg_stat_activity.wait_event` for `BufferPin` (a query holding a pin on a page that VACUUM wants to clean) or `Lock` (a conflicting lock).
+If `index_vacuum_count > 1`, the table is too big for one pass — raise `maintenance_work_mem` (recipe 6). If `phase = 'vacuuming indexes'` and stuck, check `pg_stat_activity.wait_event` for `BufferPin` (a query holding a pin on a page that VACUUM wants to clean) or `Lock` (a conflicting lock). The `BufferPin` name holds for PG14–18.
+
+> [!WARNING] PostgreSQL 19
+> PostgreSQL 19 renames wait event type `BufferPin` to `Buffer` (`BUFFERPIN` to `BUFFER` in the release notes) and wait event `BufferPin` to `BufferCleanup`. It also removes wait event `BufferContent` and adds the more precise `BufferShared`, `BufferShareExclusive`, and `BufferExclusive`. Update diagnostic queries that filter on the old names.[^pg19-wait-events-28]
 
 > [!NOTE] PostgreSQL 17
 > Replace `max_dead_tuples`/`num_dead_tuples` with `max_dead_tuple_bytes`/`num_dead_item_ids`/`dead_tuple_bytes` in any diagnostic that quoted them.[^pg17-progress] Add `v.indexes_total`, `v.indexes_processed` to the SELECT to see index-processing progress.
@@ -667,7 +690,7 @@ This advances `relfrozenxid` on the partition to "now," so anti-wraparound never
 
 13. **Trailing-page truncation takes brief ACCESS EXCLUSIVE.** Plain VACUUM's only blocking operation. For ultra-latency-sensitive tables, set `ALTER TABLE tbl SET (vacuum_truncate = false)` and accept that empty trailing pages stay until the next FULL.
 
-14. **`pg_stat_progress_vacuum` shows only LAZY VACUUM, not VACUUM FULL.** Verbatim:[^progress] *"Backends running VACUUM FULL will instead report their progress in the pg_stat_progress_cluster view."* Diagnostic queries that look for a stuck VACUUM by querying `pg_stat_progress_vacuum` will miss any FULL.
+14. **`pg_stat_progress_vacuum` shows only LAZY VACUUM, not VACUUM FULL.** On PG14–18, verbatim:[^progress] *"Backends running VACUUM FULL will instead report their progress in the pg_stat_progress_cluster view."* Diagnostic queries that look for a stuck VACUUM by querying `pg_stat_progress_vacuum` will miss any FULL.
 
 15. **`VACUUM` does *not* lower `relfrozenxid` on a partitioned-table parent — only on the partitions.** A parent is just a catalog entry; the actual heap is in the child partitions. Anti-wraparound triggers per partition. On PG18+ use `VACUUM ONLY parent` to run a vacuum on just the parent's catalog row.[^pg18-only]
 
@@ -775,3 +798,9 @@ This advances `relfrozenxid` on the partition to "now," so anti-wraparound never
 [^pg18-checksums]: PostgreSQL 18 release notes. *"Change initdb default to enable data checksums (Greg Sabino Mullane). Checksums can be disabled with the new initdb option --no-data-checksums. pg_upgrade requires matching cluster checksum settings, so this new option can be useful to upgrade non-checksum old clusters."* https://www.postgresql.org/docs/release/18.0/
 
 [^pg18-aio]: PostgreSQL 18 release notes. *"Add an asynchronous I/O subsystem (Andres Freund, Thomas Munro, Nazir Bilal Yavuz, Melanie Plageman). This feature allows backends to queue multiple read requests, which allows for more efficient sequential scans, bitmap heap scans, vacuums, etc."* https://www.postgresql.org/docs/release/18.0/
+
+[^pg19-repack-28]: PostgreSQL 19 release notes (RC2): *"Add `REPACK` command which replaces `VACUUM FULL` and `CLUSTER`... The old commands have been retained for compatibility."* https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-UTILITY ; progress view: https://www.postgresql.org/docs/19/progress-reporting.html
+
+[^pg19-av-parallel]: PostgreSQL 19 release notes (RC2): *"Allow autovacuum to use parallel autovacuum workers"*, *"Add scoring system to control the order that tables are processed by autovacuum"*, and, under Migration, *"Change parallel vacuum leaders and workers to share the cost-based vacuum delay limit... `VACUUM` with parallel workers and cost-based delay enabled might run slower than in previous releases."* https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-PERFORMANCE ; GUC list: https://www.postgresql.org/docs/19/runtime-config-vacuum.html
+
+[^pg19-wait-events-28]: PostgreSQL 19 release notes (RC2), Migration: *"Rename wait event type `BUFFERPIN` to `BUFFER` and rename wait event `BufferPin` to `BufferCleanup`"*; *"Remove wait event `BufferContent` and add more precise wait events `BufferShared`, `BufferShareExclusive`, and `BufferExclusive`."* https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION

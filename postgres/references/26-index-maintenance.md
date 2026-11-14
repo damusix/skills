@@ -44,7 +44,7 @@ Five rules that should drive every decision in this file.
 
 3. **Failed CONCURRENTLY leaves a ghost index behind.** *"If a problem arises while scanning the table, such as a deadlock or a uniqueness violation in a unique index, the CREATE INDEX command will fail but leave behind an 'invalid' index. This index will be ignored for querying purposes because it might be incomplete; however it will still consume update overhead."*[^createindex] Same trap for `REINDEX CONCURRENTLY` with `_ccnew` / `_ccold` suffixed indexes[^reindex]. **Always audit `indisvalid = false` before re-running.**
 
-4. **REINDEX rebuilds; it doesn't shrink the table.** `REINDEX` is for *index* bloat. Heap bloat from dead-tuple churn requires `VACUUM FULL` (offline) or `pg_repack` / `pg_squeeze` (online). A REINDEX-CONCURRENTLY pass that "didn't help query performance" almost always means heap bloat, not index bloat — go diagnose with [`pgstattuple`](#bloat-detection-with-pgstattuple) first.
+4. **REINDEX rebuilds; it doesn't shrink the table.** `REINDEX` is for *index* bloat. On PG14–18, heap bloat from dead-tuple churn requires `VACUUM FULL` (offline) or `pg_repack` / `pg_squeeze` (online); PG19 adds `REPACK (CONCURRENTLY)` (see [REPACK](#repack-pg19)). A REINDEX-CONCURRENTLY pass that "didn't help query performance" almost always means heap bloat, not index bloat — go diagnose with [`pgstattuple`](#bloat-detection-with-pgstattuple) first.
 
 5. **The visibility map and FSM track the heap, not the index.** Index-only scans depend on the heap's visibility map being current (see [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md)); a freshly REINDEXed index still requires an UP-TO-DATE visibility map to skip the heap fetch. If you REINDEX and `Heap Fetches` in `EXPLAIN ANALYZE` remains nonzero, the problem is autovacuum lag on the *table*, not the index.
 
@@ -60,10 +60,13 @@ Ten rows mapping operational scenario to the right tool. Rows ordered: most comm
 | Drop an old / unused index                              | **`DROP INDEX CONCURRENTLY`**                    | plain `DROP INDEX`                     | Plain form takes `ACCESS EXCLUSIVE`; CONCURRENTLY waits for conflicting transactions instead.          |
 | Clean up an `INVALID` index from a failed CIC           | **`DROP INDEX [CONCURRENTLY]`** + retry CIC      | `REINDEX`                              | See §Failure Recovery below for exact procedure.                                                        |
 | Clean up `_ccnew` / `_ccold` from a failed `REINDEX CC` | **`DROP INDEX`** by suffix                       | re-run REINDEX                         | See §`_ccnew` / `_ccold` Suffix Recovery below for decision tree.                                      |
-| Heap bloat from dead-tuple churn                        | **`pg_repack`** or **`pg_squeeze`**              | `REINDEX`, `VACUUM FULL`               | REINDEX fixes only index bloat; `VACUUM FULL` is offline; community tools are online.                  |
+| Heap bloat from dead-tuple churn                        | **`pg_repack`** or **`pg_squeeze`**              | `REINDEX`, `VACUUM FULL`               | REINDEX fixes only index bloat; `VACUUM FULL` is offline; community tools are online (PG14–18).        |
 | Post-`pg_upgrade` dedup migration (PG12 → ≥PG13)        | **`REINDEX INDEX CONCURRENTLY`** per B-tree      | leave it                               | PG13+ B-tree dedup requires REINDEX after pg_upgrade to take effect[^pg13-dedup-cite].                 |
 | Post-libc/ICU upgrade (collation version mismatch)      | **`REINDEX INDEX CONCURRENTLY`** on text indexes | trust the cluster                      | Silent corruption risk; pg_amcheck flags `XX002 index_corrupted`. See [`65-collations-encoding.md`](./65-collations-encoding.md). |
 | Periodic preventive reindex on a churn-heavy table      | **`REINDEX TABLE CONCURRENTLY`** monthly         | `pg_repack` for index-only             | REINDEX CONCURRENTLY is the in-core, lower-overhead choice when heap is not bloated.                   |
+
+> [!NOTE] PostgreSQL 19
+> The guidance above to prefer `pg_repack` or `pg_squeeze` over the offline `VACUUM FULL` holds for PG14–18. PostgreSQL 19 adds the in-core `REPACK (CONCURRENTLY)` command, which rebuilds tables without access-exclusive locking. `pg_repack` and `pg_squeeze` remain the online options on PG18 and earlier.[^pg19-repack]
 
 Three smell signals for wrong tool:
 
@@ -183,6 +186,9 @@ Two hard constraints to remember:
 
 - **Exclusion-constraint indexes** (typically `EXCLUDE USING gist`) — REINDEX CONCURRENTLY *skips* them silently when reindexing a whole table or database. To rebuild them you must drop the constraint and recreate it (which requires `ACCESS EXCLUSIVE`).
 - **System catalogs** — `REINDEX SYSTEM` is offline-only. Schedule a maintenance window or use a logical replication failover (see [`87-major-version-upgrade.md`](./87-major-version-upgrade.md)).
+
+> [!WARNING] Minor releases 2026-11-12
+> Before 18.7 and the matching older minors, `REINDEX CONCURRENTLY` on a TOAST index could leave stale `pg_index` fields; 18.7 fixes this. After updating, if queries fail with `missing chunk number` errors, reindex the table, which also reindexes its TOAST table. CVE-2026-116336 also covers `REINDEX CONCURRENTLY` not blocking `DROP INDEX` during index functions.[^pg-2026-11-toast-reindex]
 
 ### Variants
 
@@ -331,7 +337,7 @@ The two phases that bite the most:
 
 ## Online Table Reorg: pg_repack and pg_squeeze
 
-`REINDEX CONCURRENTLY` only fixes *index* bloat. For *heap* bloat — where dead tuples consume table pages and autovacuum cannot reclaim them (e.g., the live tuples are too scattered, or fillfactor is low) — the in-core options are `VACUUM FULL` (rewrites the table; takes `ACCESS EXCLUSIVE`; offline) and `CLUSTER` (same lock; reorders by an index). Both are unacceptable for production traffic. Two community extensions fill the gap.
+`REINDEX CONCURRENTLY` only fixes *index* bloat. For *heap* bloat — where dead tuples consume table pages and autovacuum cannot reclaim them (e.g., the live tuples are too scattered, or fillfactor is low) — the in-core options on PG14–18 are `VACUUM FULL` (rewrites the table; takes `ACCESS EXCLUSIVE`; offline) and `CLUSTER` (same lock; reorders by an index). Both are unacceptable for production traffic. Two community extensions fill the gap. PostgreSQL 19 adds an in-core online option, covered in [REPACK (PG19)](#repack-pg19).
 
 ### pg_repack
 
@@ -353,7 +359,7 @@ Project: <https://github.com/reorg/pg_repack>. Long-running de-facto standard.
 - Tables with `EXCLUDE USING gist` constraints (similar limitation to REINDEX CONCURRENTLY).
 - Partitioned tables — must repack each leaf partition individually.
 
-**Operational notes:** runs as a client tool (`pg_repack` binary) talking to a backend; requires superuser; takes its own catalog locks during setup. Always test on a staging snapshot first.
+**Operational notes:** runs as a client tool (`pg_repack` binary) talking to a backend; superuser required before 1.5.2, non-superuser runs supported since 1.5.2 (2024-12-16; see `doc/pg_repack.rst` for the privileges needed); takes its own catalog locks during setup. Latest tag 1.5.3. Always test on a staging snapshot first.
 
 ### pg_squeeze
 
@@ -396,6 +402,23 @@ Project: <https://github.com/cybertec-postgresql/pg_squeeze>. Server-side, logic
 
 Pick **pg_repack** as the default — broader operational evidence, no `wal_level=logical` overhead. Pick **pg_squeeze** when your cluster already runs `wal_level = logical` for replication or CDC, and you want to consolidate the bloat-removal infrastructure server-side.
 
+### REPACK (PG19)
+
+> [!NOTE] PostgreSQL 19
+> `REPACK` replaces `VACUUM FULL` and `CLUSTER`; the old commands are retained for compatibility. `REPACK ... CONCURRENTLY` rebuilds tables without access-exclusive locking.[^pg19-repack]
+
+Synopsis:
+
+    REPACK [ ( option [, ...] ) ] [ table_and_columns [ USING INDEX [ index_name ] ] ]
+
+- Options: `VERBOSE`, `ANALYZE`, `CONCURRENTLY`.
+- Without a table name, `REPACK` processes every table on which the user has the `MAINTAIN` privilege.
+- New GUC: `max_repack_replication_slots`.
+- The new view `pg_stat_progress_repack` reports progress for REPACK, CLUSTER, and VACUUM FULL. `pg_stat_progress_cluster` is kept for backwards compatibility only and translates a REPACK command into CLUSTER.
+- The RC1 release notes list several fixes for `REPACK (CONCURRENTLY)`.
+
+On PG18 and earlier, keep using `pg_repack` or `pg_squeeze` for online heap rebuilds.
+
 ## Per-Version Timeline
 
 Cumulative summary of index-maintenance-relevant changes.
@@ -417,6 +440,7 @@ Cumulative summary of index-maintenance-relevant changes.
 | PG17    | Maintenance operations now use a safe `search_path`                                                        | *"Change functions to use a safe search_path during maintenance operations"*[^pg17-search-path] |
 | PG18    | `amcheck` GIN check function                                                                               | *"Add amcheck check function gin_index_check() to verify GIN indexes"*[^pg18-amcheck-gin] |
 | PG18    | Expression indexes can be very large (TOAST on pg_index)                                                   | *"Add TOAST table to pg_index to allow for very large expression indexes"*[^pg18-pg-index-toast] |
+| PG19 (RC) | `REPACK` command (with `CONCURRENTLY`) replaces `VACUUM FULL` / `CLUSTER`; `max_repack_replication_slots`; `pg_stat_progress_repack` | *"Add `REPACK` command which replaces `VACUUM FULL` and `CLUSTER`..."*[^pg19-repack] |
 
 ## Examples / Recipes
 
@@ -731,7 +755,7 @@ See [`65-collations-encoding.md`](./65-collations-encoding.md) for the full work
 
 18. **`pg_repack` requires a PK or REPLICA IDENTITY USING INDEX.** Tables without one cannot be repacked. The same restriction applies to `pg_squeeze`.
 
-19. **`pg_repack` runs as a client tool requiring superuser.** Not all hosting environments allow superuser. Check before scheduling.
+19. **`pg_repack` before 1.5.2 requires superuser.** 1.5.2+ supports non-superuser runs. Managed providers still vary in whether the extension is installed; check before scheduling.
 
 20. **`pg_squeeze` requires `wal_level = logical`.** This bumps WAL volume across the cluster, not just for the squeezed table — measure the WAL throughput impact before turning it on for `pg_squeeze` alone.
 
@@ -814,3 +838,7 @@ Primary doc landing pages:
 - PostgreSQL 16 Routine Reindexing: <https://www.postgresql.org/docs/16/routine-reindex.html>
 - pg_repack: <https://github.com/reorg/pg_repack>
 - pg_squeeze: <https://github.com/cybertec-postgresql/pg_squeeze>
+
+[^pg19-repack]: PostgreSQL 19 release notes (RC2), Utility Commands: *"Add `REPACK` command which replaces `VACUUM FULL` and `CLUSTER`... The old commands have been retained for compatibility."* Synopsis and options: https://www.postgresql.org/docs/19/sql-repack.html. Progress view: https://www.postgresql.org/docs/19/progress-reporting.html. Release notes: https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-UTILITY
+
+[^pg-2026-11-toast-reindex]: PostgreSQL 18.7 release notes (2026-11-12), https://www.postgresql.org/docs/release/18.7/, and the 18.7 / 19 RC 2 announcement, https://www.postgresql.org/about/news/postgresql-187-1712-1616-1520-1425-and-19-rc-2-released-3442/ (CVE-2026-116336).

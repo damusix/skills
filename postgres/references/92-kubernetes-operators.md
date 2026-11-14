@@ -96,13 +96,13 @@ Three-way feature table at planning time (2026-05-14). **Verify before adopting*
 
 | Property | CloudNativePG | Zalando postgres-operator | Crunchy PGO |
 |---|---|---|---|
-| Latest release | v1.29.1 (May 2026)[^cnpg-github] | v1.15.1 (Dec 2025)[^zalando-github] | v6.0.1 (Feb 2026)[^crunchy-github] |
+| Latest release | v1.30.1 (2026-09-23)[^cnpg-github] | v2.0.3 (2026-10-02)[^zalando-github] | v6.0.3 (tag 2026-08-20; last release object v6.0.2)[^crunchy-github] |
 | License | Apache 2.0 | MIT | Apache 2.0 |
 | CNCF status | Sandbox (joined 2025)[^cnpg-home] | None (open source, vendor-neutral via Zalando) | None (Crunchy Data commercial backing) |
 | Patroni-based | ❌ (custom controller) | ✅ (Patroni internally) | ❌ (custom controller) |
 | Uses StatefulSet | ❌ (manages PVCs directly) | ✅ | ✅ |
 | Primary CRD | `Cluster` (`postgresql.cnpg.io`) | `postgresql` (`acid.zalan.do`) | `PostgresCluster` (`postgres-operator.crunchydata.com`) |
-| Supported PG majors (latest release) | 13-18 | 13-17 stable, 14+ for PG18 | per-release; verify |
+| Supported PG majors (latest release) | 14-18 (PG14 support ended 2026-11-12) | 14-18 (v2 dropped 13, added 18) | 14-18 |
 | Backup tool | Barman Cloud + pgBackRest (PG14+ via `Plugin` CR) | WAL-G, WAL-E, pg_dump | pgBackRest |
 | Connection pooler | `Pooler` CR (PgBouncer) | `enableConnectionPooler: true` (PgBouncer) | `proxy.pgBouncer` (PgBouncer) |
 | In-place major upgrade | ✅ (`imageName` change triggers) | ✅ (`majorVersionUpgradeMode`) | ✅ (annotation + `postgresVersion` bump) |
@@ -127,7 +127,7 @@ Three-way feature table at planning time (2026-05-14). **Verify before adopting*
       namespace: prod
     spec:
       instances: 3
-      imageName: ghcr.io/cloudnative-pg/postgresql:17.9
+      imageName: ghcr.io/cloudnative-pg/postgresql:17.12
       primaryUpdateStrategy: unsupervised
       storage:
         size: 100Gi
@@ -145,6 +145,7 @@ Three-way feature table at planning time (2026-05-14). **Verify before adopting*
           owner: app
       backup:
         retentionPolicy: "30d"
+        # Deprecated in-tree form; new clusters should use the Barman Cloud Plugin (see warning below)
         barmanObjectStore:
           destinationPath: s3://my-backup-bucket/appdb
           s3Credentials:
@@ -174,9 +175,12 @@ Three-way feature table at planning time (2026-05-14). **Verify before adopting*
 
 **Failover.** CNPG controller watches pod health + replication lag via the `cnpg` instance manager sidecar process running in each Postgres pod. On primary failure, controller picks the most-advanced replica (lowest lag), promotes it via `pg_promote()`[^cnpg-architecture], updates the `cluster-name-rw` Service to point at the new primary. Failover typically completes in **10-30 seconds** depending on streaming-replication lag at failure time.
 
-**In-place major upgrade.** Bump `Cluster.spec.imageName` from `postgresql:17.9` to `postgresql:18.0`. Controller orchestrates: stop replicas, run `pg_upgrade --link` on primary's PVC contents in a temporary pod (or `pg_upgrade --copy` for safety), rebuild replicas via `pg_basebackup`. Cross-reference: [`86-pg-upgrade.md`](./86-pg-upgrade.md) for `pg_upgrade` mechanics.
+**In-place major upgrade.** Bump `Cluster.spec.imageName` from `postgresql:17.12` to `postgresql:18.7`. Controller orchestrates: stop replicas, run `pg_upgrade --link` on primary's PVC contents in a temporary pod (or `pg_upgrade --copy` for safety), rebuild replicas via `pg_basebackup`. Cross-reference: [`86-pg-upgrade.md`](./86-pg-upgrade.md) for `pg_upgrade` mechanics.
 
 **Read/write routing.** Three Services created automatically: `cluster-name-rw` (writes — current primary), `cluster-name-ro` (read replicas — round-robin among healthy standbys), `cluster-name-r` (any healthy member, round-robin).
+
+> [!WARNING] CNPG 1.30: in-tree Barman Cloud deprecated
+> The native `barmanObjectStore` backup stanza is deprecated in favor of the Barman Cloud Plugin. The supported-releases page says 1.31 is the last minor with native Barman Cloud support, and it is removed from 1.32.0. New clusters should use the plugin. 1.30 also adds a `DatabaseRole` CRD, `.spec.primaryLease` (a Kubernetes `Lease` as promotion mutex), and SCRAM-encodes cleartext role passwords from Secrets (opt out per Secret with `cnpg.io/passwordPassthrough: "enabled"`).[^cnpg-github]
 
 ### Zalando postgres-operator
 
@@ -233,6 +237,9 @@ Three-way feature table at planning time (2026-05-14). **Verify before adopting*
 **Major version upgrade.** Set `spec.postgresql.version: "18"`. Operator's `majorVersionUpgradeMode` controls behavior: `off` (refuse upgrade), `manual` (operator-initiated only via annotation), `full` (automatic). Cross-reference: [`87-major-version-upgrade.md`](./87-major-version-upgrade.md).
 
 **Read/write routing.** Services: `acid-appdb` (writes — current primary, single endpoint), `acid-appdb-repl` (read replicas).
+
+> [!WARNING] Zalando v2 is a breaking upgrade from v1.x
+> Use v2.0.1+ (2.0.0 has a CRD type bug). PG13 dropped, PG18 added; `kubernetes_use_configmaps` now defaults to `true` (Endpoints are deprecated from K8s 1.33); `password_encryption` defaults to `scram-sha-256`, which triggers a rolling update; removed `useLoadBalancer`, `replicaLoadBalancer`, `init_containers`, `pod_priority_class_name`, `enable_crd_validation`, and the kubectl-pg plugin. v2.0.3 makes pooler connections `scram-sha-256` by default. Read the upstream `docs/migrate.md` first.[^zalando-github]
 
 ### Crunchy PGO
 
@@ -298,6 +305,9 @@ Three-way feature table at planning time (2026-05-14). **Verify before adopting*
 **Backup canonical via pgBackRest.** Configure `backups.pgbackrest.repos[]` for one or more repos (local PVC, S3, GCS, Azure Blob). Schedules cron-based. PITR via `dataSource.postgresCluster` with target time/LSN.
 
 **Read/write routing.** Services: `appdb-primary` (writes), `appdb-replicas` (read replicas).
+
+> [!NOTE] Crunchy PGO 6.0
+> 6.0.0 (2025-12-08) adds the `postgres-operator.crunchydata.com/v1` `PostgresCluster` API; `v1beta1` manifests are still accepted. Breaking limits in v1: at most 50 PgBouncer settings and 16 InstanceSets; Postgres logs moved outside the data directory by default; `AutoGrowVolumes` on by default; Helm install is OCI-only. 6.0.3 bundles PG 18.6, pgBackRest 2.59.0, Patroni 4.1.4.[^crunchy-github]
 
 ### Storage Class and PVC Strategy
 
@@ -368,7 +378,7 @@ K8s operators evolve independently of PostgreSQL. Postgres major releases that a
 | **PG17** | `pg_basebackup --incremental` + `pg_combinebackup`[^pg17-release-incremental]; logical slot failover[^pg17-release-slot-failover] | "Allow incremental file system backups (Robert Haas, Jakub Wartak, Tomas Vondra). pg_basebackup --incremental backs up files modified since a previous backup." |
 | **PG18** | Data checksums default-on at `initdb`[^pg18-release-checksums]; `idle_replication_slot_timeout`; default-on `data_checksums` affects `pg_upgrade` paths from non-checksum source clusters | "Change initdb to default to enabling checksums (Greg Sabino Mullane). The --no-data-checksums option turns checksums off." |
 
-**Operator releases bring PG-major support over time.** Zalando v1.15.1 supports PG13-17 stable + PG18 starting from 14+[^zalando-github]. CNPG v1.29.1 supports PG13-18[^cnpg-github]. Crunchy v6.0.1 — check release notes per major[^crunchy-github]. **Always verify the operator release supports your target PG major BEFORE upgrading.**
+**Operator releases bring PG-major support over time.** Zalando v2.0.x supports PG14-18[^zalando-github]. CNPG 1.29.x and 1.30.x support PG14-18; none has GA PG19 support yet[^cnpg-github]. Crunchy 6.0.x supports PG14-18[^crunchy-github]. **Always verify the operator release supports your target PG major BEFORE upgrading.**
 
 ## Recipes
 
@@ -409,7 +419,7 @@ K8s operators evolve independently of PostgreSQL. Postgres major releases that a
           namespace: prod
         spec:
           instances: 3
-          imageName: ghcr.io/cloudnative-pg/postgresql:17.9
+          imageName: ghcr.io/cloudnative-pg/postgresql:17.12
           storage:
             size: 100Gi
             storageClass: gp3
@@ -421,6 +431,7 @@ K8s operators evolve independently of PostgreSQL. Postgres major releases that a
               source: appdb-primary
           externalClusters:
             - name: appdb-primary
+              # Deprecated in-tree form; the Barman Cloud Plugin replaces it
               barmanObjectStore:
                 destinationPath: s3://my-bucket/appdb
                 s3Credentials:
@@ -433,7 +444,7 @@ K8s operators evolve independently of PostgreSQL. Postgres major releases that a
 
     Manual promotion on region A failure: `kubectl patch cluster appdb -p '{"spec":{"replica":{"enabled":false}}}'`.
 
-5. **Major version upgrade (CNPG).** Edit `spec.imageName: ghcr.io/cloudnative-pg/postgresql:18.0` (was `:17.9`). Operator runs `pg_upgrade`. Watch with `kubectl cnpg status appdb -n prod` and `kubectl get pods -n prod -w`. Cross-reference: [`86-pg-upgrade.md`](./86-pg-upgrade.md) for `pg_upgrade` prerequisites + [`87-major-version-upgrade.md`](./87-major-version-upgrade.md) for strategy comparison.
+5. **Major version upgrade (CNPG).** Edit `spec.imageName: ghcr.io/cloudnative-pg/postgresql:18.7` (was `:17.12`). Operator runs `pg_upgrade`. Watch with `kubectl cnpg status appdb -n prod` and `kubectl get pods -n prod -w`. Cross-reference: [`86-pg-upgrade.md`](./86-pg-upgrade.md) for `pg_upgrade` prerequisites + [`87-major-version-upgrade.md`](./87-major-version-upgrade.md) for strategy comparison.
 
 6. **Online PVC resize.** Edit `spec.storage.size: 200Gi` (was `100Gi`). Storage class must support `VolumeExpansion: true`. Verify with `kubectl get pvc -n prod`.
 
@@ -502,7 +513,7 @@ K8s operators evolve independently of PostgreSQL. Postgres major releases that a
 
 4. **Storage class without `VolumeExpansion: true`** = no online resize. PVC stuck at initial size; need PV migration to grow. Pick a CSI driver that supports expansion.
 
-5. **Operator version must support target PG major BEFORE upgrade.** Zalando v1.15.1 supports PG13-17 stable + PG18 from 14+[^zalando-github]. Bumping `postgresVersion` past what the operator supports = stuck cluster.
+5. **Operator version must support target PG major BEFORE upgrade.** Zalando v2.0.x supports PG14-18[^zalando-github]. Bumping `postgresVersion` past what the operator supports = stuck cluster.
 
 6. **PG18 default-on data checksums break `pg_upgrade` from non-checksum source[^pg18-release-checksums].** Pre-PG18 clusters created with default settings have checksums OFF. Upgrading to PG18 via `pg_upgrade` fails unless the new cluster is also initialized with `--no-data-checksums`. Cross-reference: [`86-pg-upgrade.md`](./86-pg-upgrade.md) + [`88-corruption-recovery.md`](./88-corruption-recovery.md).
 
@@ -534,7 +545,7 @@ K8s operators evolve independently of PostgreSQL. Postgres major releases that a
 
 20. **Local NVMe + replica loss = full `pg_basebackup` to rebuild.** Losing a node with local NVMe storage destroys that replica's PV. Operator schedules a new pod on a different node + bootstraps via `pg_basebackup` from primary. For TB-scale data this can take hours; consider mixed storage strategy (one replica on block, others on NVMe).
 
-21. **Operator upgrades may require Kubernetes minimum version.** CNPG v1.29.x targets K8s 1.27+; Crunchy v6.0.x targets K8s 1.22-1.26+[^crunchy-github]. Skipping K8s upgrades = stuck on old operator = no PG18 support.
+21. **Operator upgrades may require Kubernetes minimum version.** CNPG 1.29.x supports K8s 1.33-1.35 and 1.30.x supports K8s 1.34-1.36[^cnpg-github]; Crunchy 6.0.x supports K8s 1.32-1.36 and OpenShift 4.16-4.22[^crunchy-github]. Skipping K8s upgrades = stuck on old operator = no PG18 support.
 
 22. **CRD changes during operator upgrade may need `helm upgrade --skip-crds` + manual `kubectl apply -f crds.yaml`.** Helm by default does not upgrade CRDs after install. Each operator's upgrade docs state the path; follow them precisely.
 
@@ -584,13 +595,13 @@ K8s operators evolve independently of PostgreSQL. Postgres major releases that a
 
 [^cnpg-architecture]: CloudNativePG architecture documentation. https://cloudnative-pg.io/documentation/current/architecture/ — verbatim quote on cross-cluster failover: "CloudNativePG cannot perform any cross-cluster automated failover, as it does not have authority beyond a single Kubernetes cluster."
 
-[^cnpg-github]: CloudNativePG GitHub repository. https://github.com/cloudnative-pg/cloudnative-pg — v1.29.1 (May 8, 2026), supported PG majors 13-18, CR types (Cluster, Backup, ScheduledBackup, Database, ImageCatalog, ClusterImageCatalog, Pooler, Publication, Subscription).
+[^cnpg-github]: CloudNativePG GitHub repository. https://github.com/cloudnative-pg/cloudnative-pg — v1.30.1 (2026-09-23), supported PG majors 14-18 (supported-releases table: https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/main/docs/src/supported_releases.md), CR types (Cluster, Backup, ScheduledBackup, Database, ImageCatalog, ClusterImageCatalog, Pooler, Publication, Subscription).
 
-[^zalando-github]: Zalando postgres-operator GitHub. https://github.com/zalando/postgres-operator — v1.15.1 (December 18, 2025), MIT license, verbatim: "delivers an easy to run highly-available PostgreSQL clusters on Kubernetes (K8s) powered by Patroni." Supported PG majors 13-17 stable + 14+ for PG18.
+[^zalando-github]: Zalando postgres-operator GitHub. https://github.com/zalando/postgres-operator — v2.0.3 (2026-10-02; v2 notes at https://github.com/zalando/postgres-operator/releases/tag/v2.0.1), MIT license, verbatim: "delivers an easy to run highly-available PostgreSQL clusters on Kubernetes (K8s) powered by Patroni." Supported PG majors 14-18.
 
 [^zalando-readthedocs]: Zalando postgres-operator documentation. https://postgres-operator.readthedocs.io/en/latest/ — `postgresql` CR reference, 15 configuration parameter groups, Spilo image, K8s-API-as-DCS.
 
-[^crunchy-github]: Crunchy Data postgres-operator GitHub. https://github.com/CrunchyData/postgres-operator — v6.0.1 (February 26, 2026), Apache 2.0 license, `PostgresCluster` CRD, pgBackRest integration, OpenShift 4.8-4.13 tested.
+[^crunchy-github]: Crunchy Data postgres-operator GitHub. https://github.com/CrunchyData/postgres-operator — v6.0.3 (6.0.x notes: https://access.crunchydata.com/documentation/postgres-operator/6.0/releases/6.0.x), Apache 2.0 license, `PostgresCluster` CRD (`v1` since 6.0.0; `v1beta1` still accepted), pgBackRest integration. Supported platforms: https://access.crunchydata.com/documentation/postgres-operator/6.0/overview/supported-platforms
 
 [^crunchy-docs]: Crunchy PGO v5 documentation hub. https://access.crunchydata.com/documentation/postgres-operator/v5/ — CR reference; v6.0.x docs path differs, verify against current release notes.
 

@@ -218,6 +218,9 @@ To check whether a view is auto-updatable, look at `pg_views` plus the `is_*_upd
     FROM information_schema.views
     WHERE table_schema = 'public';
 
+> [!WARNING] Minor releases 2026-11-12
+> CVE-2026-16237 (2026-11-12 minors, 18.7 and the matching older branches): `INSERT ... ON CONFLICT` on an auto-updatable view now raises an error instead of updating rows hidden by the view's `WHERE`, and `ON CONFLICT DO SELECT` no longer shows them.[^minor-18-7] The same round fixed CVE-2026-116327 (`security_barrier` exposure).[^minor-nov-announce] Full CVE list: <https://www.postgresql.org/support/security/>.
+
 
 ### INSTEAD OF triggers (for non-auto-updatable views)
 
@@ -683,3 +686,8 @@ The freshness signal here is approximate (uses stats updates). For a robust syst
 [^pg18-copy-matview]: PostgreSQL 18 Release Notes. "Allow `COPY TO` to copy rows from populated materialized views (Jian He)." https://www.postgresql.org/docs/release/18.0/
 
 [^pgdump-matview-defaults]: PostgreSQL 16 — *pg_dump*. Documents `--table` behavior: *"As well as tables, this option can be used to dump the definition of matching views, materialized views, foreign tables, and sequences. It will not dump the contents of views or materialized views."* The restored matview is empty (equivalent to `WITH NO DATA`) and requires `REFRESH MATERIALIZED VIEW` after restore. https://www.postgresql.org/docs/16/app-pgdump.html
+
+
+[^minor-18-7]: PostgreSQL 18.7 release notes (2026-11-12). <https://www.postgresql.org/docs/release/18.7/>
+
+[^minor-nov-announce]: PostgreSQL 18.7, 17.12, 16.16, 15.20, 14.25, and 19 RC 2 released (2026-11-12). <https://www.postgresql.org/about/news/postgresql-187-1712-1616-1520-1425-and-19-rc-2-released-3442/>

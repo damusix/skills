@@ -251,6 +251,9 @@ Core flags:
     # edit all_objects.txt — comment out (;) the objects you don't want
     pg_restore --use-list=all_objects.txt -d target dump.custom
 
+> [!WARNING] Minor releases 2026-08-13 / 2026-11-12
+> Several `pg_dump` and `pg_restore` CVEs were fixed in these rounds: CVE-2026-19385 (`pg_dump` overflow, 2026-08-13)[^minor-aug-announce]; CVE-2026-116314 (`pg_restore`, CVSS 8.8, exploitable without privileges), CVE-2026-116318 (SQL injection through a not-null constraint name in `pg_dump` output), and CVE-2026-116330 (psql injection through the `restore.sql` of a `pg_dump` tar archive) (2026-11-12).[^minor-nov-announce] Restore only trusted archives, and run `pg_dump` and `pg_restore` from the current minors. Full CVE list: <https://www.postgresql.org/support/security/>.
+
 ## Per-Version Timeline
 
 | Version | Changes |
@@ -612,3 +615,6 @@ Useful when:
 [^pg18]: PostgreSQL 18 Release Notes — verbatim: "Add pg_dump, pg_dumpall, and pg_restore options `--statistics-only`, `--no-statistics`, `--no-data`, and `--no-schema`." (Corey Huinker, Jeff Davis) + "Add option `--no-policies` to disable row level security policy processing in pg_dump, pg_dumpall, pg_restore. This is useful for migrating to systems with different policies." (Nikolay Samokhvalov) + "Add pg_dump and pg_dumpall option `--sequence-data` to dump sequence data that would normally be excluded." (Nathan Bossart) + "Add pg_dump option `--statistics`." (Jeff Davis). https://www.postgresql.org/docs/release/18.0/
 [^pg17-pgdump]: PostgreSQL 17 documentation, `pg_dump`. https://www.postgresql.org/docs/17/app-pgdump.html
 [^pg18-pgdump]: PostgreSQL 18 documentation, `pg_dump`. https://www.postgresql.org/docs/18/app-pgdump.html
+
+[^minor-aug-announce]: PostgreSQL 18.6, 17.11, 16.15, 15.19, 14.24, and 19 Beta 3 released (2026-08-13). <https://www.postgresql.org/about/news/postgresql-186-1711-1615-1519-1424-and-19-beta-3-released-3365/>
+[^minor-nov-announce]: PostgreSQL 18.7, 17.12, 16.16, 15.20, 14.25, and 19 RC 2 released (2026-11-12). <https://www.postgresql.org/about/news/postgresql-187-1712-1616-1520-1425-and-19-rc-2-released-3442/>

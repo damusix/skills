@@ -38,7 +38,10 @@ Five rules:
 
 1. **Logical replication ships row-level changes (INSERT / UPDATE / DELETE / TRUNCATE) decoded from WAL via an output plugin.** Default plugin = `pgoutput` (built-in, used for `pgoutput` protocol — the wire format `CREATE SUBSCRIPTION` consumes). Publisher side = PUBLICATION (what gets sent). Subscriber side = SUBSCRIPTION (what gets consumed). Verbatim docs: *"Logical replication is a method of replicating data objects and their changes, based upon their replication identity (usually a primary key). We use the term logical in contrast to physical replication, which uses exact block addresses and byte-by-byte replication."*[^lr-intro]
 
-2. **DDL is NOT replicated. Sequence-state changes are NOT replicated. Large Objects are NOT replicated.** Schema, sequence advances, LOs must be synced out-of-band. Verbatim docs: *"The database schema and DDL commands are not replicated. ... Sequence data is not replicated. The data in serial or identity columns backed by sequences will of course be replicated as part of the table, but the sequence itself would still show the start value on the subscriber. ... Large objects (see Chapter 35) are not replicated. There is no workaround for that, other than storing data in normal tables."*[^lr-restrictions]
+2. **DDL is NOT replicated. Sequence-state changes are NOT replicated on PG14–18. Large Objects are NOT replicated.** Schema, sequence advances (PG14–18), LOs must be synced out-of-band. Verbatim docs: *"The database schema and DDL commands are not replicated. ... Sequence data is not replicated. The data in serial or identity columns backed by sequences will of course be replicated as part of the table, but the sequence itself would still show the start value on the subscriber. ... Large objects (see Chapter 35) are not replicated. There is no workaround for that, other than storing data in normal tables."*[^lr-restrictions]
+
+   > [!NOTE] PostgreSQL 19
+   > PostgreSQL 19 replicates sequences: `CREATE PUBLICATION` / `ALTER PUBLICATION ... ALL SEQUENCES` publishes them and `ALTER SUBSCRIPTION ... REFRESH SEQUENCES` refreshes them. Sequence synchronization also happens on `ALTER SUBSCRIPTION ... [ADD|SET|REFRESH|DROP] PUBLICATION`. The "sequence data is not replicated" quote above is the PG16 documentation.[^pg19-lr-seq]
 
 3. **Conflicts BLOCK the apply worker. No automatic resolution.** Subscriber-side row missing where publisher expects it = log message + retry forever. Subscriber-side row violates a constraint = apply worker stops. Fix manually (advance LSN via `ALTER SUBSCRIPTION ... SKIP`, edit subscriber row, or replay carefully). PG18 logs the conflicting tuple values into `pg_stat_subscription_stats`.
 
@@ -291,12 +294,15 @@ PG17 added hash-index support too:
 Publisher (`postgresql.conf`):
 
 ```ini
-wal_level = logical                     # MUST. Restart required.
+wal_level = logical                     # MUST on PG14–18. Restart required.
 max_replication_slots = 10              # >= number of subscriber slots
 max_wal_senders = 12                    # >= max_replication_slots + physical replicas
 wal_sender_timeout = 60s
 logical_decoding_work_mem = 64MB        # spill threshold
 ```
+
+> [!NOTE] PostgreSQL 19
+> When `wal_level` is `replica`, PostgreSQL 19 allows automatic enablement of logical replication when needed. The new read-only `effective_wal_level` shows the level in effect (also in `pg_controldata` and `pg_control_checkpoint()`); with `wal_level = replica` and one or more logical replication slots it shows `logical`.[^pg19-lr-other]
 
 Subscriber (`postgresql.conf`):
 
@@ -376,6 +382,18 @@ Cross-reference [`63-internals-architecture.md`](./63-internals-architecture.md)
 > - `idle_replication_slot_timeout` GUC auto-invalidates idle slots[^pg18-idleslot].
 > - `max_active_replication_origins` GUC[^pg18-origins].
 > - New CREATE SUBSCRIPTION `failover` parameter description quotes the wire-level behavior.
+
+> [!NOTE] PostgreSQL 19
+> - Sequence replication: `ALL SEQUENCES` in `CREATE`/`ALTER PUBLICATION`, `ALTER SUBSCRIPTION ... REFRESH SEQUENCES`[^pg19-lr-seq].
+> - `CREATE`/`ALTER PUBLICATION ... EXCEPT` excludes tables when using `ALL TABLES`[^pg19-lr-other].
+> - Subscription option `retain_dead_tuples` (with `max_retention_duration`) for conflict detection, plus the `pg_stat_subscription_stats.update_deleted` column[^pg19-lr-other].
+> - `CREATE SUBSCRIPTION ... SERVER` uses `postgres_fdw` connection parameters; `CREATE FOREIGN DATA WRAPPER ... CONNECTION`[^pg19-lr-other].
+> - Automatic logical enablement when `wal_level = replica`, read-only `effective_wal_level`[^pg19-lr-other].
+> - `wal_receiver_timeout` can be set per subscription and user; `wal_sender_shutdown_timeout` added (by default, senders still wait forever)[^pg19-lr-other].
+> - Slot sync skip columns `slotsync_skip_count`, `slotsync_last_skip`, `slotsync_skip_reason` in `pg_stat_replication_slots` and `pg_replication_slots`; `mem_exceeded_count` in `pg_stat_replication_slots`; `pg_sync_replication_slots()` waits for completion[^pg19-lr-other].
+> - `pg_stat_wal_receiver.status` gains `connecting`; `pg_createsubscriber` ignores already-existing publications, writes recovery parameters to an optional `pg_createsubscriber.conf`, and gains `-l`/`--logdir`[^pg19-lr-other].
+> - **Renamed:** `pg_stat_subscription_stats.sync_error_count` is now `sync_table_error_count`; `sync_seq_error_count` is new[^pg19-lr-other].
+> - `WAIT FOR LSN 'lsn'` waits until an LSN is reached (modes `standby_replay`, `standby_write`, `standby_flush`, `primary_flush`)[^pg19-lr-other].
 
 ## Examples / Recipes
 
@@ -478,6 +496,9 @@ CREATE SUBSCRIPTION sub_from_a
      FROM information_schema.sequences;
    -- pipe output, execute on new
    ```
+
+   > [!NOTE] PostgreSQL 19
+   > The manual `setval()` sync above is needed when the source is PG18 or earlier. A PG19 publication with `ALL SEQUENCES` replicates sequences, and `ALTER SUBSCRIPTION ... REFRESH SEQUENCES` refreshes them.[^pg19-lr-seq]
 8. Repoint application to new cluster.
 9. `DROP SUBSCRIPTION sub_all;` on new cluster. Decommission old.
 
@@ -528,7 +549,7 @@ Verbatim PG17 release-note: *"Enable the failover of logical slots (Hou Zhijie, 
 
 ```sql
 -- find conflicts
-SELECT subid, subname, apply_error_count, sync_error_count,
+SELECT subid, subname, apply_error_count, sync_error_count,   -- PG15-18; PG19 renames it sync_table_error_count
        confl_insert_exists, confl_update_origin_differs, confl_delete_missing  -- PG18+
   FROM pg_stat_subscription_stats;
 
@@ -549,6 +570,9 @@ DELETE FROM orders WHERE id = 1234;
 ALTER SUBSCRIPTION sub_orders DISABLE;
 -- then investigate / re-sync
 ```
+
+> [!WARNING] PostgreSQL 19
+> PostgreSQL 19 renames `pg_stat_subscription_stats.sync_error_count` to `sync_table_error_count` and adds `sync_seq_error_count`. Change the first query in this recipe to use the new column names on PG19.[^pg19-lr-other]
 
 ### Recipe 9 — Audit publications + subscriptions cluster-wide
 
@@ -659,7 +683,10 @@ Pre-PG18 the subscriber had to recompute generated column values locally (and AL
 
 1. **DDL not replicated.** Adding a column on the publisher with no matching column on the subscriber breaks the apply worker on the next INSERT/UPDATE for that table. Sync schema first, always.
 
-2. **Sequences not replicated.** Subscriber's serial / IDENTITY sequences stay at their starting value forever. After failover from publisher → subscriber, sequence values collide with existing data. Sync via `setval()` in the cutover step.
+2. **Sequences not replicated (PG14–18).** Subscriber's serial / IDENTITY sequences stay at their starting value forever. After failover from publisher → subscriber, sequence values collide with existing data. Sync via `setval()` in the cutover step.
+
+   > [!NOTE] PostgreSQL 19
+   > On PG19, publish sequences with `ALL SEQUENCES` and use `ALTER SUBSCRIPTION ... REFRESH SEQUENCES` instead of `setval()` at cutover.[^pg19-lr-seq]
 
 3. **Large Objects not replicated.** `lo_create()` / `lo_write()` writes on the publisher do nothing on the subscriber. Store blob data in `bytea` columns (see [`14-data-types-builtin.md`](./14-data-types-builtin.md)) or sync LOs out-of-band.
 
@@ -766,3 +793,5 @@ Pre-PG18 the subscriber had to recompute generated column values locally (and AL
 [^pg18-pgrecv]: PostgreSQL 18 release notes. *"Add pg_recvlogical option --enable-failover to specify failover slots (Hayato Kuroda). Also add option --enable-two-phase as a synonym for --two-phase, and deprecate the latter."* https://www.postgresql.org/docs/release/18.0/
 [^pg18-idleslot]: PostgreSQL 18 release notes. *"Allow inactive replication slots to be automatically invalidated using server variable idle_replication_slot_timeout (Nisha Moond, Bharath Rupireddy)."* https://www.postgresql.org/docs/release/18.0/
 [^pg18-origins]: PostgreSQL 18 release notes. *"Add server variable max_active_replication_origins to control the maximum active replication origins (Euler Taveira)."* https://www.postgresql.org/docs/release/18.0/
+[^pg19-lr-seq]: PostgreSQL 19 release notes (RC2), Logical Replication (paraphrased): `CREATE`/`ALTER PUBLICATION ... ALL SEQUENCES`; `ALTER SUBSCRIPTION ... REFRESH SEQUENCES`. https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-LOGICAL
+[^pg19-lr-other]: PostgreSQL 19 release notes (RC2), Logical Replication, Replication, System Views, and Migration: `EXCEPT`, `retain_dead_tuples`, `CREATE SUBSCRIPTION ... SERVER`, `effective_wal_level`, `wal_receiver_timeout`, `wal_sender_shutdown_timeout`, slot sync skip columns, `pg_createsubscriber`, and *`sync_error_count` renamed `sync_table_error_count`*. https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-LOGICAL , https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-REPLICATION , https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION ; `WAIT`: https://www.postgresql.org/docs/19/sql-wait.html

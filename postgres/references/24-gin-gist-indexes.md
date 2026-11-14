@@ -86,7 +86,7 @@ Eleven rows. The upper option is the default unless the row's "Use GiST when" co
 | Multirange overlap / containment (`&&`, `@>`, `<@`) | **GiST** (`multirange_ops`) | n/a | Native GiST opclass since multirange shipped (PG14+) |
 | KNN nearest neighbor (`ORDER BY col <-> point LIMIT N`) | **GiST** (`<->` operator) | n/a | Only GiST and SP-GiST support ordering operators |
 | Geometric `box`, `circle`, `polygon`, `point`, `line` predicates | **GiST** (built-in opclasses) | n/a | See built-in opclasses below |
-| `inet` / `cidr` containment (`<<`, `>>`, `<<=`, `>>=`) | **GiST** (`inet_ops`, **must specify**) | n/a | `inet_ops` is **not** the default opclass; you must request it explicitly[^gist-inet] |
+| `inet` / `cidr` containment (`<<`, `>>`, `<<=`, `>>=`) | **GiST** (`inet_ops`, **must specify**) | n/a | On PG14–18, `inet_ops` is **not** the default opclass; you must request it explicitly (PG19 changes the default, see below)[^gist-inet] |
 | `EXCLUDE USING ...` exclusion constraint | **GiST** | n/a | Range/geometric exclusion. Add `btree_gist` only when mixing equality with range |
 
 
@@ -253,7 +253,10 @@ PostgreSQL 16 ships with eight built-in GiST opclasses[^gist-builtin]:
 
 
 > [!WARNING]
-> `inet_ops` is **not** the default opclass for `inet`/`cidr`. You must request it explicitly: `CREATE INDEX ON tbl USING gist (col inet_ops);`[^gist-inet] The reason is historical — `inet`/`cidr` columns are most often queried with B-tree-friendly equality and range operators. You'd reach for `inet_ops` specifically when you need network-containment operators (`<<`, `>>`, `<<=`, `>>=`).
+> On PG14–18, `inet_ops` is **not** the default opclass for `inet`/`cidr`. You must request it explicitly: `CREATE INDEX ON tbl USING gist (col inet_ops);`[^gist-inet] The reason is historical — `inet`/`cidr` columns are most often queried with B-tree-friendly equality and range operators. You'd reach for `inet_ops` specifically when you need network-containment operators (`<<`, `>>`, `<<=`, `>>=`).
+
+> [!WARNING] PostgreSQL 19
+> PostgreSQL 19 changes the default index opclasses for `inet` and `cidr` from `btree_gist` to GiST. `pg_upgrade` disallows upgrading clusters that have `btree_gist` `inet`/`cidr` indexes, so drop or rebuild those indexes before the upgrade.[^pg19-inet-opclass]
 
 
 Two important contrib opclasses:
@@ -428,7 +431,13 @@ Both contrib extensions exist for the **same** narrow purpose: they let GIN or G
 | PG18 | GIN indexes can be built in parallel | [^pg18-gin-parallel] |
 | PG18 | GiST range-type and B-tree builds use sorting to speed up | [^pg18-gist-sorted] |
 | PG18 | GiST gains `stratnum()` support function | [^pg18-gist-stratnum] |
+| PG19 (RC) | Default index opclasses for `inet` and `cidr` change from `btree_gist` to GiST; `pg_upgrade` refuses clusters with `btree_gist` `inet`/`cidr` indexes | [^pg19-inet-opclass] |
+| PG19 (RC) | GIN vacuum uses streaming reads; `btree_gin` supports all btree cross-type comparisons | [^pg19-gin-btree-gin] |
+| PG19 (RC) | Full text search and `pg_trgm` use the database's locale provider for character classification; reindex FTS and `pg_trgm` indexes and recompute stored `tsvector` values after the upgrade | [^pg19-fts-reindex] |
 
+
+> [!WARNING] Minor releases 2026-08-13 / 2026-11-12
+> The 18.6 release (2026-08-13) fixed parallel GIN index builds that could leave bogus `reltuples` (`Infinity` or `NaN`) on tables with GIN indexes, so check those tables and run `ANALYZE` where the value is bogus. The 18.7 release (2026-11-12) carries several GIN fixes, including `VACUUM` missing dead entries and posting-tree page deletion, so reindex GIN indexes if corruption is suspected. After updating, also reindex `pg_trgm` GiST indexes (`gist_trgm_ops`) and `btree_gist` indexes on `float4`/`float8` (NaN) or `bit`/`bit varying`.[^pg-2026-11-gin-advisory]
 
 ## Inspection with pageinspect
 
@@ -779,7 +788,7 @@ Typical outcome: `jsonb_path_ops` is 25–50% smaller, scans 30–60% faster on 
 
 5. **`jsonb_path_ops` is silently empty for `{}` and `[]`.** Already covered in [`17-json-jsonb.md`](./17-json-jsonb.md) gotcha #12. The opclass produces no index entries for empty containers, so a `WHERE payload @> '{}'` (which matches everything) returns from the index but rows with empty payloads are missed.
 
-6. **`inet_ops` is not the default.** A bare `CREATE INDEX ON tbl USING gist (ip);` produces an empty opclass list and fails. You must say `gist (ip inet_ops)` to get the network-containment index.[^gist-inet]
+6. **`inet_ops` is not the default on PG14–18.** A bare `CREATE INDEX ON tbl USING gist (ip);` produces an empty opclass list and fails. You must say `gist (ip inet_ops)` to get the network-containment index.[^gist-inet]
 
 7. **GiST `<->` ordering with a `LIMIT` is the only fast path** — without `LIMIT`, the planner often picks a sequential scan because the KNN traversal cost dominates without an early stop.
 
@@ -890,3 +899,11 @@ Typical outcome: `jsonb_path_ops` is 25–50% smaller, scans 30–60% faster on 
 [^pg18-gist-sorted]: PostgreSQL 18 release notes — *"Allow values to be sorted to speed range-type GiST and btree index builds (Bernd Helmle)."* https://www.postgresql.org/docs/release/18.0/
 
 [^pg18-gist-stratnum]: PostgreSQL 18 release notes — *"Add GiST support function `stratnum()` (Paul A. Jungwirth)."* https://www.postgresql.org/docs/release/18.0/
+
+[^pg19-inet-opclass]: PostgreSQL 19 release notes (RC2), Migration: *"Change the default index opclasses for `inet` and `cidr` data types from btree_gist to GiST... `pg_upgrade` will disallow upgrading of clusters with btree_gist `inet`/`cidr` indexes."* https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION
+
+[^pg19-gin-btree-gin]: PostgreSQL 19 release notes (RC2): GIN vacuum, hash bulk-delete, bloom, and pgstattuple use streaming reads, and `btree_gin` supports all btree cross-type comparisons. https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-PERFORMANCE
+
+[^pg19-fts-reindex]: PostgreSQL 19 release notes (RC2), Migration: full text search and `pg_trgm` now use the database's locale provider for character classification when parsing text; *"it is recommended to reindex all indexes which use full text search and pg_trgm after the upgrade, and to recompute any stored `tsvector` values."* https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION
+
+[^pg-2026-11-gin-advisory]: PostgreSQL 18.6 and 19 Beta 3 announcement (2026-08-13), https://www.postgresql.org/about/news/postgresql-186-1711-1615-1519-1424-and-19-beta-3-released-3365/ (parallel GIN build `reltuples` check, `btree_gist` float and bit reindex); PostgreSQL 18.7 release notes (2026-11-12), https://www.postgresql.org/docs/release/18.7/ (GIN fixes, `pg_trgm` GiST reindex).

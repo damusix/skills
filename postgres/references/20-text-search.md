@@ -349,6 +349,9 @@ A typical English chain: `unaccent` (filter) → `english_ispell` (morphological
 > [!NOTE] PostgreSQL 18
 > Full-text search and `pg_trgm` now use the cluster's default collation provider to read configuration files and dictionaries, not always libc. *"Clusters that default to non-libc collation providers (e.g., ICU, builtin) that behave differently than libc for characters processed by LC_CTYPE could observe changes in behavior of some full-text search functions, as well as the pg_trgm extension. When upgrading such clusters using pg_upgrade, it is recommended to reindex all indexes related to full-text search and pg_trgm after the upgrade."*[^pg18-cfg] Also: Estonian stemming added.[^pg18-est]
 
+> [!NOTE] PostgreSQL 19
+> Full-text search and `pg_trgm` use the database's locale provider for character classification when parsing text. After `pg_upgrade`, *"it is recommended to reindex all indexes which use full text search and pg_trgm after the upgrade, and to recompute any stored `tsvector` values."* Stemmers: Polish and Esperanto added; *"The Dutch stemmer now uses a different algorithm"* (the previous one is available as `dutch_porter`); English, French, German, Lithuanian, Norwegian, Spanish, Swedish, and Turkish stemmers updated. Stored `tsvector` values built with a changed stemmer need recomputing.[^pg19-fts]
+
 
 ### Parsers and Token Types
 
@@ -780,6 +783,7 @@ Pick at the application layer — there's no single in-DB query that does all th
 - [`93-pg-trgm.md`](./93-pg-trgm.md) — substring/fuzzy alternative to FTS
 - [`94-pgvector.md`](./94-pgvector.md) — semantic-embedding alternative to FTS
 - [`102-skill-cookbook.md`](./102-skill-cookbook.md) — pick FTS vs pg_trgm vs pgvector decision walkthrough
+- [`103-pg-textsearch.md`](./103-pg-textsearch.md) — BM25 ranking via the pg_textsearch extension (PG17+), when `ts_rank` relevance is not good enough
 
 
 ## Sources
@@ -835,3 +839,5 @@ Pick at the application layer — there's no single in-DB query that does all th
 [^pg18-est]: PostgreSQL 18 release notes. Verbatim: "Add full text search stemming for Estonian (Tom Lane)." https://www.postgresql.org/docs/release/18.0/
 
 [^pg18-paral]: PostgreSQL 18 release notes — parallel GIN build. https://www.postgresql.org/docs/release/18.0/
+
+[^pg19-fts]: PostgreSQL 19 release notes (RC-era), Migration and Additional Modules sections. https://www.postgresql.org/docs/19/release-19.html

@@ -44,6 +44,9 @@ Five rules:
 
 5. **PG18+ collation-provider change can invalidate trigram indexes.** FTS + pg_trgm now use default collation provider (Peter Eisentraut). Clusters defaulting to non-libc providers (ICU, builtin) may behave differently for `LC_CTYPE` characters. After pg_upgrade, reindex FTS + pg_trgm indexes.
 
+> [!WARNING] Minor releases 2026-11-12
+> PostgreSQL 14.25, 15.20, 16.16, 17.12, and 18.7 fix GiST index corruption in pg_trgm. Verbatim: "Combination of index entries could lose the flag identifying their format, so that subsequent index searches could miss matching rows. This fix does not repair existing indexes. Users should `REINDEX` existing `gist_trgm_ops` indexes after updating." The item names only GiST (`gist_trgm_ops`) indexes. The same releases fix two GIN VACUUM/page-split bugs that can also miss rows, with `REINDEX` recommended if affected. Use the audit query in [Collation-Provider Change](#collation-provider-change-pg18) to list indexes.[^pg-minor-2026-11]
+
 > [!WARNING] pg_trgm is NOT FTS
 > Trigrams treat strings as character sequences. No stemming, no stop words, no language awareness, no phrase search. For document search (English/Spanish/etc. with morphology), use `tsvector` — see [`20-text-search.md`](./20-text-search.md). pg_trgm shines for identifiers, names, codes, short fields where character-level fuzzy match beats linguistic processing.
 
@@ -297,8 +300,10 @@ Audit query to find all trigram indexes:
 | PG17 | No direct pg_trgm release-note items | — |
 | PG18 | "Allow GIN indexes to be created in parallel" [^pg18-parallel-gin] | Tomas Vondra, Matthias van de Meent |
 | PG18 | FTS + pg_trgm use cluster default collation provider; REINDEX after pg_upgrade if non-libc [^pg18-fts-collation] | Peter Eisentraut |
+| 14.25 / 15.20 / 16.16 / 17.12 / 18.7 | Fix GiST `gist_trgm_ops` index corruption; REINDEX existing GiST trigram indexes [^pg-minor-2026-11] | Nate Clark |
+| PG19 (RC, pre-GA) | FTS + pg_trgm use the database's locale provider for **character classification** when parsing text; REINDEX FTS + pg_trgm indexes after `pg_upgrade` [^pg19-trgm] | Jeff Davis |
 
-**Five consecutive majors had only THREE pg_trgm items** (PG14, PG18×2). pg_trgm interface is stable. Anyone claiming "PG15/16/17 improved pg_trgm" — verify against release notes directly.
+**PG14–PG18 had only THREE pg_trgm release-note items** (PG14, PG18×2). PG19 continues the PG18 collation-provider change: PG18 moved config-file and dictionary reading; PG19 moves character classification. pg_trgm interface is stable. Anyone claiming "PG15/16/17 improved pg_trgm" — verify against release notes directly.
 
 ## Recipes
 
@@ -701,6 +706,10 @@ Five clear signals you should NOT use pg_trgm:
 [^pg18-parallel-gin]: PostgreSQL 18 Release Notes — https://www.postgresql.org/docs/release/18.0/ — "Allow GIN indexes to be created in parallel (Tomas Vondra, Matthias van de Meent)" (E.4.3.1.2. Indexes)
 
 [^pg18-fts-collation]: PostgreSQL 18 Release Notes — https://www.postgresql.org/docs/release/18.0/ — "Change full text search to use the default collation provider of the cluster to read configuration files and dictionaries, rather than always using libc (Peter Eisentraut). Clusters that default to non-libc collation providers (e.g., ICU, builtin) that behave differently than libc for characters processed by LC_CTYPE could observe changes in behavior of some full-text search functions, as well as the pg_trgm extension. When upgrading such clusters using pg_upgrade, it is recommended to reindex all indexes related to full-text search and pg_trgm after the upgrade." (E.4.2. Migration to Version 18)
+
+[^pg-minor-2026-11]: PostgreSQL 18.7 Release Notes (same item in 14.25, 15.20, 16.16, 17.12; released 2026-11-12) — https://www.postgresql.org/docs/release/18.7/ — "Fix possible index corruption in contrib/pg_trgm GiST indexes (Nate Clark)."
+
+[^pg19-trgm]: PostgreSQL 19 Release Notes (RC2 draft, wording may change before GA) — https://www.postgresql.org/docs/19/release-19.html — "Change full text search and pg_trgm to use the database's locale provider for character classification when parsing text (Jeff Davis)" (E.1.2. Migration to Version 19)
 
 [pgtrgm-16]: https://www.postgresql.org/docs/16/pgtrgm.html
 [pg18-release-notes]: https://www.postgresql.org/docs/release/18.0/

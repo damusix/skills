@@ -180,6 +180,9 @@ Catches:
 
 Run `--check` against the source cluster while it's still serving traffic. The target cluster must be initdb'd but not running.
 
+> [!WARNING] Minor releases 2026-08-13 / 2026-11-12
+> When migrating logical slots (source 17+), `pg_upgrade --check` fails if the new cluster's `output_plugin_libraries` GUC (added for CVE-2026-6471 in 18.6 and 17.11) does not permit the output plugins used by the old cluster's slots. Set it on the new cluster first, for example `output_plugin_libraries = 'pgoutput, test_decoding, my_trusted_decoder'`.[^minor-18-6] The `vacuumdb --missing-stats-only` step this file recommends had CVE-2026-116313 fixed in the 2026-11-12 minors (18.7 and the matching older branches), so run it from a vacuumdb at those minors or later.[^minor-nov-announce] Full CVE list: <https://www.postgresql.org/support/security/>.
+
 ### Prerequisites
 
 Both clusters: stopped cleanly via `pg_ctl stop -m fast` or `systemctl stop postgresql-N`. **Verbatim docs: "Stop both servers before running pg_upgrade."**[^pgupgrade-docs]
@@ -305,6 +308,9 @@ Cross-reference [`55-statistics-planner.md`](./55-statistics-planner.md) for wha
 | PG16 | Locale + encoding can differ between source and target — pg_upgrade automatically sets the new cluster's locale and encoding (Jeff Davis)[^pg16-locale]. `--copy` flag exposed explicitly (Peter Eisentraut)[^pg16-copy]. |
 | PG17 | **Logical replication slots and subscriptions migrated** (Hayato Kuroda et al.)[^pg17-slots] — only when source ≥ PG17. `--copy-file-range` flag (Thomas Munro)[^pg17-cfr]. `--sync-method` parameter for file-sync control. |
 | PG18 | **Per-column planner statistics preserved** (Corey Huinker, Jeff Davis, Nathan Bossart)[^pg18-stats]. `--no-statistics` flag. **`--swap` mode** for directory-swap upgrade[^pg18-swap]. Updated docs on standby logical-slot copying behavior tied to old-primary version[^pg18-slots]. |
+
+> [!NOTE] PostgreSQL 19
+> `pg_upgrade` refuses clusters that have `btree_gist` indexes on `inet` or `cidr` columns (the built-in GiST opclass becomes the default for those types) and clusters with carriage returns or line feeds in database, role, or tablespace names. After upgrading to PG19, reindex every index that uses full text search or `pg_trgm`, recompute stored `tsvector` values, and reindex indexes that use the `fuzzystrmatch` functions `dmetaphone()`, `dmetaphone_alt()`, `soundex()`, `metaphone()`, or `difference()`.[^pg19-migration]
 
 ## Examples / Recipes
 
@@ -772,3 +778,10 @@ For `--copy` mode: old cluster untouched, restart it directly. For `--clone`: sa
 [^pg18-swap]: PostgreSQL 18 release notes. Verbatim "New `--swap` option: Swap directories rather than copy/clone/link files (potentially fastest method)." https://www.postgresql.org/docs/18/release-18.html
 
 [^pg18-slots]: PostgreSQL 18 documentation, `pg_upgrade`. Verbatim "If the old primary is prior to version 17.0, then no slots on the primary are copied to the new standby, so all the slots on the old standby must be recreated manually. If the old primary is version 17.0 or later, then only logical slots on the primary are copied to the new standby, but other slots on the old standby are not copied, so must be recreated manually." https://www.postgresql.org/docs/18/pgupgrade.html
+
+
+[^minor-18-6]: PostgreSQL 18.6 release notes (2026-08-13). CVE-2026-6471 and the `output_plugin_libraries` GUC. <https://www.postgresql.org/docs/release/18.6/>
+
+[^minor-nov-announce]: PostgreSQL 18.7, 17.12, 16.16, 15.20, 14.25, and 19 RC 2 released (2026-11-12). CVE-2026-116313, "`vacuumdb --missing-stats-only`". <https://www.postgresql.org/about/news/postgresql-187-1712-1616-1520-1425-and-19-rc-2-released-3442/>
+
+[^pg19-migration]: PostgreSQL 19 release notes, Migration to Version 19 (RC 2). <https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION>
