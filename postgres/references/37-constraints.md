@@ -183,6 +183,16 @@ Column-constraint form:
 
 On PG≤17, the only way to add a NOT NULL to a populated table is `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL` — which takes `ACCESS EXCLUSIVE` and scans the table. The PG18 `NOT VALID` form lets you install the constraint immediately and validate later (see Recipe 8).
 
+> [!WARNING] Minor releases 2026-11-12
+> The 2026-11-12 minors fixed `NOT NULL NO INHERIT` constraints on partitioned tables, which could let a partition hold NULLs.[^minor-nov-announce] Find existing ones with:
+>
+>     SELECT conrelid::regclass, conname
+>     FROM pg_constraint
+>     WHERE contype = 'n' AND connoinherit
+>       AND conrelid IN (SELECT oid FROM pg_class WHERE relkind = 'p');
+>
+> Then fix each one either with `DROP CONSTRAINT` or with `ALTER CONSTRAINT ... INHERIT`. Full CVE list: <https://www.postgresql.org/support/security/>.
+
 
 ### UNIQUE constraints
 
@@ -906,3 +916,5 @@ Foreign keys without a covering index on the child side (delete-on-parent will b
 [^pg18-drop-only]: PostgreSQL 18 release notes. *"Allow dropping of constraints ONLY on partitioned tables (Álvaro Herrera). This was previously erroneously prohibited."* https://www.postgresql.org/docs/release/18.0/
 
 [^pg18-collations]: PostgreSQL 18 release notes. *"Require primary/foreign key relationships to use either deterministic collations or the the same nondeterministic collations (Peter Eisentraut). The restore of a pg_dump, also used by pg_upgrade, will fail if these requirements are not met; schema changes must be made for these upgrade methods to succeed."* https://www.postgresql.org/docs/release/18.0/
+
+[^minor-nov-announce]: PostgreSQL 18.7, 17.12, 16.16, 15.20, 14.25, and 19 RC 2 released (2026-11-12). <https://www.postgresql.org/about/news/postgresql-187-1712-1616-1520-1425-and-19-rc-2-released-3442/>

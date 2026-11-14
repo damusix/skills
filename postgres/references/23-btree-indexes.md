@@ -197,6 +197,9 @@ Control:
 
 The `pg_index.indisdeduplicated` (PG13+ equivalent via `bt_metap().allequalimage`) and the `bt_metap()` `allequalimage` field together let you check whether an index is even eligible. `allequalimage = t` means all opclass-equal values are bitwise identical, so dedup can proceed safely; `f` means the opclass disqualifies dedup.
 
+> [!WARNING] Minor releases 2026-08-13 / 2026-11-12
+> The 2026-11-12 minors (18.7 and the matching older branches) disable btree deduplication for columns declared as `bpchar` (no length, `atttypmod = -1`); `char` and `char(n)` are not affected. Existing entries in such indexes are not repaired, so `REINDEX` indexes on `bpchar` columns.[^minor-18-7] The 2026-08-13 minors fixed an integer overflow in comparisons on btree indexes over `ltree` with more than about 14,653 labels; reindex those indexes too.[^minor-aug-announce] Full CVE list: <https://www.postgresql.org/support/security/>.
+
 > [!NOTE] PostgreSQL 15
 > Docs: *"Allow btree indexes on system and TOAST tables to efficiently store duplicates."*[^pg15-systoast] Previously dedup was disabled for these; PG15 enables it.
 
@@ -661,3 +664,6 @@ Index entries over the limit raise `index row size N exceeds btree version 4 max
 [^pg18-sortedrange]: PG 18 release notes. Docs: *"Allow values to be sorted to speed range-type GiST and btree index builds (Bernd Helmle)."* https://www.postgresql.org/docs/18/release-18.html
 [^pg18-nonbtreeunique]: PG 18 release notes. Docs: *"Allow non-btree unique indexes to be used as partition keys and in materialized views (Mark Dilger). The index type must still support equality."* https://www.postgresql.org/docs/18/release-18.html
 [^collations]: PG 16 docs, "11.5. Indexes and Collations". Docs: *"An index can support only one collation per index column. If multiple collations are of interest, multiple indexes may be needed."* https://www.postgresql.org/docs/16/indexes-collations.html
+
+[^minor-18-7]: PostgreSQL 18.7 release notes (2026-11-12). "Disable btree index de-duplication support for the bpchar data type". <https://www.postgresql.org/docs/release/18.7/>
+[^minor-aug-announce]: PostgreSQL 18.6, 17.11, 16.15, 15.19, 14.24, and 19 Beta 3 released (2026-08-13), reindex advice for `ltree` btree indexes. <https://www.postgresql.org/about/news/postgresql-186-1711-1615-1519-1424-and-19-beta-3-released-3365/>

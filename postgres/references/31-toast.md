@@ -36,7 +36,7 @@ PostgreSQL's TOAST mechanism transparently compresses and/or moves wide column v
 
 1. **TOAST kicks in only when the whole tuple exceeds ~2 KB.** A column with a 500-byte value never goes out-of-line — the cost is paid at the *row* level, not the *column* level. The threshold is `TOAST_TUPLE_THRESHOLD` (normally 2 KB) [^toast-threshold].
 2. **There are four storage strategies; `EXTENDED` is the default for almost every variable-length type.** PLAIN forbids both compression and out-of-line storage (fixed-length types). EXTENDED tries compression first, then out-of-line. EXTERNAL skips compression and goes straight out-of-line. MAIN tries compression and keeps in-line as long as possible [^four-strategies].
-3. **Compression default is `pglz`; `lz4` is faster and almost always better but only present if PostgreSQL was built `--with-lz4`.** Set per-column with `ALTER TABLE ... ALTER COLUMN ... SET COMPRESSION lz4` (PG14+) or cluster-wide via `default_toast_compression` GUC [^pg14-lz4] [^default-toast].
+3. **Compression default is `pglz` on PG14–18 (PG19 changes it to `lz4`); `lz4` is faster and almost always better but only present if PostgreSQL was built `--with-lz4`.** Set per-column with `ALTER TABLE ... ALTER COLUMN ... SET COMPRESSION lz4` (PG14+) or cluster-wide via `default_toast_compression` GUC [^pg14-lz4] [^default-toast].
 4. **Every TOAST-eligible table has a sidecar `pg_toast.pg_toast_<oid>` relation.** It is autovacuumed independently, has its own index, and can become bloated independently of the main table. Read it through `pg_class` (relkind `t`) [^toast-naming].
 5. **Reading a TOASTed column requires joining the TOAST table on every access.** `SELECT *` on a wide-row table pays this cost on every row. `SELECT key, length(blob)` does not de-TOAST. UPDATE of an *unchanged* out-of-line value is free [^update-preserve].
 
@@ -113,11 +113,14 @@ Setting the strategy is via `ALTER TABLE`:
 
 PostgreSQL supports two TOAST compression algorithms:
 
-- **`pglz`** — built-in since PostgreSQL began; the default. Slower compression and slower decompression than `lz4`. Roughly 2-3× slower to decompress than `lz4` on typical text payloads.
+- **`pglz`** — built-in since PostgreSQL began; the default on PG14–18. Slower compression and slower decompression than `lz4`. Roughly 2-3× slower to decompress than `lz4` on typical text payloads.
 - **`lz4`** — added in PG14 [^pg14-lz4]. Faster to compress AND decompress, similar or slightly better compression ratio on most workloads. Requires the server to have been compiled with `--with-lz4`.
 
 > [!NOTE] PostgreSQL 14 — LZ4 TOAST compression
 > Verbatim: *"Add ability to use LZ4 compression on TOAST data (Dilip Kumar). This can be set at the column level, or set as a default via server parameter `default_toast_compression`. The server must be compiled with `--with-lz4` to support this feature. The default setting is still `pglz`."* [^pg14-lz4]
+
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 changes the default TOAST compression method from `pglz` to the more efficient `lz4`: the documented default of `default_toast_compression` is `lz4`.[^pg19-toast-lz4]
 
 Set the compression algorithm per-column:
 
@@ -293,6 +296,7 @@ Direct inspection (requires superuser):
 | PG16 | `VACUUM ... PROCESS_MAIN false` (or `vacuumdb --no-process-main`) — vacuum only the TOAST table | [^pg16-process-main] |
 | PG17 | `pg_column_toast_chunk_id(col)` — return a value's TOAST identifier; NULL if not TOASTed | [^pg17-chunk-id] |
 | PG18 | TOAST table added to `pg_index` to allow very large expression indexes | [^pg18-toast-pg-index] |
+| PG19 (RC) | Default `default_toast_compression` changes from `pglz` to `lz4` | [^pg19-toast-lz4] |
 
 ## Examples / Recipes
 
@@ -633,3 +637,5 @@ Trade-offs:
 [^pg17-chunk-id]: PostgreSQL 17 release notes. Verbatim: *"Add function `pg_column_toast_chunk_id()` to return a value's TOAST identifier (Yugo Nagata). This returns `NULL` if the value is not stored in TOAST."* https://www.postgresql.org/docs/release/17.0/
 
 [^pg18-toast-pg-index]: PostgreSQL 18 release notes. Verbatim: *"Add TOAST table to `pg_index` to allow for very large expression indexes (Nathan Bossart)."* https://www.postgresql.org/docs/release/18.0/
+
+[^pg19-toast-lz4]: PostgreSQL 19 release notes (RC2), Migration: *"Change the default TOAST compression method from `pglz` to the more efficient `lz4`."* https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION ; the `default_toast_compression` default is documented as `lz4` at https://www.postgresql.org/docs/19/runtime-config-client.html

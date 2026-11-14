@@ -30,7 +30,7 @@ When working with spatial data in Postgres — coordinates, points, polygons, di
 
 Five rules:
 
-1. **PostGIS is THE spatial extension for Postgres.** Wholly external, versioned independently (latest stable **3.6.3** at planning time). Supports PG 12-18. **Zero PostGIS items in PG14/15/16/17/18 release notes** — PostGIS evolves on its own cadence.
+1. **PostGIS is THE spatial extension for Postgres.** Wholly external, versioned independently (latest stable **3.7.0**, 2026-10-29). 3.7 supports PG 14-19; 3.6.x supports PG 12-18.[^28] **Zero PostGIS items in PG14/15/16/17/18 release notes** — PostGIS evolves on its own cadence.
 
 2. **`geometry` (planar) vs `geography` (spheroidal) — pick deliberately.** `geometry` does straight-line math in 2D plane — fast, simple, distance in SRS units (degrees if SRID 4326, meters if SRID 3857). `geography` does great-circle math on a spheroid — accurate for global distances + areas, but slower + smaller function set. **Default to `geometry`** unless your data spans continents or you need accurate area/distance over large distances.
 
@@ -337,15 +337,25 @@ Key types + functions:
 |---|---|---|
 | **3.0** | 2019-10 | First major release after merger of `postgis_topology` etc. into core. GEOS 3.8 baseline. |
 | **3.1** | 2020-12 | `ST_HilbertCode`, `ST_Hexagon`, performance for large geometry collections. |
-| **3.2** | 2022-02 | `ST_Letters`, performance for vector tiles (`ST_AsMVT`). |
-| **3.3** | 2022-08 | New cluster functions, performance improvements. |
-| **3.4** | 2023-09 | `ST_LargestEmptyCircle`, `ST_CoverageUnion`, schema migration improvements. |
-| **3.5** | 2024-09 | `ST_HasArc`, lattice / coverage support, dropped EOL'd PG versions. Latest in 3.5 series: 3.5.6 (Apr 2026). |
-| **3.6** | 2025-Q4 | Latest stable: **3.6.3** at planning time (2026-05-14). RelateNG support (faster spatial predicates), GEOS 3.13 features. |
+| **3.2** | 2021-12 | Performance for vector tiles (`ST_AsMVT`). |
+| **3.3** | 2022-08 | `ST_Letters`, new cluster functions, performance improvements. |
+| **3.4** | 2023-08 | `ST_LargestEmptyCircle`, `ST_CoverageUnion`, schema migration improvements. |
+| **3.5** | 2024-09 | `ST_HasArc`, lattice / coverage support, RelateNG support (faster spatial predicates, GEOS 3.13), dropped EOL'd PG versions. Latest tag 3.5.7. |
+| **3.6** | 2025-09 | GEOS 3.14+ for all features. Latest 3.6.4 (2026-06-08): Flatgeobuf schema-mismatch vulnerability fix, `pg_upgrade` fix for non-standard geography SRID. 3.6.3 removed a rare extension privilege-escalation case. |
+| **3.7** | 2026-10-29 | **Breaking**, see warning below. New: `ST_CoverageEdges`, `ST_MinimumSpanningTree` (window function), `ST_IsSimpleDetail`, `ST_MMin`/`ST_MMax`, `ST_XSize`/`ST_YSize`/`ST_ZSize`/`ST_MSize`, `ST_3DInterpolatePoint`, `ST_CatmullSmoothing`, `CG_PolygonRepair`, NURBSCurve geometry, raster `GDT_Float16`. `ST_DWithin` uses prepared-distance caching. |
 
 **Key:** PG14/15/16/17/18 release notes contain **ZERO** PostGIS items. PostGIS evolves on its own schedule.
 
 PostGIS 3.6 support matrix (per install docs): PostgreSQL 12 through 18, GEOS 3.8+, Proj 6.1+, GDAL 2.4+.
+
+PostGIS 3.7 requirements (NEWS): GEOS 3.10+ (3.15+ for all features), PostgreSQL 14-19, Proj 6.1+, libgmp, SFCGAL 2.3+.[^28]
+
+> [!WARNING] PostGIS 3.7 breaking changes
+> - PostgreSQL 12 and 13 and GEOS < 3.10 are no longer supported.
+> - `postgis_tiger_geocoder` and `address_standardizer` are removed from the PostGIS tree and now live in separate repositories (`https://git.osgeo.org/postgis/postgis_tiger_geocoder`, `https://github.com/postgis/address_standardizer`). Install them separately before upgrading a database that uses them.
+> - The `ST_MemCollect` aggregate is removed; use `ST_Collect`.
+> - Topology building functions: tolerance `0` now means exactly 0; the new default `-1` means "use topology precision".
+> - `CG_AlphaShape` returns a MultiPolygon; `ST_GeoHash` now round-trips through `ST_GeomFromGeoHash`.[^28]
 
 ## Examples / Recipes
 
@@ -634,7 +644,7 @@ WHERE t.typname IN ('geometry', 'geography')
 [^6]: Using PostGIS: data management — https://postgis.net/docs/using_postgis_dbmanagement.html (verified 2026-05-14) — verbatim: "The basis for the PostGIS `geometry` data type is a plane..." and "The PostGIS `geography` data type is based on a spherical model..."
 [^7]: PostGIS install requirements — https://postgis.net/docs/manual-3.5/postgis_installation.html (verified 2026-05-14) — PG 12-18, GEOS 3.8+, Proj 6.1+, GDAL 2.4+
 [^8]: PostGIS release notes — https://postgis.net/docs/manual-3.5/release_notes.html (verified 2026-05-14, covers 3.5.0 through 3.5.6, Sept 2024 to Apr 2026)
-[^9]: PostGIS source downloads — https://postgis.net/source/ (verified 2026-05-14, latest stable `postgis-3.6.3.tar.gz`)
+[^9]: PostGIS source downloads — https://postgis.net/source/ (checked 2026-11-14, latest stable 3.7.0)
 [^10]: PostGIS GitHub mirror — https://github.com/postgis/postgis (verified 2026-05-14, mirror of canonical OSGeo repo)
 [^11]: PostGIS workshop (intro tutorial) — https://postgis.net/workshops/postgis-intro/ (verified 2026-05-14, 43 modules)
 [^12]: ST_DWithin documentation — https://postgis.net/docs/ST_DWithin.html (verified 2026-05-14)
@@ -653,3 +663,4 @@ WHERE t.typname IN ('geometry', 'geography')
 [^25]: PostgreSQL 16 release notes — https://www.postgresql.org/docs/16/release-16.html (verified 2026-05-14, ZERO PostGIS items)
 [^26]: PostgreSQL 17 release notes — https://www.postgresql.org/docs/17/release-17.html (verified 2026-05-14, ZERO PostGIS items)
 [^27]: PostgreSQL 18 release notes — https://www.postgresql.org/docs/18/release-18.html (verified 2026-05-14, ZERO PostGIS items)
+[^28]: PostGIS NEWS at tag 3.7.0 — https://github.com/postgis/postgis/blob/3.7.0/NEWS (checked 2026-11-14) — 3.7.0 requirements, breaking changes, new functions; 3.6.4 entries from https://github.com/postgis/postgis/blob/3.6.4/NEWS; 3.2/3.3/3.4/3.5/3.6 dates and attributions from master NEWS

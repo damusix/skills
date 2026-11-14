@@ -43,7 +43,7 @@ For per-view deep dives see [`58-performance-diagnostics.md`](./58-performance-d
 
 1. **Four-tier framework — workload / efficiency / saturation / capacity.** Workload = QPS, transaction mix, query latency distribution. Efficiency = cache hit ratio, plan quality, autovacuum effectiveness. Saturation = connections, CPU, I/O wait, lock waits, replication lag. Capacity = disk usage, WAL retention, partition count, slot retention. Each tier needs separate dashboards + separate alert thresholds.
 
-2. **`postgres_exporter` is canonical Prometheus exporter.** Supplements `pg_stat_*` views with derived metrics (cache hit ratio computed as `blks_hit / (blks_hit + blks_read)`, replication lag bytes, table bloat estimates). Supports custom queries via `queries.yaml` for workload-specific metrics. Default-enabled collectors: database, locks, replication, replication_slot, stat_bgwriter, stat_database, stat_progress_vacuum, stat_user_tables, statio_user_tables, wal[^postgres-exporter].
+2. **`postgres_exporter` is canonical Prometheus exporter.** Supplements `pg_stat_*` views with derived metrics (cache hit ratio computed as `blks_hit / (blks_hit + blks_read)`, replication lag bytes, table bloat estimates). Custom queries via `queries.yaml` still work but are deprecated as of 0.20. Default-enabled collectors (0.20.1): database, locks, replication, replication_slots, settings, stat_activity, stat_archiver, stat_bgwriter, stat_database, stat_progress_vacuum, stat_replication, stat_user_tables, statio_user_tables, wal[^postgres-exporter].
 
 3. **`pgbouncer_exporter` consumes pgBouncer console.** Translates `SHOW STATS` / `SHOW POOLS` / `SHOW CONFIG` / `SHOW DATABASES` / `SHOW LISTS` to Prometheus metrics. Pool saturation = `cl_waiting > 0 sustained` + `maxwait > 5s` — cross-reference [`81-pgbouncer.md`](./81-pgbouncer.md) Recipe 4.
 
@@ -55,7 +55,7 @@ For per-view deep dives see [`58-performance-diagnostics.md`](./58-performance-d
 
 | Need | Use | Avoid | Why |
 |---|---|---|---|
-| Prometheus exporter for PostgreSQL | `postgres_exporter` v0.19+ (prometheus-community) | Per-cloud-provider exporters | Canonical, well-maintained, vendor-agnostic |
+| Prometheus exporter for PostgreSQL | `postgres_exporter` v0.20+ (prometheus-community) | Per-cloud-provider exporters | Canonical, well-maintained, vendor-agnostic |
 | Prometheus exporter for pgBouncer | `pgbouncer_exporter` v0.11+ | Custom scrapers of pgBouncer console | Same project family, consistent metric naming |
 | One-shot snapshot for diagnostics | `pgmetrics` (350+ metrics, single binary, no extension required) | Cron-curling exporter | Designed for ad-hoc scripting / troubleshooting[^pgmetrics] |
 | Real-time `top`-style CLI | `pg_activity` (Dalibo, htop-style) | Hand-rolled `watch pg_stat_activity` | Per-query, per-DB filtering, keyboard navigation[^pg_activity] |
@@ -64,7 +64,7 @@ For per-view deep dives see [`58-performance-diagnostics.md`](./58-performance-d
 | Vendor-managed monitoring SaaS | Provider-agnostic — pick what fits | Provider-locked monitoring | Skill stays neutral; evaluate by ops requirements |
 | Structured Postgres logs for ingestion | `log_destination = 'stderr,jsonlog'` PG15+ | CSV format alone | JSON parsable by Loki / Splunk / Elasticsearch without regex |
 | Per-query observability | `pg_stat_statements` + auto_explain | `pg_stat_activity` polling | Stat_statements normalizes queries; activity gives one-shot snapshot |
-| Replication lag alerting | Prometheus rule on `pg_replication_slot_wal_*` + `pg_stat_replication.replay_lag` | Cron polling lag query | Threshold-based alerting needs sliding window |
+| Replication lag alerting | Prometheus rule on `pg_replication_slots_*` (0.20+; `pg_replication_slot_*` before) + `pg_stat_replication.replay_lag` | Cron polling lag query | Threshold-based alerting needs sliding window |
 | Capacity tracking — disk / WAL / slot retention | `pg_database_size` + `pg_replication_slots` + `pg_wal` directory size | DBA inbox via cron email | Trend lines + projections beat one-shot snapshots |
 
 **Three smell signals:**
@@ -90,7 +90,7 @@ Each tier collects different metrics with different sample rates + alert horizon
 
 | Tool | Type | Latest version | Maintained by | Notes |
 |---|---|---|---|---|
-| **postgres_exporter** | Prometheus exporter (server-side daemon) | v0.19.1 (2026-02-25) | prometheus-community | Canonical PG → Prometheus[^postgres-exporter] |
+| **postgres_exporter** | Prometheus exporter (server-side daemon) | v0.20.1 (2026-07-08) | prometheus-community | Canonical PG → Prometheus[^postgres-exporter] |
 | **pgbouncer_exporter** | Prometheus exporter for pgBouncer console | v0.11.0+ | prometheus-community | Scrapes `SHOW STATS` / `SHOW POOLS`[^pgbouncer-exporter] |
 | **pgwatch** | Full monitoring stack (collector + dashboards) | v5.2.0 (2026-05-04) | Cybertec | Agentless, Grafana dashboards included, supports many backends[^pgwatch] |
 | **pgmonitor** | Full monitoring stack (Prometheus + Grafana + alert rules) | v5.3.0 (2025-07-10) | Crunchy Data (now Snowflake)[^pgmonitor-copyright] | Opinionated dashboards + alert rules, copyright transferred 2025-2026[^pgmonitor] |
@@ -116,13 +116,20 @@ Canonical Prometheus exporter. Connects to PG cluster via libpq, scrapes `pg_sta
 | `database` | `pg_database_size` per database | Capacity-tier baseline |
 | `locks` | `pg_locks` counts by mode | Saturation-tier baseline |
 | `replication` | `pg_stat_replication`, `pg_stat_wal_receiver` | Saturation + capacity |
-| `replication_slot` | `pg_replication_slots` | Capacity — WAL retention |
-| `stat_bgwriter` (PG≤16) / `stat_checkpointer` (PG17+) | bgwriter + checkpointer stats | Efficiency — write pressure |
+| `replication_slots` (`replication_slot` before 0.20) | `pg_replication_slots` | Capacity — WAL retention |
+| `stat_activity`, `stat_archiver`, `stat_replication`, `settings` | `pg_stat_activity`, `pg_stat_archiver`, `pg_stat_replication`, `pg_settings` | Saturation + config drift |
+| `stat_bgwriter` | `pg_stat_bgwriter` | Efficiency — write pressure. On PG17+ also enable `--collector.stat_checkpointer` (disabled by default) |
 | `stat_database` | `pg_stat_database` | Workload + efficiency |
 | `stat_progress_vacuum` | `pg_stat_progress_vacuum` | Saturation — vacuum-in-flight |
 | `stat_user_tables` | `pg_stat_user_tables` | Workload + efficiency per-table |
 | `statio_user_tables` | `pg_statio_user_tables` | Efficiency — cache hit per-table |
 | `wal` | `pg_stat_wal` | Workload + capacity |
+
+> [!WARNING] postgres_exporter 0.20 breaking changes
+> - Collector `replication_slot` renamed `replication_slots` (`--collector.replication_slots`), and metrics renamed `pg_replication_slot_*` → `pg_replication_slots_*`. Update alert rules and dashboards.
+> - `--disable-settings-metrics` / `PG_EXPORTER_DISABLE_SETTINGS_METRICS` removed; use `--no-collector.settings`.
+> - `settings`, `stat_activity`, `stat_archiver`, `stat_replication`, `replication_slots` are standalone collectors: they ignore `--metric-prefix` and `constantLabels` and are not turned off by `--disable-default-metrics`.
+> - `--extend.query-path` (custom `queries.yaml`), `--auto-discover-databases`, `constantLabels`, `--include-databases`, `--exclude-databases` are deprecated. Upstream recommends built-in collectors, or a generic SQL exporter for custom queries. The examples below still run on 0.20.1.[^postgres-exporter]
 
 **Custom queries via `queries.yaml`** for metrics not exposed by default. Example for tracking longest-running transaction:
 
@@ -221,6 +228,9 @@ log_recovery_conflict_waits = on          # Standby query cancellation diagnosti
 log_lock_failures = on                    # NOWAIT lock acquisition failures
 ```
 
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 enables `log_lock_waits` by default, so the explicit `log_lock_waits = on` above is only required on PG14–18. The new `log_autoanalyze_min_duration` controls logging of autoanalyze, and `log_autovacuum_min_duration` now only controls logging of vacuum operations by autovacuum. PostgreSQL 19 also adds `debug_print_raw_parse`, and `log_min_messages` now accepts a `type: level` setting per process type.[^pg19-monitoring-82]
+
 Ship logs to immutable store (S3 with object lock / Azure Blob / GCS with retention) for compliance + forensics. Cross-reference [`51-pgaudit.md`](./51-pgaudit.md) Recipe 7 for the canonical log-shipping pattern.
 
 ### auto_explain
@@ -270,7 +280,7 @@ Quick-reference catalog with PG-version-introduced annotations. Deep dive lives 
 | `pg_stat_progress_create_index` | Live | PG12+ | CREATE INDEX progress |
 | `pg_stat_progress_basebackup` | Live | PG13+ | pg_basebackup progress |
 | `pg_stat_progress_copy` | Live | **PG14+**[^pg14-progress-copy] | COPY progress |
-| `pg_stat_progress_cluster` | Live | PG12+ | CLUSTER + VACUUM FULL progress |
+| `pg_stat_progress_cluster` | Live | PG12+ | CLUSTER + VACUUM FULL progress (PG19: kept for backwards compatibility; use `pg_stat_progress_repack`) |
 | `pg_stat_progress_analyze` | Live | PG13+ | ANALYZE progress |
 | `pg_stat_io` | Cumulative by backend_type × context × object | **PG16+**[^pg16-io] | Unified I/O; PG18 replaced `op_bytes` with bytes columns + added WAL rows |
 | `pg_stat_subscription_stats` | Cumulative per subscription | **PG15+**[^pg15-sub-stats] | Logical replication conflict + error counts |
@@ -280,6 +290,9 @@ Quick-reference catalog with PG-version-introduced annotations. Deep dive lives 
 | `pg_locks` | Live | PG9.x | Lock holders + waiters; PG14+ `waitstart` column |
 | `pg_stat_ssl` | Live per backend | PG9.5 | SSL/TLS connection info |
 | `pg_stat_gssapi` | Live per backend | PG12+ | GSSAPI connection info |
+
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 adds the views `pg_stat_lock` (with `pg_stat_get_lock()`), `pg_stat_recovery`, `pg_stat_progress_repack`, `pg_stat_autovacuum_scores`, and `pg_dsm_registry_allocations`. `pg_stat_progress_repack` covers `REPACK`, `CLUSTER`, and `VACUUM FULL`, while `pg_stat_progress_cluster` is kept for backwards compatibility only. `stats_reset` is added to `pg_stat_all_tables`, `pg_stat_all_indexes`, `pg_statio_all_sequences` (and the sys/user variants), `pg_stat_user_functions`, and `pg_stat_database_conflicts`.[^pg19-monitoring-82]
 
 > [!NOTE] PostgreSQL 17
 > `pg_stat_checkpointer` view created. Columns `buffers_backend` + `buffers_backend_fsync` **removed** from `pg_stat_bgwriter` because "These fields are considered redundant to similar columns in pg_stat_io"[^pg17-checkpointer]. Monitoring queries for buffer write distribution must use `pg_stat_io` filtered by `backend_type = 'client backend'`.
@@ -346,6 +359,7 @@ No universal threshold — set per workload. Below = starting points for OLTP we
 | **PG16** | `pg_stat_io` view added[^pg16-io]; `last_seq_scan` + `last_idx_scan` columns added to `pg_stat_*_tables` / `pg_stat_*_indexes`; `n_tup_newpage_upd` column tracks rows updated to new pages; `pg_stat_get_backend_subxact()` function for subxact cache; `pg_buffercache_usage_counts()` + `pg_buffercache_summary()` functions; `pg_stat_subscription.leader_pid` column; `SpinDelay` + `DSMAllocate` + `LogicalParallelApply*` wait events added; `BUFFER_USAGE_LIMIT` option added to VACUUM/ANALYZE + `vacuum_buffer_usage_limit` GUC; `log_checkpoints` messages now include REDO LSN |
 | **PG17** | **`pg_stat_checkpointer` view split from `pg_stat_bgwriter`**[^pg17-checkpointer] — `buffers_backend` + `buffers_backend_fsync` REMOVED from `pg_stat_bgwriter`; `pg_wait_events` system view added[^pg17-wait-events]; `pg_stat_progress_vacuum` column renames (`max_dead_tuples` → `max_dead_tuple_bytes`, `num_dead_tuples` → `num_dead_item_ids`, new `dead_tuple_bytes` + `indexes_total` + `indexes_processed`); `pg_stat_reset_shared('slru')` for SLRU stats; `pg_stat_statements` new columns (`local_blk_read_time`, `local_blk_write_time`, `stats_since`, `minmax_stats_since`, JIT `deform_counter` details); `pg_replication_slots` new columns (`invalidation_reason`, `inactive_since`); SLRU customization GUCs (`commit_timestamp_buffers` etc.); `pg_stat_progress_copy.tuples_skipped` column |
 | **PG18** | `pg_aios` view added[^pg18-aios] (async I/O subsystem); **`pg_stat_io.op_bytes` REMOVED** — replaced with `read_bytes` + `write_bytes` + `extend_bytes`; WAL I/O rows added to `pg_stat_io`; `pg_stat_get_backend_io()` per-backend variant added; `pg_stat_reset_backend_stats(pid)` function added; `pg_stat_get_backend_wal()` added; `pg_stat_checkpointer` new columns `num_done` + `slru_written` (disambiguates skipped checkpoints + splits SLRU writes); `pg_stat_database` new columns `parallel_workers_to_launch` + `parallel_workers_launched`; `pg_stat_all_tables` variants gain `total_vacuum_time` / `total_autovacuum_time` / `total_analyze_time` / `total_autoanalyze_time`; `pg_stat_statements` new columns `parallel_workers_to_launch` + `parallel_workers_launched` + `wal_buffers_full`; **`pg_stat_wal` REMOVED columns** (`wal_write`, `wal_sync`, `wal_write_time`, `wal_sync_time` — relocated to `pg_stat_io`); `track_wal_io_timing` now controls timing in `pg_stat_io`; `pg_backend_memory_contexts` schema changes (`parent` removed, `path` + `type` added, `level` now one-based); VACUUM/ANALYZE delay-time tracking via `track_cost_delay_timing` |
+| **PG19** (RC) | `pg_stat_lock`, `pg_stat_recovery`, `pg_stat_progress_repack`, `pg_stat_autovacuum_scores`, `pg_dsm_registry_allocations`; `stats_reset` columns on per-table, per-index, sequence, function, and database-conflict views; `pg_stat_progress_basebackup.backup_type`; `pg_stat_wal` full-page-image bytes; wait-event renames (`BUFFERPIN` to `BUFFER`, `BufferPin` to `BufferCleanup`); `log_autoanalyze_min_duration`; `log_lock_waits` on by default[^pg19-monitoring-82] |
 
 ## Examples / Recipes
 
@@ -497,7 +511,7 @@ groups:
     summary: "Standby {{ $labels.application_name }} replay lag > 30s"
 
 - alert: PostgresReplicationSlotInactive
-  expr: pg_replication_slots_active{slot_type="physical"} == 0
+  expr: pg_replication_slots_slot_is_active{slot_type="physical"} == 0
   for: 5m
   labels:
     severity: warning
@@ -828,7 +842,7 @@ Cross-reference [`57-pg-stat-statements.md`](./57-pg-stat-statements.md) Recipe 
 
 10. **`idle_in_transaction` alerts page constantly.** Symptom is real (cross-reference [`27-mvcc-internals.md`](./27-mvcc-internals.md) Gotcha #2) but filter by `state_change > 1 minute` to reduce noise. Short-lived idle-in-tx is application normal; long-lived is the bug.
 
-11. **`pg_stat_replication.replay_lag` returns NULL on idle standby.** Standby with no replication traffic since last query reports NULL — not zero. Alert rule must `OR pg_replication_slot_wal_lag_bytes > X` to cover idle gap.
+11. **`pg_stat_replication.replay_lag` returns NULL on idle standby.** Standby with no replication traffic since last query reports NULL — not zero. Alert rule must also check slot WAL retention (a `pg_replication_slots_*` metric on 0.20+) to cover the idle gap.
 
 12. **`pg_replication_slots.active = false` is normal during failover but indefinite slot retention fills disk.** Alert on `active = false for > 5 minutes` + `pg_wal_lsn_diff(...) > max_slot_wal_keep_size_threshold`.
 
@@ -875,7 +889,7 @@ Cross-reference [`57-pg-stat-statements.md`](./57-pg-stat-statements.md) Recipe 
 
 ## Sources
 
-[^postgres-exporter]: "postgres_exporter" — Prometheus Community PostgreSQL exporter (v0.19.1, February 2026). Default-enabled collectors documented in README. https://github.com/prometheus-community/postgres_exporter
+[^postgres-exporter]: "postgres_exporter" — Prometheus Community PostgreSQL exporter (v0.20.1, 2026-07-08; breaking changes in https://github.com/prometheus-community/postgres_exporter/releases/tag/v0.20.0). Default-enabled and deprecated flags documented in the v0.20.1 README: https://github.com/prometheus-community/postgres_exporter/blob/v0.20.1/README.md https://github.com/prometheus-community/postgres_exporter
 [^postgres-exporter-custom]: Custom queries flag: `--extend.query-path` accepts YAML file with custom SQL → metric definitions. README documents the YAML schema. https://github.com/prometheus-community/postgres_exporter#flags
 [^pgbouncer-exporter]: "pgbouncer_exporter" — Prometheus exporter for pgBouncer (v0.11.0+). Supports pgBouncer 1.8+. Scrapes SHOW STATS / SHOW POOLS / SHOW CONFIG. https://github.com/prometheus-community/pgbouncer_exporter
 [^pgwatch]: "pgwatch" — Cybertec open-source PostgreSQL monitoring (v5.2.0, May 2026). Agentless collector + Grafana dashboards. https://github.com/cybertec-postgresql/pgwatch
@@ -897,6 +911,7 @@ Cross-reference [`57-pg-stat-statements.md`](./57-pg-stat-statements.md) Recipe 
 [^pg17-checkpointer]: PG17 release notes: "Create system view `pg_stat_checkpointer` (Bharath Rupireddy, Anton A. Melnikov, Alexander Korotkov). Relevant columns have been removed from `pg_stat_bgwriter` and added to this new system view." https://www.postgresql.org/docs/release/17.0/
 [^pg17-wait-events]: PG17 release notes: "Add system view `pg_wait_events` that reports wait event types (Bertrand Drouvot). This is useful for adding descriptions to wait events reported in `pg_stat_activity`." https://www.postgresql.org/docs/release/17.0/
 [^pg18-aios]: PG18 release notes: "Add an asynchronous I/O subsystem (Andres Freund, Thomas Munro, Nazir Bilal Yavuz, Melanie Plageman). ... new system view `pg_aios` shows the file handles being used for asynchronous I/O." https://www.postgresql.org/docs/release/18.0/
+[^pg19-monitoring-82]: PG19 release notes (RC2): new system views and columns (System Views), `log_lock_waits` default on, `log_autoanalyze_min_duration` and `log_autovacuum_min_duration` scope (Monitoring), wait-event renames (Migration), `debug_print_raw_parse`. https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-SYSTEM-VIEWS , https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MONITORING , https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION ; progress views: https://www.postgresql.org/docs/19/progress-reporting.html
 
 Additional canonical references:
 

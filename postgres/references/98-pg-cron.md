@@ -32,7 +32,7 @@ When you need scheduled work **inside Postgres** without external cron / systemd
 
 Five rules:
 
-1. **pg_cron is wholly external — not in core.** Latest stable **v1.6.7** released 2025-09-04. v1.6.6 (same day) added PG18 support. Apache-2.0 throughout. Repo `citusdata/pg_cron`. **Zero pg_cron items in PG14/15/16/17/18 release notes** — versioned independently of PostgreSQL.[^1][^2][^3]
+1. **pg_cron is wholly external — not in core.** Latest stable **v1.6.8** released 2026-09-08, which added PG19 support. v1.6.6 (2025-09-04) added PG18 support. Apache-2.0 throughout. Repo `citusdata/pg_cron`. **Zero pg_cron items in PG14/15/16/17/18 release notes** — versioned independently of PostgreSQL.[^1][^2][^3]
 
 2. **Single-database installation, multi-database execution.** Verbatim README: `"pg_cron may only be installed to one database in a cluster. If you need to run jobs in multiple databases, use cron.schedule_in_database()."` Schema lives in the database named by `cron.database_name` GUC (default `postgres`). All `cron.job` rows live there; jobs targeting other databases dispatch via `schedule_in_database()`.[^1]
 
@@ -103,7 +103,7 @@ SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_cron';
 ```
 
 > [!NOTE] PostgreSQL 18
-> v1.6.6 added PG18 support. v1.6.5 fixed a leap-year scheduling bug. v1.6.7 (current) fixes GCC compile errors. **Use v1.6.5 or later** in production.
+> v1.6.6 added PG18 support. v1.6.5 fixed a leap-year scheduling bug. v1.6.7 fixes GCC compile errors. v1.6.8 (current) adds PG19 support and `cron.match_dom_and_dow`. **Use v1.6.5 or later** in production.
 
 `pg_read_server_files` / `pg_write_server_files` are **not** required — pg_cron runs SQL only, not shell. (For shell commands you'd use `system()` from PL/Python or call a PL/pgSQL function that uses `pg_execute_server_program`-style mechanism, neither of which pg_cron itself provides.)
 
@@ -314,14 +314,18 @@ Operational consequences:
 | GUC | Default | Context | Notes |
 |---|---|---|---|
 | `cron.database_name` | `postgres` | postmaster | DB where extension installs + `cron.job` lives |
-| `cron.timezone` | `GMT` | sighup | **Default is GMT, not UTC, not server-local** — always set explicitly |
+| `cron.timezone` | `GMT` | postmaster | **Default is GMT, not UTC, not server-local** — always set explicitly |
 | `cron.use_background_workers` | `off` | postmaster | Use bgworker slots instead of forking; restart required |
 | `cron.max_running_jobs` | `32` | postmaster | Concurrent execution cap |
-| `cron.log_run` | `on` | sighup | Whether to write to `cron.job_run_details` |
-| `cron.log_statement` | `on` | sighup | Whether to log the SQL itself |
+| `cron.log_run` | `on` | postmaster | Whether to write to `cron.job_run_details` |
+| `cron.log_statement` | `on` | postmaster | Whether to log the SQL itself |
 | `cron.log_min_messages` | `WARNING` | sighup | Bgworker log level |
-| `cron.host` | `localhost` | sighup | Where the worker connects (Citus-coordinator scenarios) |
+| `cron.host` | `localhost` | postmaster | Where the worker connects (Citus-coordinator scenarios) |
 | `cron.launch_active_jobs` | `on` | sighup | v1.6.0+; set off to pause all without unscheduling |
+| `cron.enable_superuser_jobs` | `on` | postmaster | Set off to refuse jobs that run as a superuser |
+| `cron.match_dom_and_dow` | `off` | sighup | v1.6.8+; superuser only. When on, a day must match **both** day-of-month and day-of-week (`'0 5 1-7 * 0'` = first Sunday of the month). Default keeps classic cron OR behavior |
+
+README: "`cron.log_min_messages` and `cron.launch_active_jobs` have a setting context of sighup ... All the other settings have a postmaster context" (`cron.match_dom_and_dow`, added later, is also sighup in the v1.6.8 source). The v1.6.8 CHANGELOG calls the new setting `cron.dom_dow_and_logic`; the shipped source defines `cron.match_dom_and_dow`.[^10]
 
 > [!NOTE] PostgreSQL 18
 > No PG18-specific GUCs — pg_cron is wholly external. The PG18 `idle_replication_slot_timeout` does not affect pg_cron (cross-reference [`75-replication-slots.md`](./75-replication-slots.md)).
@@ -332,7 +336,8 @@ pg_cron versions track their own cadence — **not** PG major versions.
 
 | pg_cron | Date | Highlights |
 |---|---|---|
-| v1.6.7 | 2025-09-04 | Fix GCC compile errors (latest stable at planning time) |
+| v1.6.8 | 2026-09-08 | **PG19 support**; native Windows build; `cron.match_dom_and_dow`; shutdown hang with synchronous replication fixed; launcher shared-memory leak fixed (latest stable) |
+| v1.6.7 | 2025-09-04 | Fix GCC compile errors |
 | v1.6.6 | 2025-09-04 | **PG18 support**; stop log spam; crash fix for unavailable jobs; FreeBSD 14.3 |
 | v1.6.5 | 2024-12-12 | **Leap-year scheduling fix**; superuser check before adding job to CronJobHash |
 | v1.6.4 | 2024-08-09 | `CachedCronJobRelationId` invalidation fix |
@@ -676,7 +681,7 @@ UPDATE cron.job SET active = true;          -- resume all
 
 21. **Background-worker mode under heavy load can deadlock with logical-replication apply workers** (rare). Both compete for the same `max_worker_processes` budget. Bump generously and monitor `pg_stat_activity` for `backend_type = 'background worker'` saturation.
 
-22. **`cron.timezone` change requires reload, not restart.** `ALTER SYSTEM SET cron.timezone = 'America/New_York'; SELECT pg_reload_conf();` works — but jobs already mid-execution use the old value until they end.
+22. **`cron.timezone` change requires a restart.** The v1.6.8 source registers it as `PGC_POSTMASTER`: `ALTER SYSTEM SET cron.timezone = 'America/New_York';` then restart the server. `pg_reload_conf()` does not apply it.[^10]
 
 23. **`cron.host = 'localhost'` is a Citus-coordinator leftover.** On a standalone cluster, leaving it alone is fine. In a Citus cluster, see [`97-citus.md`](./97-citus.md) for the multi-node scheduler pattern.
 
@@ -709,7 +714,7 @@ UPDATE cron.job SET active = true;          -- resume all
 
 [^1]: pg_cron README — `https://github.com/citusdata/pg_cron/blob/main/README.md` — function signatures, cron syntax, configuration GUCs, HA behavior, single-database-per-cluster restriction. Verbatim quotes preserved including the typo `"as a long a server is in hot standby"`.
 
-[^2]: pg_cron releases page — `https://github.com/citusdata/pg_cron/releases` — version timeline. Latest **v1.6.7** released 2025-09-04 (GCC fix). v1.6.6 (same day) added PG18 support. v1.6.5 (2024-12-12) fixed leap-year scheduling bug.
+[^2]: pg_cron releases page — `https://github.com/citusdata/pg_cron/releases` — version timeline. Latest **v1.6.8** released 2026-09-08 (PG19 support). v1.6.7 (2025-09-04) GCC fix. v1.6.6 (2025-09-04) added PG18 support. v1.6.5 (2024-12-12) fixed leap-year scheduling bug.
 
 [^3]: pg_cron CHANGELOG — `https://github.com/citusdata/pg_cron/blob/main/CHANGELOG.md` — per-version notes including off-by-1 day-of-month fix in v1.6.3, last-day-of-month `$` syntax in v1.6.0, `[1-59] seconds` form + `cron.timezone` GUC in v1.5.0.
 
@@ -724,3 +729,5 @@ UPDATE cron.job SET active = true;          -- resume all
 [^8]: PG18 release notes — `https://www.postgresql.org/docs/release/18.0/` — verified zero pg_cron items.
 
 [^9]: pg_cron repo home — `https://github.com/citusdata/pg_cron` — Apache-2.0 license, Citus / Microsoft maintained, provider-agnostic.
+
+[^10]: pg_cron v1.6.8 source — `https://github.com/citusdata/pg_cron/blob/v1.6.8/src/pg_cron.c` — GUC names, defaults, and contexts (`PGC_POSTMASTER` for `cron.timezone`, `cron.log_run`, `cron.log_statement`, `cron.host`, `cron.enable_superuser_jobs`; `PGC_SIGHUP` for `cron.match_dom_and_dow`). Checked 2026-11-14.

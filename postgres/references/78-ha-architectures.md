@@ -226,9 +226,9 @@ Three actively-maintained operators:
 
 | Operator | Project | Strengths | Notes |
 |---|---|---|---|
-| CloudNativePG (CNPG) | cloudnative-pg.io | CNCF-incubated, no Patroni dependency, native K8s primitives, declarative backup via Barman, supports PG13-18 | Recommended for new K8s deployments. v1.29 stable at planning time[^cnpg]. |
-| Zalando postgres-operator | github.com/zalando/postgres-operator | Original Patroni-on-K8s, large user base, supports PG13-17 | Bundles Patroni internally. v1.15.1 at planning time[^zalando-pg-op]. |
-| Crunchy Data PGO | github.com/CrunchyData/postgres-operator | Commercial backing from Crunchy, mature, deep backup integration | Now at v6.0.1 (Feb 2026)[^crunchy-pgo]. |
+| CloudNativePG (CNPG) | cloudnative-pg.io | CNCF-incubated, no Patroni dependency, native K8s primitives, declarative backup via Barman, supports PG14-18 | v1.30.1 (checked 2026-11-14); details in [`92-kubernetes-operators.md`](./92-kubernetes-operators.md)[^cnpg]. |
+| Zalando postgres-operator | github.com/zalando/postgres-operator | Original Patroni-on-K8s, large user base, supports PG14-18 | Bundles Patroni internally. v2.0.3 (checked 2026-11-14), with breaking changes in v2; see 92[^zalando-pg-op]. |
+| Crunchy Data PGO | github.com/CrunchyData/postgres-operator | Commercial backing from Crunchy, mature, deep backup integration | v6.0.3 (checked 2026-11-14); see 92[^crunchy-pgo]. |
 
 **Strengths of operator pattern overall:** declarative CRD model fits GitOps. Operators handle PVC management, Service updates, secret rotation, scheduled backup, monitoring integration. K8s native.
 
@@ -284,7 +284,7 @@ PG14-18 release-note items affecting HA architectures. Specific features documen
 - `pg_basebackup` LZ4/Zstandard compression (verbatim "Add support for LZ4 and Zstandard compression of server-side base backups (Jeevan Ladhe, Robert Haas)"). Faster reseed of replicas.
 - Checkpointer + bgwriter during crash recovery (verbatim "Run the checkpointer and bgwriter processes during crash recovery (Thomas Munro). This helps to speed up long crash recoveries").
 - `recovery_prefetch` (verbatim "Allow WAL processing to pre-fetch needed file contents"). Reduces replica replay lag.
-- `archive_library` (verbatim "Allow archiving via loadable modules (Nathan Bossart). Previously, archiving was only done by calling shell commands"). Cleaner integration with pgBackRest/Barman/WAL-G.
+- `archive_library` (verbatim "Allow archiving via loadable modules (Nathan Bossart). Previously, archiving was only done by calling shell commands"). pgBackRest, Barman, and WAL-G still document `archive_command` in their released versions.
 
 ### PG16
 
@@ -694,11 +694,11 @@ Full DR runbook lives in [`90-disaster-recovery.md`](./90-disaster-recovery.md).
 
 [^repmgr]: repmgr documentation, version 5.5.0. https://repmgr.org/docs/current/index.html — Active project under EDB. Supports PG13–18.
 
-[^cnpg]: CloudNativePG project: https://cloudnative-pg.io/ — Note: canonical domain is `cloudnative-pg.io` (with hyphen). The non-hyphenated `cloudnativepg.io` redirects. v1.29 stable at time of writing. CNCF incubated project.
+[^cnpg]: CloudNativePG project: https://cloudnative-pg.io/ — Note: canonical domain is `cloudnative-pg.io` (with hyphen). The non-hyphenated `cloudnativepg.io` redirects. Version checked 2026-11-14 in [`92-kubernetes-operators.md`](./92-kubernetes-operators.md). CNCF incubated project.
 
-[^zalando-pg-op]: Zalando postgres-operator. https://github.com/zalando/postgres-operator — Bundles Patroni internally. Supports PG13-17. v1.15.1 released December 2025.
+[^zalando-pg-op]: Zalando postgres-operator. https://github.com/zalando/postgres-operator — Bundles Patroni internally. Version and PG support checked 2026-11-14 in [`92-kubernetes-operators.md`](./92-kubernetes-operators.md).
 
-[^crunchy-pgo]: Crunchy Data PGO (Postgres Operator). https://github.com/CrunchyData/postgres-operator — Now at v6.0.1 (Feb 2026). v5 documentation at https://access.crunchydata.com/documentation/postgres-operator/v5/.
+[^crunchy-pgo]: Crunchy Data PGO (Postgres Operator). https://github.com/CrunchyData/postgres-operator — Version checked 2026-11-14 in [`92-kubernetes-operators.md`](./92-kubernetes-operators.md). v5 documentation at https://access.crunchydata.com/documentation/postgres-operator/v5/.
 
 [^sync-standby]: PostgreSQL 16 documentation, `synchronous_commit` GUC at https://www.postgresql.org/docs/16/runtime-config-wal.html — Verbatim: "When set to `remote_apply`, commits will wait until replies from the current synchronous standby(s) indicate they have received the commit record of the transaction and applied it, so that it has become visible to queries on the standby(s)." If no sync standby is available, writes block.
 

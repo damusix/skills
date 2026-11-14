@@ -1,6 +1,6 @@
 # PostgreSQL Versions and Features
 
-Major-version release cadence, support policy, and headline features per PG14 / PG15 / PG16 / PG17 / PG18. **This file covers WHAT changed in each major.** For HOW to upgrade between majors, see [87-major-version-upgrade.md](./87-major-version-upgrade.md).
+Major-version release cadence, support policy, and headline features per PG14 / PG15 / PG16 / PG17 / PG18, plus PG19 (release candidate; GA planned 2026-11-19). **This file covers WHAT changed in each major.** For HOW to upgrade between majors, see [87-major-version-upgrade.md](./87-major-version-upgrade.md).
 
 ## Table of Contents
 
@@ -15,6 +15,8 @@ Major-version release cadence, support policy, and headline features per PG14 / 
     - [PostgreSQL 16 (2023-09-14, EOL 2028-11-09)](#postgresql-16-2023-09-14-eol-2028-11-09)
     - [PostgreSQL 17 (2024-09-26, EOL 2029-11-08)](#postgresql-17-2024-09-26-eol-2029-11-08)
     - [PostgreSQL 18 (2025-09-25, EOL 2030-11-14)](#postgresql-18-2025-09-25-eol-2030-11-14)
+    - [PostgreSQL 19 (RC 2; GA planned 2026-11-19)](#postgresql-19-rc-2-ga-planned-2026-11-19)
+- [Minor-Release Advisories (2026-08-13, 2026-11-12)](#minor-release-advisories-2026-08-13-2026-11-12)
 - [Theme-Crosscut Tables](#theme-crosscut-tables)
 - [Recipes](#recipes)
 - [Gotchas / Anti-patterns](#gotchas--anti-patterns)
@@ -47,7 +49,7 @@ Five rules:
 
 3. **Versioning since PG10 = single integer for major.** Verbatim: "Starting with PostgreSQL 10, a major version is indicated by increasing the first part of the version, e.g. 10 to 11."[^1] Pre-PG10 used 9.x.y three-part numbering (9.6 → 10 was the cutover). Minor releases are now PATCH only (e.g., 17.9 = 9th patch of major 17).
 
-4. **At any time, five majors are supported.** PG14, 15, 16, 17, 18 as of today (2026-05-14). PG13 EOL'd 2025-11-13 (six months ago). PG14 EOLs in November 2026 (six months away). Always at least one EOL deadline within rolling 12-month window.
+4. **Normally five majors are supported.** As of 2026-11-14, four are: PG15, 16, 17, 18. PG14 reached EOL on 2026-11-12 (final minor 14.25), and PG19 is a release candidate with GA planned for 2026-11-19, after which the count returns to five. Always at least one EOL deadline within a rolling 12-month window; the next is PG15 on 2027-11-11.[^1][^10]
 
 5. **Headline-features lists are NOT exhaustive.** Each major has hundreds of changes. The "press release" 5-7 items are surface markers — for behavior changes that affect existing queries, read the full release notes via [/docs/N/release-N.html](https://www.postgresql.org/docs/16/release-16.html).
 
@@ -55,11 +57,11 @@ Five rules:
 
 | Situation | Action |
 |---|---|
-| New cluster, fresh start | Use **PG18** (current, supported through 2030-11) |
+| New cluster, fresh start | Use **PG18** (current GA, supported through 2030-11). Re-evaluate PG19 after its GA (planned 2026-11-19) and its first minor release |
 | Greenfield but conservative | Use **PG17** (one year of patches, supported through 2029-11) |
 | Existing PG13 cluster | **Migrate now** — already EOL since 2025-11-13 (no security patches) |
-| Existing PG14 cluster | **Plan upgrade now** — EOL 2026-11-12, ~6 months remaining |
-| Existing PG15 cluster | Plan upgrade within 18 months — EOL 2027-11-11 |
+| Existing PG14 cluster | **Migrate now** — EOL since 2026-11-12; 14.25 was the final release |
+| Existing PG15 cluster | Plan upgrade within 12 months — EOL 2027-11-11 |
 | Audit which extensions support target major | See [86-pg-upgrade.md](./86-pg-upgrade.md) preflight |
 | Cross-check feature introduced in version | Use [Theme-Crosscut Tables](#theme-crosscut-tables) below |
 | Look up patch-level fix | See [/support/versioning/](https://www.postgresql.org/support/versioning/) "Current Minor" column |
@@ -69,7 +71,7 @@ Five rules:
 
 Three smell signals:
 
-- **Running an EOL'd version in production.** No security patches. Audit cluster's `SHOW server_version` against EOL table; PG13 and below are dead.
+- **Running an EOL'd version in production.** No security patches. Audit cluster's `SHOW server_version` against EOL table; PG14 and below are dead.
 - **"Feature X requires upgrade" claim without version cite.** Verify against release notes — false-confidence about feature availability is a long-tail hazard.
 - **Extension version not checked before pg_upgrade.** Third-party extension may not yet support new PG major — see [87 gotcha #8](./87-major-version-upgrade.md#gotchas--anti-patterns).
 
@@ -78,35 +80,36 @@ Three smell signals:
 > [!NOTE] Cadence is annual, in October
 > Each major typically released second or third week of October. PG18 went GA 2025-09-25 (earlier than usual). PG14 was 2021-09-30. PG15 was 2022-10-13. PG16 was 2023-09-14. PG17 was 2024-09-26.[^1]
 
-Minor releases happen on **second Thursday of every February, May, August, and November**. EOL date for each major = minor release of November of fifth year. Example: PG14's last minor release will be 2026-11-12 (the November 2026 quarterly minor).
+Minor releases happen on **second Thursday of every February, May, August, and November**. EOL date for each major = minor release of November of fifth year. Example: PG14's last minor release was 14.25 on 2026-11-12 (the November 2026 quarterly minor). Exception: 18.5 was never shipped ("18.5 was not shipped due to a regression"), so PG18 went from 18.4 to 18.6 in August 2026.[^11]
 
 Pre-PG10 versioning (9.x and earlier): major number = `9.X`, minor = `Y`. Example: 9.6.24. **PG9.6 was the last release with this scheme.**
 
 PG10+ versioning: major = `N`, minor = `N.M`. Example: 17.9 = major 17, ninth minor (patch) release of that major. No 9.6-style three-part version exists post-PG10.
 
 `SHOW server_version_num` returns major+minor packed integer:
-- PG14.22 → `140022`
-- PG15.17 → `150017`
-- PG16.13 → `160013`
-- PG17.9 → `170009`
-- PG18.3 → `180003`
+- PG14.25 → `140025`
+- PG15.20 → `150020`
+- PG16.16 → `160016`
+- PG17.12 → `170012`
+- PG18.7 → `180007`
 
 Useful for version-conditional SQL: `WHEN current_setting('server_version_num')::int >= 170000`.
 
 ## Support Policy and EOL Calendar
 
-> [!WARNING] PG13 already EOL — PG14 EOL in ~6 months
-> Per /support/versioning/ as of 2026-05-14: PG13 EOL'd 2025-11-13. PG14 EOLs 2026-11-12 (about six months away). PG15, 16, 17, 18 currently supported.
+> [!WARNING] PG14 is EOL
+> PG14 reached end-of-life on 2026-11-12. Verbatim: "This is the final release of PostgreSQL 14. PostgreSQL 14 is now end-of-life and will no longer receive security and bug fixes." PG15, 16, 17, 18 are supported. PG19 GA is planned for 2026-11-19.[^10]
 
 Verbatim policy quote: "The PostgreSQL Global Development Group supports a major version for 5 years after its initial release."[^1]
 
 | Major | Current Minor | Supported | First Release | Final Release (EOL) |
 |---|---|---|---|---|
-| 18 | 18.3 | **Yes** | 2025-09-25 | 2030-11-14 |
-| 17 | 17.9 | **Yes** | 2024-09-26 | 2029-11-08 |
-| 16 | 16.13 | **Yes** | 2023-09-14 | 2028-11-09 |
-| 15 | 15.17 | **Yes** | 2022-10-13 | 2027-11-11 |
-| 14 | 14.22 | **Yes** | 2021-09-30 | 2026-11-12 |
+| 19 | 19 RC 2 | not yet released | GA planned 2026-11-19 | (not yet published) |
+| 18 | 18.7 | **Yes** | 2025-09-25 | 2030-11-14 |
+| 17 | 17.12 | **Yes** | 2024-09-26 | 2029-11-08 |
+| 16 | 16.16 | **Yes** | 2023-09-14 | 2028-11-09 |
+| 15 | 15.20 | **Yes** | 2022-10-13 | 2027-11-11 |
+| 14 | 14.25 (final) | No | 2021-09-30 | 2026-11-12 (past) |
 | 13 | 13.23 | No | 2020-09-24 | 2025-11-13 (past) |
 | 12 | 12.22 | No | 2019-10-03 | 2024-11-21 (past) |
 | 11 | 11.22 | No | 2018-10-18 | 2023-11-09 (past) |
@@ -114,7 +117,7 @@ Verbatim policy quote: "The PostgreSQL Global Development Group supports a major
 
 After EOL date, branch receives NO further updates — no security fixes, no bug fixes. Verbatim: "While we will not stop you from running an unsupported version, we strongly recommend that you do not. Once a release is unsupported, you are at risk for unfixed issues, including data corruption and security holes."[^1]
 
-Most recent quarterly minor release: 2026-02-26 (delivered 18.3 / 17.9 / 16.13 / 15.17 / 14.22). Next: 2026-05 (second Thursday of May).
+Most recent quarterly minor release: 2026-11-12 (18.7 / 17.12 / 16.16 / 15.20 / 14.25, plus 19 RC 2). Previous: 2026-08-13 (18.6 / 17.11 / 16.15 / 15.19 / 14.24). Next scheduled: 2027-02-11, 2027-05-13, 2027-08-12, 2027-11-11.[^10][^11][^12]
 
 ## Per-Version Headline Features
 
@@ -205,6 +208,62 @@ Quoted from upstream release notes overview. Lists are illustrative, NOT exhaust
 - **`pg_stat_checkpointer.num_done` and `slru_written`** — distinguish completed-from-skipped checkpoints.
 - **AFTER triggers fire as queue-time role, not commit-time role.** Silent semantic change. See [39-triggers.md headline WARNING](./39-triggers.md).
 - **`promote_trigger_file` removed** (was deprecated since PG12, removed in PG16) — only `pg_promote()` and `pg_ctl promote` work.
+
+### PostgreSQL 19 (RC 2; GA planned 2026-11-19)
+
+> [!WARNING] Not released yet
+> As of 2026-11-14, PostgreSQL 19 is at Release Candidate 2 (2026-11-12). "The planned date for the general availability of PostgreSQL 19 is November 19, 2026." Feature details below come from the RC-era release notes and may still change. Re-verify `/docs/19/` citations at GA.[^10][^13]
+
+**Headline features** (from the release notes):[^13]
+
+- **`REPACK`** replaces the `VACUUM FULL` and `CLUSTER` surface (old commands kept for compatibility); `REPACK (CONCURRENTLY)` rebuilds tables without an access-exclusive lock. New `pg_stat_progress_repack` view and `max_repack_replication_slots` GUC. Command reference: [`26-index-maintenance.md`](./26-index-maintenance.md#repack-pg19).
+- **Autovacuum:** parallel autovacuum workers (`autovacuum_max_parallel_workers`, per-table `autovacuum_parallel_workers`); a scoring system for table processing order (`autovacuum_*_score_weight` GUCs, `pg_stat_autovacuum_scores` view); `log_autoanalyze_min_duration`.
+- **Planner:** `pg_plan_advice` and `pg_stash_advice` contrib modules for stabilizing plans; eager aggregation (`enable_eager_aggregate`); `NOT IN` → anti-join when NULLs are absent; `EXPLAIN (ANALYZE, IO)`.
+- **Logical replication:** sequence replication (`... ALL SEQUENCES`, `ALTER SUBSCRIPTION ... REFRESH SEQUENCES`); `PUBLICATION ... EXCEPT`; `retain_dead_tuples` for conflict detection; logical decoding enabled automatically when needed at `wal_level = replica` (read-only `effective_wal_level`).
+- **`WAIT FOR LSN`** for read-your-writes on standbys.
+- **SQL:** `IGNORE NULLS` / `RESPECT NULLS` for `lead`, `lag`, `first_value`, `last_value`, `nth_value`; `INSERT ... ON CONFLICT DO SELECT ... RETURNING`; `COPY TO ... (FORMAT json)`; `COPY FROM ... ON_ERROR SET_NULL` and multi-line `HEADER n`; `ALTER CONSTRAINT ... [NOT] ENFORCED` for `CHECK`.
+- **Security / TLS:** server-side SNI via `PGDATA/pg_hosts.conf`; OAuth validators can register `pg_hba.conf` options.
+- **Monitoring:** `pg_stat_lock`, `pg_stat_recovery`, `stats_reset` columns on per-table/index stats views.
+
+**Incompatibilities that change stated defaults** ("Migration to Version 19"):[^13]
+
+| Change | PG14–18 | PG19 |
+|---|---|---|
+| `jit` | `on` | **`off`** |
+| `default_toast_compression` | `pglz` | **`lz4`** |
+| `max_locks_per_transaction` | 64 | **128** ("settings must now be doubled to match their capacity in previous releases") |
+| `log_lock_waits` | `off` | **`on`** |
+| `wal_compression = on` | means `pglz` | first available of zstd, lz4, pglz |
+| `io_workers` (PG18) | default 3 | **removed**; `io_min_workers` (2), `io_max_workers` (8), `io_worker_idle_timeout`, `io_worker_launch_interval` |
+| RADIUS authentication | available | **removed** |
+| `standard_conforming_strings` | settable | always `on`; `escape_string_warning` removed |
+| Wait event `BufferPin` | type `BufferPin` | type `Buffer`, event `BufferCleanup`; `BufferContent` split into `BufferShared` / `BufferShareExclusive` / `BufferExclusive` |
+| `pg_stat_subscription_stats.sync_error_count` | present | renamed `sync_table_error_count`; `sync_seq_error_count` added |
+| Default `inet`/`cidr` GiST opclass | btree_gist | core GiST; `pg_upgrade` refuses clusters with btree_gist `inet`/`cidr` indexes |
+| FTS and pg_trgm character classification | libc | database locale provider; reindex FTS and pg_trgm indexes after `pg_upgrade` |
+| `json_array()` over zero rows | `NULL` | empty JSON array |
+| C compiler for extensions | C99 | C11 |
+
+> [!WARNING] Announced in Beta 1, reverted before release
+> The Beta 1 announcement (2026-06-04) advertised features that were reverted and are **not** in PostgreSQL 19: SQL/PGQ property graph queries, `UPDATE`/`DELETE ... FOR PORTION OF`, `ALTER TABLE ... MERGE PARTITIONS` / `SPLIT PARTITIONS`, `GROUP BY ALL`, online data checksum enable/disable, and `pg_get_role_ddl()` / `pg_get_tablespace_ddl()` / `pg_get_database_ddl()`. Answers that cite Beta 1 material for these are wrong.[^13]
+
+## Minor-Release Advisories (2026-08-13, 2026-11-12)
+
+The 2026-08-13 round (18.6 / 17.11 / 16.15 / 15.19 / 14.24) fixed 28 CVEs. The 2026-11-12 round (18.7 / 17.12 / 16.16 / 15.20 / 14.25) fixed 52 CVEs, many CVSS 8.8. Some fixes need action after updating:[^11][^14]
+
+| Action | Why | Details in |
+|---|---|---|
+| List third-party logical-decoding output plugins (wal2json, decoderbufs, ...) in the new `output_plugin_libraries` GUC | CVE-2026-6471; default allows only `pgoutput` and `test_decoding` | [76](./76-logical-decoding.md), [86](./86-pg-upgrade.md) |
+| `REINDEX` pg_trgm GiST (`gist_trgm_ops`) indexes | GiST trigram index corruption (Nov) | [93](./93-pg-trgm.md) |
+| `REINDEX` btree indexes on `bpchar` declared without a length | btree deduplication disabled for that type (Nov) | [23](./23-btree-indexes.md) |
+| `REINDEX` GIN indexes if corruption is suspected; `ANALYZE` tables whose GIN-indexed `reltuples` is `Infinity`/`NaN` | GIN VACUUM and page-deletion fixes (Nov); parallel GIN build stats (Aug) | [24](./24-gin-gist-indexes.md) |
+| `REINDEX` btree_gist indexes on `float4`/`float8` (NaN handling) and `bit`/`bit varying`, and btree indexes on `ltree` with more than about 14,653 labels | wrong results (Aug) | [24](./24-gin-gist-indexes.md), [23](./23-btree-indexes.md) |
+| Take a new full backup if you use incremental backups | "existing incremental backup files should not be trusted" (Nov) | [84](./84-backup-physical-pitr.md) |
+| Find and fix `NOT NULL NO INHERIT` constraints on partitioned tables | a partition could hold NULLs (Nov) | [37](./37-constraints.md) |
+| Rebuild C-language extensions | composite-type safety checks; new `composite_type_mismatch` GUC can disable them at a security cost (Nov) | [18.7 notes](https://www.postgresql.org/docs/release/18.7/) |
+| Re-check pgcrypto PGP decryption with legacy ciphers | CVE-2026-14663: decrypt now fails by default; `ignore-cipher-failure=1` (Aug) | [50](./50-encryption-pgcrypto.md) |
+
+Full CVE list: <https://www.postgresql.org/support/security/>.
 
 ## Theme-Crosscut Tables
 
@@ -319,7 +378,7 @@ SELECT
         WHEN current_setting('server_version_num')::int < 140000
             THEN 'EOL — upgrade immediately'
         WHEN current_setting('server_version_num')::int < 150000
-            THEN 'EOL November 2026 — plan upgrade'
+            THEN 'EOL since 2026-11-12 — upgrade immediately'
         WHEN current_setting('server_version_num')::int < 160000
             THEN 'EOL November 2027'
         WHEN current_setting('server_version_num')::int < 170000
@@ -410,7 +469,7 @@ Given that the support policy is 5 years from initial release:
 - Plan upgrade for **at least 6 months before EOL** (gives time for test cluster, dry-run, rollback plan).
 - Plan upgrade for **at least 12 months before EOL** if you depend on third-party extensions (vendor lag is real).
 
-For example, today (2026-05-14) you should already have a PG14→PG17 or PG14→PG18 plan in motion (PG14 EOL is 2026-11-12).
+For example, PG14 clusters still running after 2026-11-12 are past EOL and should be upgraded now. PG15 clusters (EOL 2027-11-11) should have an upgrade plan in motion.
 
 ### Recipe 8: Diff-the-release-notes pre-upgrade
 
@@ -473,9 +532,9 @@ If unsure when feature X arrived:
 
 ## Gotchas / Anti-patterns
 
-1. **Running PG13 or older in production.** PG13 EOL'd 2025-11-13. No security patches. Migrate now.
+1. **Running PG14 or older in production.** PG14 EOL'd 2026-11-12 and PG13 EOL'd 2025-11-13. No security patches. Migrate now.
 
-2. **Running PG14 in 2026-Q2 without an upgrade plan.** PG14 EOLs 2026-11-12 — 6 months away.
+2. **Running PG15 into 2027 without an upgrade plan.** PG15 EOLs 2027-11-11.
 
 3. **Assuming `9.x` versioning is current.** PG10 changed to single-integer-major in 2017. If a tutorial or library docs say "`SHOW server_version` returns 9.6.X for the X.Y minor of major 9.6," they are pre-2017.
 
@@ -499,7 +558,7 @@ If unsure when feature X arrived:
 
 13. **Trusting the marketing post over the release notes.** "PG18 is N% faster!" benchmarks are workload-specific. Read what specifically changed in the planner / executor / storage layer to see if your workload is affected.
 
-14. **Ignoring the second-Thursday-of-November rule.** That's the date your branch dies. PG14 dies 2026-11-12. PG15 dies 2027-11-11. Mark the calendar.
+14. **Ignoring the second-Thursday-of-November rule.** That's the date your branch dies. PG14 died 2026-11-12. PG15 dies 2027-11-11. Mark the calendar.
 
 15. **`SELECT version()` is verbose, `SHOW server_version` is concise.** Use `version()` for compile-flag / OS-package context; use `server_version_num` for SQL-level version checks.
 
@@ -545,7 +604,7 @@ If unsure when feature X arrived:
 
 ## Sources
 
-[^1]: PostgreSQL Global Development Group, "Versioning Policy." https://www.postgresql.org/support/versioning/ (verified 2026-05-14). Source of: 5-year support quote, annual-release-cadence quote, PG10+ single-integer-major-versioning quote, and the canonical EOL table for PG10 through PG18.
+[^1]: PostgreSQL Global Development Group, "Versioning Policy." https://www.postgresql.org/support/versioning/ (verified 2026-05-14; current-minor and EOL rows re-checked 2026-11-14). Source of: 5-year support quote, annual-release-cadence quote, PG10+ single-integer-major-versioning quote, and the canonical EOL table for PG10 through PG18.
 
 [^2]: PostgreSQL 14 Release Notes. https://www.postgresql.org/docs/14/release-14.html (verified 2026-05-14). Headline features: OUT parameters in procedures; CTE SEARCH/CYCLE clauses; generalized subscripting; multirange types; B-tree bottom-up index deletion.
 
@@ -559,6 +618,16 @@ If unsure when feature X arrived:
 
 [^7]: "PostgreSQL 18 Released" announcement. https://www.postgresql.org/about/news/postgresql-18-released-3142/ (verified 2026-05-14). Source of release-summary quotes including AIO subsystem and uuidv7() callouts.
 
-[^8]: PostgreSQL Release Notes index. https://www.postgresql.org/docs/release/ (verified 2026-05-14). Source of most-recent-minor-release confirmation (2026-02-26 delivered 18.3 / 17.9 / 16.13 / 15.17 / 14.22).
+[^8]: PostgreSQL Release Notes index. https://www.postgresql.org/docs/release/ (checked 2026-11-14). Lists 18.7 / 17.12 / 16.16 / 15.20 / 14.25 as the newest minors (2026-11-12).
 
 [^9]: PostgreSQL Security Information. https://www.postgresql.org/support/security/ (verified 2026-05-14). Source of CVE feed and pgsql-announce subscription pointer.
+
+[^10]: "PostgreSQL 18.7, 17.12, 16.16, 15.20, 14.25, and 19 RC 2 Released!" (2026-11-12). https://www.postgresql.org/about/news/postgresql-187-1712-1616-1520-1425-and-19-rc-2-released-3442/ — PG14 EOL notice ("This is the final release of PostgreSQL 14"), 52 CVEs, reindex and backup advisories. Also https://www.postgresql.org/docs/release/14.25/.
+
+[^11]: "PostgreSQL 18.6, 17.11, 16.15, 15.19, 14.24, and 19 Beta 3 Released!" (2026-08-13). https://www.postgresql.org/about/news/postgresql-186-1711-1615-1519-1424-and-19-beta-3-released-3365/ — 28 CVEs, 18.5 skipped, `output_plugin_libraries`. Release notes: https://www.postgresql.org/docs/release/18.6/ and https://www.postgresql.org/docs/release/18.7/.
+
+[^12]: PostgreSQL roadmap. https://www.postgresql.org/developer/roadmap/ (checked 2026-11-14) — PG19 GA "planned for November 19, 2026"; 2027 minor-release dates.
+
+[^13]: PostgreSQL 19 Release Notes (RC-era). https://www.postgresql.org/docs/19/release-19.html (checked 2026-11-14; header still reads "AS OF 2026-10-09") — headline features, "Migration to Version 19" incompatibilities. Reverted Beta-1 features confirmed absent from the release notes and RC docs, with revert commits on the REL_19_STABLE branch of https://github.com/postgres/postgres.
+
+[^14]: PostgreSQL 18.7 Release Notes. https://www.postgresql.org/docs/release/18.7/ — per-item post-update actions (bpchar dedup, GIN, TOAST index, incremental backups, `composite_type_mismatch`).

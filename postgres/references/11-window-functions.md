@@ -13,7 +13,7 @@ This file covers:
 - The named `WINDOW` clause and inheritance rules.
 - When the planner uses `WindowAgg` and how to read it in `EXPLAIN`.
 - Common recipes (top-N per group, moving average, gap-and-island, sessionization, cumulative percentile).
-- Gotchas: default frame ending at "current row's peer", `last_value` returning the same row as `first_value`, no `IGNORE NULLS`, `NOT IN` of a window result anti-patterns.
+- Gotchas: default frame ending at "current row's peer", `last_value` returning the same row as `first_value`, no `IGNORE NULLS` before PG19, `NOT IN` of a window result anti-patterns.
 
 If you're picking between `DISTINCT ON`, `LATERAL`, and a window function for "first row per group", see the three-way comparison in [`02-syntax-dql.md`](./02-syntax-dql.md). If you're trying to filter by a window function value, that's in `WHERE` is not allowed — wrap in a CTE or subquery (see [`04-ctes.md`](./04-ctes.md)).
 
@@ -317,8 +317,11 @@ FROM leaderboard;
 | `last_value(value)` | `value` at the last row **of the frame** | Frame-sensitive — and the default frame ends at the current row's peer, so naive `last_value` *returns the current row*. See gotcha #1. |
 | `nth_value(value, n)` | `value` at the Nth row **of the frame**, counting from 1; `NULL` if out of frame. | Frame-sensitive. |
 
-> [!WARNING] No `RESPECT NULLS` / `IGNORE NULLS`
-> PostgreSQL does **not** implement the SQL-standard `RESPECT NULLS`/`IGNORE NULLS` options on `lag`, `lead`, `first_value`, `last_value`, or `nth_value`. The behavior is always `RESPECT NULLS` — nulls in the input become nulls in the output. To "ignore nulls", filter them out in a subquery first, or use a `coalesce(...)` trick combined with a conditional.[^functions-window]
+> [!WARNING] No `RESPECT NULLS` / `IGNORE NULLS` (PG14–18)
+> On PG14–18, PostgreSQL does **not** implement the SQL-standard `RESPECT NULLS`/`IGNORE NULLS` options on `lag`, `lead`, `first_value`, `last_value`, or `nth_value`. The behavior is always `RESPECT NULLS` — nulls in the input become nulls in the output. To "ignore nulls", filter them out in a subquery first, or use a `coalesce(...)` trick combined with a conditional.[^functions-window]
+
+> [!NOTE] PostgreSQL 19
+> PostgreSQL 19 adds the `IGNORE NULLS` and `RESPECT NULLS` clause for `lead()`, `lag()`, `first_value()`, `last_value()`, and `nth_value()`, so the subquery and `coalesce(...)` workarounds above are only needed on PG14–18. RC2 fixed an infinite loop in `first_value()` and `nth_value()` with `IGNORE NULLS` and some `EXCLUDE` options.[^pg19-ignore-nulls]
 
 > [!WARNING] No `FROM LAST` for `nth_value`
 > Only `FROM FIRST` (the default) is implemented. For `FROM LAST` semantics, reverse the window's `ORDER BY`.[^functions-window]
@@ -657,7 +660,7 @@ For deep pagination, **keyset cursors are faster** than `row_number()` ranges �
 2. **Filtering on a window result inside `WHERE`.** Illegal — window functions evaluate after `WHERE`. Wrap in a subquery or CTE. Same for `GROUP BY`/`HAVING`.[^tutorial-window]
 3. **Running total ties give duplicate values.** `sum(x) OVER (ORDER BY ts)` over rows with equal `ts` produces the same running total for each tied row. The cause is the same default frame described in gotcha #1. Fix: `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
 4. **`row_number()` ordering with ties is nondeterministic.** Without a tiebreaker, two equivalent `row_number()` calls in the same query *are* guaranteed to agree, but across runs the assignment among tied rows may change. Always add a deterministic tiebreaker (e.g. primary key) to the `ORDER BY` when the number itself is significant.
-5. **No `IGNORE NULLS`.** `lag(x)` over `(NULL, 1, NULL, 2)` returns `(_, NULL, 1, NULL)` — not `(_, _, 1, 1)`. To skip nulls, pre-filter in a CTE or use `coalesce(lag(x), lag(x, 2), lag(x, 3), …)`. There is no clean primitive for this; the SQL-standard `IGNORE NULLS` option is not implemented.[^functions-window]
+5. **No `IGNORE NULLS` on PG14–18.** `lag(x)` over `(NULL, 1, NULL, 2)` returns `(_, NULL, 1, NULL)` — not `(_, _, 1, 1)`. To skip nulls, pre-filter in a CTE or use `coalesce(lag(x), lag(x, 2), lag(x, 3), …)`. There is no clean primitive for this; the SQL-standard `IGNORE NULLS` option is not implemented before PG19 (see the PG19 note under the window function table).[^functions-window]
 6. **`PARTITION BY` doesn't trigger `GROUP BY` semantics.** A window function never collapses rows. If you write `SELECT dept_id, sum(salary) OVER (PARTITION BY dept_id) FROM emp`, you get *one row per employee*, all rows for a given dept showing the same sum. Use `GROUP BY` if you want one row per dept.
 7. **Window functions inside aggregates is illegal.** Aggregates evaluate before window functions, so an aggregate cannot reference a window result. The reverse is fine: a window function may receive an aggregate value as input.[^tutorial-window]
 8. **`FILTER` on pure window functions.** `row_number() FILTER (WHERE …) OVER (…)` is rejected. Only aggregates accept `FILTER`. Use a `CASE` inside the function argument, or restructure with a subquery that excludes the filtered rows.
@@ -696,3 +699,5 @@ For deep pagination, **keyset cursors are faster** than `row_number()` ranges �
 [^pg14-window-inf-fix]: PostgreSQL 14 release notes, "E.23.2. Migration to Version 14". Verbatim: "Fix handling of infinite window function ranges (Tom Lane). Previously window frame clauses like `'inf' PRECEDING AND 'inf' FOLLOWING` returned incorrect results." https://www.postgresql.org/docs/release/14.0/
 
 [^pg18-window]: PostgreSQL 18 release notes, "E.4.3.1.1. Optimizer" — "Speed up the processing of `INTERSECT`, `EXCEPT`, window aggregates, and view column aliases (Tom Lane, David Rowley)." And "E.4.3.2.3. EXPLAIN" — "Add details about window function arguments to `EXPLAIN` output (Tom Lane)." https://www.postgresql.org/docs/release/18.0/
+
+[^pg19-ignore-nulls]: PostgreSQL 19 release notes (RC2), "Allow window functions to ignore NULLs with the `IGNORE NULLS`/`RESPECT NULLS` clause... Supported window functions are `lead()`, `lag()`, `first_value()`, `last_value()`, and `nth_value()`." https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-QUERY

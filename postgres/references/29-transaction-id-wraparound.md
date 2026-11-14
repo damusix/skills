@@ -70,7 +70,7 @@ Skip this file if you only need the VACUUM command grammar ([`28-vacuum-autovacu
 | Hot table has age > 200M and autovacuum can't keep up | Per-table tune `autovacuum_freeze_max_age` lower; raise `autovacuum_vacuum_cost_limit` | Recipe 4 |
 | Approaching 400M (anti-wraparound about to launch) | Schedule a maintenance window to let it complete; do not cancel it | Recipe 6 |
 | Past 1B age, failsafe (1.6B) imminent | Stop conflicting DDL, drop cost throttling, let VACUUM run | Recipe 7 |
-| Warning fires (~40M XIDs left) | Identify largest table by age, manual `VACUUM FREEZE` | Recipe 8 |
+| Warning fires (~40M XIDs left; ~100M on PG19) | Identify largest table by age, manual `VACUUM FREEZE` | Recipe 8 |
 | Hard stop fires (3M XIDs left) | **Do not enter single-user mode** — clear the horizon blocker, then run VACUUM in normal mode | Recipe 9 |
 | Cluster won't start (e.g., wraparound + crash) | Last resort: `pg_resetwal`, then immediately dump/initdb/restore | Recipe 10 |
 | MultiXact age > 400M | Same procedure as XID, with MultiXact-specific GUCs | Recipe 11 |
@@ -220,7 +220,7 @@ PostgreSQL emits two server-log messages on every transaction allocation when th
 
 | Trigger | Message |
 |---|---|
-| `age(datfrozenxid) > 2^31 − 40,000,000` (≈40M XIDs left until catastrophe) | `WARNING: database "mydb" must be vacuumed within N transactions / HINT: To avoid a database shutdown, execute a database-wide VACUUM in that database.`[^routine] |
+| `age(datfrozenxid) > 2^31 − 40,000,000` (≈40M XIDs left until catastrophe; PG19 starts warning at 100M) | `WARNING: database "mydb" must be vacuumed within N transactions / HINT: To avoid a database shutdown, execute a database-wide VACUUM in that database.`[^routine] |
 | `age(datfrozenxid) > 2^31 − 3,000,000` (3M XIDs left) | `ERROR: database is not accepting commands to avoid wraparound data loss in database "mydb" / HINT: Stop the postmaster and vacuum that database in single-user mode.`[^routine] |
 
 At the hard-stop threshold the database refuses new transactions (XID allocation is blocked). Existing transactions complete, but no new work can start until VACUUM advances `datfrozenxid`.
@@ -450,7 +450,7 @@ When `age(relfrozenxid) > 1.6B` (or the PG14+ `vacuum_failsafe_age` you've confi
 ### Recipe 8 — Warning level: manual VACUUM FREEZE
 
 
-When `WARNING: database "X" must be vacuumed within N transactions` fires (~40M XIDs left):
+When `WARNING: database "X" must be vacuumed within N transactions` fires (~40M XIDs left; ~100M on PG19):
 
 1. Verify horizon is moving (Recipe 3). **Do not skip this.** A VACUUM cannot freeze if the horizon is pinned, regardless of how aggressively you run it.
 2. Identify the offending database (the warning message names it).

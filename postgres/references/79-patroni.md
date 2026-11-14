@@ -223,7 +223,7 @@ Twelve dynamic settings catalog:
 | `ttl` | 30s | Leader lock TTL in DCS — after this, replicas race to acquire |
 | `retry_timeout` | 10s | DCS retry budget per loop iteration |
 | `maximum_lag_on_failover` | 1MB | Replica too far behind cannot be promoted automatically |
-| `master_start_timeout` | 300s | Leader has this long to come back before failover triggers |
+| `primary_start_timeout` | 300s | Leader has this long to come back before failover triggers (`master_start_timeout` still accepted as an alias) |
 | `synchronous_mode` | off | Enable synchronous replication (`on`, `quorum`, `off`) |
 | `synchronous_node_count` | 1 | How many sync standbys (with `synchronous_mode: on`) |
 | `synchronous_mode_strict` | false | Block writes if no sync standby available |
@@ -491,21 +491,24 @@ Worker group N is replicated within itself; the coordinator group registers work
 
 ## Per-Version Timeline
 
-Patroni release cadence is independent of PG releases. Verified at planning time: latest is **v4.1.3 (2026-05-05)**.
+Patroni release cadence is independent of PG releases. Latest is **v4.1.5 (2026-08-12)**, checked 2026-11-14. Backport lines 4.0.x and 3.3.x still get patch releases.
 
 | Patroni version | Released | Key items |
 |---|---|---|
 | 2.0 | 2020-09 | Standby clusters, REST API improvements |
 | 2.1 | 2021-09 | `failover_priority`, scheduled switchovers |
-| 3.0 | 2023-02 | **Citus support**, REST API auth required by default for control endpoints |
+| 3.0 | 2023-01 | **Citus support**, DCS `failsafe_mode`, REST API auth required by default for control endpoints |
 | 3.1 | 2023-08 | Kubernetes Endpoints v1 (replaces v1beta1) |
-| 3.2 | 2024-01 | `failsafe_mode` for DCS outage handling |
-| 3.3 | 2024-08 | Quorum-based synchronous replication (`synchronous_mode: quorum`) |
-| 4.0 | 2025-05 | Drops Python 3.6/3.7 support; PG 17 support |
-| 4.1 | 2025-12 | PG 18 support; etcd v2 deprecated; improved monotonic-clock handling |
-| 4.1.3 | 2026-05 | Latest at planning time |
+| 3.2 | 2023-10 | |
+| 3.3 | 2024-04 | |
+| 4.0 | 2024-08-29 | **Quorum-based synchronous replication** (`synchronous_mode: quorum`); PG17 support. **Breaking "master" → "primary" rename:** K8s `role` label default `primary` (override with `kubernetes.leader_label_value`), REST API returns `primary`, `patroni_master` metric and `patronictl --master` removed, `bootstrap.users` removed |
+| 4.0.7 | 2025-09-22 | PG18 RC1 support |
+| 4.1 | 2025-09-23 | `patronictl demote-cluster` / `promote-cluster`, `sync_priority` tag, `restapi.server_tokens`, receive/replay LSN and lag in `/cluster` and `patronictl list` |
+| 4.1.1 / 4.1.2 | 2026-04 | Etcd auth changes for etcd 3.6.9 / 3.5.28 / 3.4.42 (topology reads and lease keepalive now need auth); `restapi.thread_pool_size`; Python 3.14 |
+| 4.1.4 | 2026-07-07 | `patroni_postgres_timeline` metric is now a gauge; Patroni-managed slots with `wal_status = lost` are dropped and recreated |
+| 4.1.5 | 2026-08-12 | Latest. Compatibility with PG 14.24 / 15.19 / 16.15 / 17.11 / 18.6 (`output_plugin_libraries`); `--validate-config` fixes |
 
-**Patroni PG-version-support rule:** Patroni N typically supports the last 5 PG majors. For PG 18, use Patroni 4.1+. For PG 14, Patroni 3.x and 4.x both work.
+**Patroni PG-version-support rule:** Patroni N typically supports the last 5 PG majors. For PG 18, use Patroni 4.0.7+ (4.1.x recommended). On the August 2026 PG minor releases, use 4.1.5+. PG19 support is not in any release yet (unreleased master has PG19-only `pg_hosts`). For PG 14, Patroni 3.x and 4.x both work.
 
 ## Recipes
 
@@ -709,7 +712,7 @@ Wire `/metrics` into Prometheus + alert on `patroni_cluster_unlocked == 1` (no l
 20. **`failover` and `switchover` are not aliases.** `switchover` requires healthy leader; `failover` does not. Picking the wrong one in a runbook can fail when you need it most.
 21. **Patroni won't start two leaders even without watchdog — but it can't prevent it after a crash.** The protection is: at start, refuse to be leader without grabbing the lock. After a SIGKILL or kernel hang, that protection is gone. Watchdog is the backstop.
 22. **`patronictl edit-config` opens YAML in your `$EDITOR`.** Saving an invalid YAML produces an error message and **discards the edit**. Always test with `patronictl show-config` after.
-23. **Patroni 4.0 dropped Python 3.6 and 3.7 support.** RHEL 7 / Ubuntu 18.04 default Python is too old. Plan upgrade path before upgrading Patroni.
+23. **Patroni 4.0 renamed "master" to "primary" everywhere.** HAProxy checks, K8s label selectors, and dashboards that match `master` (REST role, `patroni_master` metric, `role=master` label) break on upgrade from 3.x. Audit them first.
 
 ## See Also
 
@@ -753,6 +756,6 @@ Wire `/metrics` into Prometheus + alert on `patroni_cluster_unlocked == 1` (no l
 
 [^patroni-security]: DCS and REST API security. https://patroni.readthedocs.io/en/latest/security.html
 
-[^patroni-releases]: Patroni release notes. Latest: v4.1.3 (2026-05-05). https://patroni.readthedocs.io/en/latest/releases.html
+[^patroni-releases]: Patroni release notes. Latest: v4.1.5 (2026-08-12). Full notes: https://raw.githubusercontent.com/patroni/patroni/master/docs/releases.rst https://patroni.readthedocs.io/en/latest/releases.html
 
 [^patroni-github]: Patroni source. https://github.com/zalando/patroni

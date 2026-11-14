@@ -84,7 +84,7 @@ Verbatim: *"Replication slots provide an automated way to ensure that the primar
 | Retains `catalog_xmin` | No | **Yes** — blocks `VACUUM` from removing required catalog rows |
 | Output | Raw WAL bytes (consumed by walreceiver) | Logical changes via `pgoutput` (built-in), `wal2json`, `test_decoding`, etc. |
 | `database` column populated | NULL | The database OID the slot belongs to |
-| `wal_level` required | `replica` | `logical` |
+| `wal_level` required | `replica` | `logical` (PG14–18); PG19 enables logical decoding automatically when needed at `replica` |
 | Can be temporary | Yes (`temporary = true`) | Yes (`temporary = true`) |
 
 Logical slot identity rule, verbatim: *"A replication slot has an identifier that is unique across all databases in a PostgreSQL cluster. Slots persist independently of the connection using them and are crash-safe."*[^logicaldecoding] But each logical slot is bound to **one database** — `pg_replication_slots.database` shows which.
@@ -206,7 +206,7 @@ Verbatim signatures from `functions-admin.html` §9.27.6[^functions-admin]:
 |---|---|---|---|
 | `max_replication_slots` | 10 | postmaster (restart) | Maximum slots the cluster can have. Setting lower than current count prevents server start. Requires `wal_level = replica` or higher. |
 | `max_wal_senders` | 10 | postmaster | Maximum concurrent walsender connections (separate budget from slots) |
-| `wal_level` | `replica` | postmaster | Must be `replica` for physical slots, `logical` for logical slots |
+| `wal_level` | `replica` | postmaster | Must be `replica` for physical slots, `logical` for logical slots (PG14–18; PG19 also accepts `replica`, see `effective_wal_level`) |
 | `wal_keep_size` | 0 | sighup | WAL retention floor (parallel mechanism to slots; both apply) |
 | `max_slot_wal_keep_size` | `-1` (unlimited) | sighup (PG13+) | Maximum WAL a slot may retain. **Set this on every production cluster.** |
 | `hot_standby_feedback` | off | sighup | Standby reports xmin back to primary; redundant with physical slot for `xmin` retention but cheaper for some workloads |
@@ -314,7 +314,7 @@ The slot now persists across standby disconnects. Without the slot, a brief stan
 
 When using `pg_recvlogical` or a custom CDC consumer (not native logical replication):
 
-    -- Slot creation. wal_level = logical required.
+    -- Slot creation. wal_level = logical required on PG14-18.
     SELECT pg_create_logical_replication_slot(
         'cdc_stream',     -- slot name
         'pgoutput',       -- output plugin (use 'wal2json' if installed)
@@ -329,6 +329,9 @@ When using `pg_recvlogical` or a custom CDC consumer (not native logical replica
     -- Consume changes (advances confirmed_flush_lsn)
     SELECT lsn, xid, data
     FROM pg_logical_slot_get_changes('cdc_stream', NULL, NULL);
+
+> [!WARNING] Minor releases 2026-08-13 / 2026-11-12
+> CVE-2026-6471 (logical decoding could `dlopen` an arbitrary file) added the `output_plugin_libraries` GUC in the 2026-08-13 minors (18.6, 17.11, and the matching older branches). By default only the plugins shipped with PostgreSQL (`pgoutput` and `test_decoding`) are allowed, so third-party plugins such as `wal2json` and `decoderbufs` must be listed, for example `output_plugin_libraries = 'pgoutput, test_decoding, my_trusted_decoder'`.[^minor-18-6] CVE-2026-120145 (2026-11-12 minors) makes the server reject subscriber system catalogs as logical replication targets.[^minor-nov-announce] Full CVE list: <https://www.postgresql.org/support/security/>.
 
 ### Recipe 4 — Find abandoned slots and bound disk impact
 
@@ -609,3 +612,6 @@ If `slot_headroom < 2`, plan to raise `max_replication_slots`. Note: requires se
 [^pg16-release]: PostgreSQL 16 Release Notes. https://www.postgresql.org/docs/release/16.0/
 [^pg17-release]: PostgreSQL 17 Release Notes. https://www.postgresql.org/docs/release/17.0/
 [^pg18-release]: PostgreSQL 18 Release Notes. https://www.postgresql.org/docs/release/18.0/
+
+[^minor-18-6]: PostgreSQL 18.6 release notes (2026-08-13). <https://www.postgresql.org/docs/release/18.6/>
+[^minor-nov-announce]: PostgreSQL 18.7, 17.12, 16.16, 15.20, 14.25, and 19 RC 2 released (2026-11-12). CVE-2026-120145, "Logical replication can write to subscriber system catalogs". <https://www.postgresql.org/about/news/postgresql-187-1712-1616-1520-1425-and-19-rc-2-released-3442/>

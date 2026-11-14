@@ -109,6 +109,9 @@ Three values:
 > [!WARNING] Changing `wal_level` requires a restart
 > All `wal_level` changes are restart-only because the on-disk format changes. Bump from `replica` to `logical` *before* you need logical replication; do not wait for the migration window.
 
+> [!NOTE] PostgreSQL 19
+> With `wal_level = replica`, PostgreSQL 19 can automatically enable logical replication when it is needed. The new read-only variable `effective_wal_level` shows the level in effect (also in `pg_controldata` and `pg_control_checkpoint()`): when `wal_level` is `replica` and the system has one or more logical replication slots, `effective_wal_level` shows `logical`.[^pg19-wal-level]
+
 ### full_page_writes and Torn Pages
 
 Default `on`. When on, the first modification of any 8 KB page after a checkpoint emits a full page image to WAL. From `wal-reliability.html`: *"PostgreSQL periodically writes full page images to permanent WAL storage before modifying the actual page on disk."*[^fpw] This is the only way to recover from a *torn page* — an OS or hardware-level partial write where the 8 KB page was split mid-write across power loss.
@@ -137,13 +140,16 @@ Compresses **full page images** only, not the regular WAL record data. Values:
 | Value | Available | Notes |
 |---|---|---|
 | `off` (default) | all versions | No compression |
-| `on` | all versions | Alias for `pglz` |
+| `on` | all versions | PG14–18: alias for `pglz`. PG19: selects the first of `zstd`, `lz4`, `pglz` that is available |
 | `pglz` | all versions | Original PostgreSQL LZ |
 | `lz4` | PG15+[^pg15-comp] | Faster + better compression than pglz |
 | `zstd` | PG15+[^pg15-comp] | Better compression than lz4, more CPU |
 
 > [!NOTE] PostgreSQL 15
 > Verbatim: *"Allow WAL full page writes to use LZ4 and Zstandard compression (Andrey Borodin, Justin Pryzby). This is controlled by the `wal_compression` server setting."*[^pg15-comp]
+
+> [!WARNING] PostgreSQL 19
+> PostgreSQL 19 changes `wal_compression = on` to use the best WAL compression method available; previously it always used `pglz`. The value `on` now selects the first of `zstd`, `lz4`, `pglz` that is available. The default value is still `off`.[^pg19-wal-compression]
 
 The compression target is the FPW, which is the dominant cost on write-heavy workloads. Recipe 5 shows the bench script to measure WAL volume reduction on your cluster.
 
@@ -316,6 +322,7 @@ Selected options:
 | **16** | `archive_library` and `archive_command` mutually exclusive; `pg_split_walfile_name()` introspection; `pg_waldump --save-fullpage`; hex timelines in `pg_waldump -t`; logical decoding on standbys; `wal_sync_method=fdatasync` on Windows[^pg16-notes] |
 | **17** | WAL summarization (`summarize_wal`, `wal_summary_keep_time`); `pg_walsummary` CLI; `pg_available_wal_summaries()`, `pg_wal_summary_contents()`, `pg_get_wal_summarizer_state()`; `pg_basebackup --incremental`; `pg_combinebackup`; streaming I/O improves sequential reads[^pg17-notes] |
 | **18** | `data_checksums` default `on` at `initdb`; async I/O subsystem (`io_method`, `io_combine_limit`); WAL I/O activity in `pg_stat_io`; `track_wal_io_timing` moved from `pg_stat_wal` to `pg_stat_io`; `pg_stat_wal` loses `wal_write`/`wal_sync`/`wal_write_time`/`wal_sync_time` columns; `pg_stat_checkpointer` gains `num_done` and `slru_written`; WAL buffer-full count in `EXPLAIN (WAL)` and autovacuum logs[^pg18-notes] |
+| **19** (RC) | `effective_wal_level` and automatic logical enablement when `wal_level = replica`[^pg19-wal-level]; `wal_compression = on` selects the first available of `zstd`, `lz4`, `pglz`[^pg19-wal-compression]; `WAIT FOR LSN` command[^pg19-wait]; `wal_sender_shutdown_timeout`[^pg19-wait]; `pg_stat_wal` and `pg_stat_get_backend_wal()` report full-page-image bytes[^pg19-wal-fpi] |
 
 ## Examples / Recipes
 
@@ -603,6 +610,9 @@ CHECKPOINT;
 
 16. **`synchronous_commit = remote_apply` makes COMMIT wait for standby replay.** This guarantees read-your-writes consistency across replicas but adds the standby's apply latency to every commit. Use it deliberately, per-transaction, not as a default.
 
+    > [!NOTE] PostgreSQL 19
+    > PostgreSQL 19 adds `WAIT FOR LSN 'lsn' [ WITH ( MODE 'standby_replay|standby_write|standby_flush|primary_flush', TIMEOUT '...', NO_THROW ) ]`, which waits until a given LSN is reached. The default mode is `standby_replay`. It is an option for read-your-writes on a standby alongside `remote_apply`.[^pg19-wait]
+
 17. **`archive_timeout` does not skip empty segments.** If `archive_timeout = 5min` and no writes occur, the WAL writer still emits a segment switch — the archive script will see a near-empty 16 MB file every 5 minutes. Heartbeat writes (Recipe 4) are more efficient.
 
 18. **Hint bits and full_page_writes interact.** A read can set hint bits (HEAP_XMIN_COMMITTED / HEAP_XMIN_INVALID) and dirty a page; if it's the first dirty after a checkpoint *and* `full_page_writes = on`, the entire page goes to WAL. On PG18 with data checksums default on, this also true for hint-bit-only changes that previously skipped WAL. Read-heavy workloads on PG18 see more WAL volume than identical workloads on PG17.
@@ -613,7 +623,10 @@ CHECKPOINT;
 
 21. **`commit_delay` does nothing under `commit_siblings`.** The delay applies only when at least `commit_siblings` (default 5) transactions are already waiting. On a low-concurrency cluster, `commit_delay` has zero effect.
 
-22. **`wal_compression = on` is an alias for `pglz`.** Setting `wal_compression = on` on PG15+ gives you `pglz`, not `lz4`. The string `'on'` does not pick the best compressor — pick the algorithm explicitly.
+22. **`wal_compression = on` is an alias for `pglz` on PG15–18.** Setting `wal_compression = on` on PG15–18 gives you `pglz`, not `lz4`. The string `'on'` does not pick the best compressor — pick the algorithm explicitly.
+
+    > [!NOTE] PostgreSQL 19
+    > On PG19, `wal_compression = on` selects the first of `zstd`, `lz4`, `pglz` that is available, so it no longer means `pglz`.[^pg19-wal-compression]
 
 23. **Hot-standby and FPI interact with vacuum cleanup.** `hot_standby_feedback = on` propagates the standby's xmin back to the primary, preventing the primary from cleaning tuples the standby still needs. This is correct for read-heavy standbys but can cause primary-side bloat invisible from a primary-only monitoring view. See [`73-streaming-replication.md`](./73-streaming-replication.md).
 
@@ -687,3 +700,11 @@ CHECKPOINT;
 [^chkpt]: PostgreSQL 16, `CHECKPOINT` command — verbatim: *"CHECKPOINT is not intended for use during normal operation."* https://www.postgresql.org/docs/16/sql-checkpoint.html
 
 [^pg15-chkpt-role]: PostgreSQL 15+, `CHECKPOINT` command — verbatim: *"Only superusers or users with the privileges of the pg_checkpoint role can call CHECKPOINT."* https://www.postgresql.org/docs/16/sql-checkpoint.html
+
+[^pg19-wal-level]: PostgreSQL 19 release notes (RC2), Replication: *"When server variable `wal_level` is `replica`, allow automatic enablement of logical replication when needed"*; read-only `effective_wal_level`. https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-REPLICATION
+
+[^pg19-wal-compression]: PostgreSQL 19 release notes (RC2), Migration: *"Change `wal_compression` equals `on` to use the best WAL compression method available. Previously this always used `pglz`."* Docs: *"The value `on` selects the first of zstd, lz4, pglz that is available. The default value is off."* https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION and https://www.postgresql.org/docs/19/runtime-config-wal.html
+
+[^pg19-wait]: PostgreSQL 19 release notes (RC2), Replication: the `WAIT` command (`WAIT FOR LSN`) and `wal_sender_shutdown_timeout` (by default, senders still wait forever). Command reference: https://www.postgresql.org/docs/19/sql-wait.html . Release notes: https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-REPLICATION
+
+[^pg19-wal-fpi]: PostgreSQL 19 release notes (RC2), Monitoring: `pg_stat_wal` and `pg_stat_get_backend_wal()` report full-page-image bytes. https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-SYSTEM-VIEWS

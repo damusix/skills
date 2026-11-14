@@ -1,12 +1,12 @@
 ---
 name: postgres
-description: Comprehensive PostgreSQL reference for developers and DBAs covering versions 14–18. Use whenever the user asks about PostgreSQL syntax, DDL/DML/DQL, joins, LATERAL, CTEs, window functions, GROUPING SETS, DISTINCT ON, RETURNING, ON CONFLICT, PL/pgSQL, functions, procedures, triggers, views, materialized views, indexes (B-tree/GIN/GiST/BRIN/Hash/Bloom), MVCC, VACUUM, autovacuum, WAL, TOAST, partitioning, replication (streaming/logical), backup, PITR, HA (Patroni/repmgr), pgBouncer, EXPLAIN ANALYZE, RLS, roles, extensions (pgvector, PostGIS, TimescaleDB, Citus, pg_trgm, pg_cron), JSON/JSONB, full-text search, UUID, timestamptz, COPY, system catalogs, collations, large objects, cursors, GUC, or any Postgres administration, performance, security, replication, backup, or recovery topic.
+description: Comprehensive PostgreSQL reference for developers and DBAs covering versions 14–18, plus PostgreSQL 19 changes. Use whenever the user asks about PostgreSQL syntax, DDL/DML/DQL, joins, LATERAL, CTEs, window functions, GROUPING SETS, DISTINCT ON, RETURNING, ON CONFLICT, PL/pgSQL, functions, procedures, triggers, views, materialized views, indexes (B-tree/GIN/GiST/BRIN/Hash/Bloom), MVCC, VACUUM, autovacuum, WAL, TOAST, partitioning, replication (streaming/logical), backup, PITR, HA (Patroni/repmgr), pgBouncer, EXPLAIN ANALYZE, RLS, roles, extensions (pgvector, PostGIS, TimescaleDB, Citus, pg_trgm, pg_cron, pg_textsearch, pgmq), JSON/JSONB, full-text search, BM25 ranking, message queues, UUID, timestamptz, COPY, system catalogs, collations, large objects, cursors, GUC, or any Postgres administration, performance, security, replication, backup, or recovery topic.
 ---
 
 
 # PostgreSQL Skill
 
-This skill is the working reference for **PostgreSQL 16, 17, and 18** (current baseline: PG16). Cross-version notes go back to PG14 where behavior changed; PG13 and earlier are end-of-life and out of scope. PG14 reaches end-of-life on 2026-11-12 — flag upgrade urgency when a user is on it.
+This skill is the working reference for **PostgreSQL 16, 17, and 18** (current baseline: PG16). Cross-version notes go back to PG14 where behavior changed; PG13 and earlier are out of scope. PG14 reached end-of-life on 2026-11-12 (final minor 14.25); flag upgrade urgency when a user is on it. PostgreSQL 19 is a release candidate with GA planned for 2026-11-19; its changes live in `100-pg-versions-features.md` and in `PostgreSQL 19` callouts in topic files.
 
 The skill is provider-neutral: bare-metal/self-hosted, containers, and Kubernetes operators are all covered. Managed-service limitations are called out categorically ("most managed providers disable X") without naming or recommending any specific vendor.
 
@@ -23,7 +23,7 @@ When this skill is loaded, follow these steps to answer the user's question:
 3. **Follow See Also.** Each reference ends with a **See Also** section linking related files. Follow it for cross-cutting questions (e.g. a VACUUM question pulls in MVCC, autovacuum, and wraparound).
 4. **Answer using the file.** Lead with the direct answer or code, then version notes via admonitions, then caveats, then citation URLs.
 5. **Never answer from memory alone** when a reference file exists for the topic. The references are the source of truth for this skill; the model's training data is not version-specific enough.
-6. **Assume PG16 unless told otherwise.** If the user does not state a version, answer for PG16 and add a one-line note for differences on PG17/PG18. Only ask the user which version they are on if the answer materially changes across supported versions (e.g. wraparound mechanics, planner statistics behavior, archive_command vs archive_library).
+6. **Assume PG16 unless told otherwise.** If the user does not state a version, answer for PG16 and add a one-line note for differences on PG17/PG18 (and PG19, a release candidate until GA). Only ask the user which version they are on if the answer materially changes across supported versions (e.g. wraparound mechanics, planner statistics behavior, archive_command vs archive_library).
 
 > [!NOTE]
 > When a Postgres question does not obviously match a single file, load these cross-cutting entry points first: `references/102-skill-cookbook.md` (symptom-driven recipes spanning multiple files), `references/22-indexes-overview.md` (index decision routing), `references/56-explain.md` (plan reading), `references/64-system-catalogs.md` (catalog introspection).
@@ -39,7 +39,7 @@ Structure every answer using this skill as follows:
 - **Call out managed-service limitations categorically** when relevant. Phrase as "most managed providers disable X" — never name a specific provider.
 - **End with source links.** Cite the official PostgreSQL docs pinned to the correct major version (e.g. `https://www.postgresql.org/docs/16/sql-vacuum.html`, not `/docs/current/`).
 - **For longer answers**, use headers matching the reference file's section headings so the user can jump to the source.
-- **For version-sensitive answers**, default to PG16 + add inline `> [!NOTE] PG17` / `> [!NOTE] PG18` deltas. Only ask the user to confirm version when the answer flips between supported majors.
+- **For version-sensitive answers**, default to PG16 + add inline `> [!NOTE] PG17` / `> [!NOTE] PG18` / `PostgreSQL 19` deltas. Only ask the user to confirm version when the answer flips between supported majors.
 - **For any performance investigation document or slow-query guide**, always include an explicit section explaining how to read EXPLAIN plans bottom-up: start at the deepest-indented leaf node (scans execute first), work upward through parents (joins, sorts, aggregates), reach the root last. Identify the first node where `actual rows` diverges 10× or more from estimated `rows` — that is the misestimate source; everything above it operates on bad cardinality.
 
 
@@ -75,7 +75,7 @@ Keywords are matched case-insensitively. A single file can match multiple keywor
 | B-tree, btree, deduplication, bottom-up index deletion, fillfactor, INCLUDE columns, covering index | [`references/23-btree-indexes.md`](references/23-btree-indexes.md) | B-tree indexes |
 | GIN, GiST, KNN-GiST, jsonb_ops, jsonb_path_ops, EXCLUDE USING gist, fastupdate, gin_pending_list_limit | [`references/24-gin-gist-indexes.md`](references/24-gin-gist-indexes.md) | GIN & GiST indexes |
 | BRIN, minmax_multi, bloom index, hash index, SP-GiST | [`references/25-brin-hash-spgist-bloom-indexes.md`](references/25-brin-hash-spgist-bloom-indexes.md) | BRIN, hash, SP-GiST, bloom |
-| CREATE INDEX CONCURRENTLY, REINDEX CONCURRENTLY, INVALID index, pg_repack, pg_squeeze, index bloat | [`references/26-index-maintenance.md`](references/26-index-maintenance.md) | Index maintenance |
+| CREATE INDEX CONCURRENTLY, REINDEX CONCURRENTLY, INVALID index, pg_repack, pg_squeeze, REPACK, REPACK CONCURRENTLY, index bloat | [`references/26-index-maintenance.md`](references/26-index-maintenance.md) | Index maintenance |
 | MVCC, xmin, xmax, cmin, cmax, infomask, tuple visibility, snapshot, xip, MultiXact | [`references/27-mvcc-internals.md`](references/27-mvcc-internals.md) | MVCC internals |
 | VACUUM, autovacuum, VACUUM FULL, VACUUM FREEZE, autovacuum_vacuum_scale_factor, pg_stat_progress_vacuum, visibility map, parallel vacuum | [`references/28-vacuum-autovacuum.md`](references/28-vacuum-autovacuum.md) | VACUUM & autovacuum |
 | transaction id wraparound, XID wraparound, datfrozenxid, autovacuum_freeze_max_age, MultiXact wraparound, 64-bit XID | [`references/29-transaction-id-wraparound.md`](references/29-transaction-id-wraparound.md) | TXID wraparound |
@@ -149,7 +149,9 @@ Keywords are matched case-insensitively. A single file can match multiple keywor
 | Citus, distributed table, reference table, coordinator, worker, shard, colocated join, columnar storage | [`references/97-citus.md`](references/97-citus.md) | Citus |
 | pg_cron, cron.schedule, cron.job, cron.job_run_details, scheduled VACUUM, scheduled REFRESH MATERIALIZED VIEW | [`references/98-pg-cron.md`](references/98-pg-cron.md) | pg_cron |
 | pg_partman, partman.create_parent, run_maintenance_proc, partition retention, partman.part_config, sub-partition | [`references/99-pg-partman.md`](references/99-pg-partman.md) | pg_partman |
-| PG14, PG15, PG16, PG17, PG18, release notes, version features, support policy | [`references/100-pg-versions-features.md`](references/100-pg-versions-features.md) | Per-major-version feature highlights |
+| pg_textsearch, BM25, bm25 index, `<@>`, to_bm25query, ranked keyword search, hybrid search, RRF, reciprocal rank fusion | [`references/103-pg-textsearch.md`](references/103-pg-textsearch.md) | pg_textsearch (BM25 ranked search) |
+| pgmq, message queue, pgmq.send, pgmq.read, pgmq.pop, pgmq.archive, visibility timeout, vt, outbox, job queue, FIFO queue | [`references/104-pgmq.md`](references/104-pgmq.md) | pgmq (Postgres message queue) |
+| PG14, PG15, PG16, PG17, PG18, PG19, release notes, version features, support policy, EOL, minor release, CVE, REPACK | [`references/100-pg-versions-features.md`](references/100-pg-versions-features.md) | Per-major-version feature highlights |
 | managed Postgres, managed PaaS, hosted Postgres, bare-metal, self-hosted, superuser restriction, extension allowlist, shared_preload_libraries restriction, vendor lock-in | [`references/101-managed-vs-baremetal.md`](references/101-managed-vs-baremetal.md) | Managed vs bare-metal trade-offs (provider-agnostic) |
 | recipe, cookbook, bloat triage, slow-query investigation, deadlock investigation, replication lag investigation, PITR walkthrough, upgrade playbook, catalog exploration | [`references/102-skill-cookbook.md`](references/102-skill-cookbook.md) | Multi-file recipes & catalog exploration |
 
@@ -168,7 +170,8 @@ Some terms route to multiple files — load both when in doubt.
 | `Replication is lagging` | [73-streaming-replication.md](references/73-streaming-replication.md) | [75-replication-slots.md](references/75-replication-slots.md), [82-monitoring.md](references/82-monitoring.md) | Lag could be stream pressure or slot retention |
 | `Upgrade` | [86-pg-upgrade.md](references/86-pg-upgrade.md) | [87-major-version-upgrade.md](references/87-major-version-upgrade.md) | pg_upgrade is one strategy; the other file covers blue/green and logical-repl-based upgrades |
 | `JSON column performance` | [17-json-jsonb.md](references/17-json-jsonb.md) | [24-gin-gist-indexes.md](references/24-gin-gist-indexes.md) | JSONB indexing happens via GIN |
-| `Full-text search ranking` | [20-text-search.md](references/20-text-search.md) | [24-gin-gist-indexes.md](references/24-gin-gist-indexes.md) | FTS uses GIN |
+| `Full-text search ranking` | [20-text-search.md](references/20-text-search.md) | [103-pg-textsearch.md](references/103-pg-textsearch.md), [24-gin-gist-indexes.md](references/24-gin-gist-indexes.md) | Core FTS ranks with `ts_rank` over GIN; BM25 ranking needs pg_textsearch |
+| `Job queue / message queue` | [104-pgmq.md](references/104-pgmq.md) | [43-locking.md](references/43-locking.md), [45-listen-notify.md](references/45-listen-notify.md) | pgmq packages the `SKIP LOCKED` pattern from 43; NOTIFY in 45 wakes consumers |
 | `Bulk load slow` | [66-bulk-operations-copy.md](references/66-bulk-operations-copy.md) | [33-wal.md](references/33-wal.md), [28-vacuum-autovacuum.md](references/28-vacuum-autovacuum.md) | WAL volume and post-load vacuum dominate |
 | `Catalog exploration / inspection` | [64-system-catalogs.md](references/64-system-catalogs.md) | [102-skill-cookbook.md](references/102-skill-cookbook.md) | The cookbook has runnable recipes |
 | `shared_buffers` | [32-buffer-manager.md](references/32-buffer-manager.md) | [54-memory-tuning.md](references/54-memory-tuning.md) | Mechanics live in 32; sizing guidance lives in 54 |
@@ -200,6 +203,8 @@ Primary documentation roots (re-fetch before citing in any reference file; versi
 - PostgreSQL 16 manual (default baseline): <https://www.postgresql.org/docs/16/index.html>
 - PostgreSQL 17 manual: <https://www.postgresql.org/docs/17/index.html>
 - PostgreSQL 18 manual: <https://www.postgresql.org/docs/18/index.html>
+- PostgreSQL 19 release notes (RC until GA, planned 2026-11-19): <https://www.postgresql.org/docs/19/release-19.html>
+- Security advisories (CVE list per minor release): <https://www.postgresql.org/support/security/>
 - Per-version release notes: <https://www.postgresql.org/docs/release/>
 - Versioning + support policy: <https://www.postgresql.org/support/versioning/>
 - PostgreSQL Wiki: <https://wiki.postgresql.org/>

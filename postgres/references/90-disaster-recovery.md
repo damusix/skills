@@ -53,7 +53,7 @@ Five rules to internalize.
 > [!WARNING] Two operational watersheds for 2026
 >
 > 1. **Untested backups silently fail.** PG18 default-on `data_checksums` will detect on-disk corruption during restore — but only if you restore. Without quarterly drill, corruption + retention-window roll-over silently destroys recoverable history. Triple-anchor: budget, drill, alert.
-> 2. **PG13 EOL was November 2025 — running PG13 in production today (2026-05-14) means no security patches, no DR-tooling fixes.** PG14 EOL November 2026 (~6 months out). Cross-reference [`87-major-version-upgrade.md`](./87-major-version-upgrade.md).
+> 2. **PG13 EOL was November 2025 and PG14 EOL was 2026-11-12 (final release 14.25). Running either in production means no security patches, no DR-tooling fixes.**[^pg14-eol-dr] Cross-reference [`87-major-version-upgrade.md`](./87-major-version-upgrade.md).
 
 ---
 
@@ -780,7 +780,7 @@ SELECT pg_stat_archiver;
 
 20. **Cross-architecture restore impossible.** Cannot restore x86_64 backup on aarch64. **Mitigation:** match architecture. For cross-arch DR, logical replication or pg_dump.
 
-21. **PG13 EOL November 2025.** Running PG13 today (2026-05-14) = no security patches, no DR-tooling fixes. **Mitigation:** upgrade. PG14 EOL Nov 2026.
+21. **PG13 and PG14 are EOL.** PG13 reached EOL in November 2025; PG14 reached EOL on 2026-11-12 (final release 14.25, no further fixes).[^pg14-eol-dr] Running either = no security patches, no DR-tooling fixes. **Mitigation:** upgrade.
 
 22. **Disposable host's monitoring may poll prod's metrics.** Restore drill spins up host with same hostname → Prometheus targets it → graphs show prod metrics from disposable host. **Mitigation:** drill hosts use unique hostname + isolated monitoring.
 
@@ -842,3 +842,5 @@ SELECT pg_stat_archiver;
 [^runtime-config-wal]: PostgreSQL 16 — Server Configuration: WAL, archiving, recovery, recovery-target — https://www.postgresql.org/docs/16/runtime-config-wal.html
 
 [^recovery-config]: PostgreSQL 16 — Appendix O.1: recovery.conf compatibility note — https://www.postgresql.org/docs/16/recovery-config.html
+
+[^pg14-eol-dr]: PostgreSQL 18.7, 17.12, 16.16, 15.20, 14.25, and 19 RC 2 released (2026-11-12), "PostgreSQL 14 EOL Notice". "This is the final release of PostgreSQL 14. PostgreSQL 14 is now end-of-life and will no longer receive security and bug fixes." <https://www.postgresql.org/about/news/postgresql-187-1712-1616-1520-1425-and-19-rc-2-released-3442/>

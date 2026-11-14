@@ -241,7 +241,10 @@ Three operational rules:
 
 2. **The aborted transaction raises `SQLSTATE 40P01 deadlock_detected`.** The application must catch and retry — replay the entire transaction from `BEGIN`, not just the failing statement. Same retry contract as `40001` (see [`42-isolation-levels.md`](./42-isolation-levels.md)).
 
-3. **Logging deadlocks.** Set `log_lock_waits = on` (off by default) to log every lock wait longer than `deadlock_timeout`. Deadlock detections are always logged regardless. The log message shows the full lock wait graph including PIDs, modes, and queries.
+3. **Logging deadlocks.** Set `log_lock_waits = on` (off by default on PG14–18) to log every lock wait longer than `deadlock_timeout`. Deadlock detections are always logged regardless. The log message shows the full lock wait graph including PIDs, modes, and queries.
+
+   > [!NOTE] PostgreSQL 19
+   > PostgreSQL 19 enables `log_lock_waits` by default (documented default: on), so lock waits longer than `deadlock_timeout` are logged without any setting.[^pg19-log-lock-waits]
 
 The canonical deadlock pattern is **out-of-order row access**:
 
@@ -319,9 +322,12 @@ Five GUCs control lock behavior:
 |---|---|---|
 | `deadlock_timeout` | `1s` | How long a session waits before the deadlock check runs. Lowering reports deadlocks faster but raises CPU overhead. Recommended: keep default. |
 | `lock_timeout` | `0` (disabled) | Abort any statement that waits longer than this for a lock. Recommended: set per-session or per-statement, never cluster-wide. |
-| `max_locks_per_transaction` | `64` | Average per-transaction object-lock budget for the shared lock table. Restart required to change. |
+| `max_locks_per_transaction` | `64` (PG14–18) | Average per-transaction object-lock budget for the shared lock table. Restart required to change. |
 | `max_pred_locks_per_transaction` | `64` | Average per-transaction predicate-lock budget for SSI. Restart required. |
 | `max_pred_locks_per_relation` | `-2` | When predicate locks on one relation exceed this, escalate to whole-relation lock. Negative means `max_pred_locks_per_transaction / abs(setting)`. |
+
+> [!WARNING] PostgreSQL 19
+> PostgreSQL 19 changes the default of `max_locks_per_transaction` from 64 to 128. Settings that were tuned on PG18 or earlier must now be doubled to match their capacity in previous releases.[^pg19-max-locks]
 
 **`deadlock_timeout`** (verbatim): *"This is the amount of time to wait on a lock before checking to see if there is a deadlock condition ... The default is one second (`1s`), which is probably about the smallest value you would want in practice ... When `log_lock_waits` is set, this parameter also determines the amount of time to wait before a log message is issued about the lock wait."*[^deadlock-timeout]
 
@@ -366,6 +372,7 @@ The most common wait events in blocking chains are `relation`, `tuple`, and `tra
 | **PG16** | `applytransaction` wait event/locktype added (logical-replication apply workers); `pg_locks` exposes speculative-insertion lock info via `transactionid` + `objid`[^pg16-spectoken]; `LOCK TABLE` permissions simplified — having permission for a stronger mode now also grants weaker modes[^pg16-lock-perms] |
 | **PG17** | No lock-system release-note changes |
 | **PG18** | `log_lock_failures` GUC added for `SELECT … NOWAIT` lock-failure logging[^pg18-log-lock-failures] |
+| **PG19** (RC) | `max_locks_per_transaction` default 64 to 128[^pg19-max-locks]; `log_lock_waits` on by default[^pg19-log-lock-waits]; new `pg_stat_lock` view and `pg_stat_get_lock()`[^pg19-stat-lock] |
 
 > [!NOTE]
 > The eight-mode conflict matrix and row-level lock model have been **operationally stable since PG9.x**. If a tutorial claims that PG16/17/18 introduced new lock modes or changed the conflict matrix, verify directly against `explicit-locking.html` — it has not.
@@ -543,7 +550,7 @@ If your cluster has lots of partitions or wide-fanout queries, you may hit `out 
                 AS current_locks
     ) AS m;
 
-Run this on a healthy cluster to baseline `pct_used`. If a workload spike pushes it above 70%, raise `max_locks_per_transaction` (requires restart). Typical values: 64 (default), 128 (cluster with 1k–10k partitions), 256–512 (heavy partitioning + many backends).
+Run this on a healthy cluster to baseline `pct_used`. If a workload spike pushes it above 70%, raise `max_locks_per_transaction` (requires restart). Typical values on PG14–18: 64 (default), 128 (cluster with 1k–10k partitions), 256–512 (heavy partitioning + many backends). On PG19 double each (128 default, 256, 512–1024): lock memory is sized differently, so this query's `total_lock_slots` overstates PG19 capacity about 2x and `pct_used` reads about half its real value.
 
 
 ### Recipe 8: Enforce locking order to avoid deadlocks in batch updates
@@ -732,6 +739,7 @@ The `source` column tells you whether each value is from `postgresql.conf`, `ALT
 - [`35-partitioning.md`](./35-partitioning.md) — ATTACH/DETACH PARTITION lock matrix.
 - [`64-system-catalogs.md`](./64-system-catalogs.md) — joining `pg_locks` to `pg_class`/`pg_namespace`/`pg_stat_activity`.
 - [`45-listen-notify.md`](./45-listen-notify.md) — queue-table patterns using `FOR UPDATE SKIP LOCKED` paired with `NOTIFY`-the-id delivery.
+- [`104-pgmq.md`](./104-pgmq.md) — pgmq, a queue extension whose `read` is a `FOR UPDATE SKIP LOCKED` query with a visibility timeout.
 - [`01-syntax-ddl.md`](./01-syntax-ddl.md) — per-`ALTER TABLE`-variant lock mode matrix.
 - [`37-constraints.md`](./37-constraints.md) — `ALTER TABLE` constraint variants and their lock modes.
 
@@ -797,3 +805,9 @@ The `source` column tells you whether each value is from `postgresql.conf`, `ALT
 - PostgreSQL 16 release notes. https://www.postgresql.org/docs/release/16.0/
 - PostgreSQL 17 release notes. https://www.postgresql.org/docs/release/17.0/
 - PostgreSQL 18 release notes. https://www.postgresql.org/docs/release/18.0/
+
+[^pg19-max-locks]: PostgreSQL 19 release notes (RC2), Migration: *"Change default of `max_locks_per_transaction` from 64 to 128... effectively settings must now be doubled to match their capacity in previous releases."* https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION ; docs: https://www.postgresql.org/docs/19/runtime-config-locks.html
+
+[^pg19-log-lock-waits]: PostgreSQL 19 release notes (RC2): *"Enable server variable `log_lock_waits` by default."* https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MONITORING ; docs: https://www.postgresql.org/docs/19/runtime-config-logging.html
+
+[^pg19-stat-lock]: PostgreSQL 19 release notes (RC2), System views: new `pg_stat_lock` (and `pg_stat_get_lock()`). https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-SYSTEM-VIEWS

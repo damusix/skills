@@ -1,6 +1,6 @@
 # pgvector — Vector Similarity Search
 
-`pgvector` extension. Adds `vector`, `halfvec`, `sparsevec` types + HNSW and IVFFlat indexes for approximate nearest-neighbor search. Six distance operators: `<->` L2, `<=>` cosine, `<#>` negative inner product, `<+>` L1 (taxicab), `<~>` hamming (bit), `<%>` jaccard (bit). Latest version **0.8.2** (2026-02-25). External extension — not in core PostgreSQL.
+`pgvector` extension. Adds `vector`, `halfvec`, `sparsevec` types + HNSW and IVFFlat indexes for approximate nearest-neighbor search. Six distance operators: `<->` L2, `<=>` cosine, `<#>` negative inner product, `<+>` L1 (taxicab), `<~>` hamming (bit), `<%>` jaccard (bit). Latest version **0.8.7** (2026-10-01). Run 0.8.7+: 0.8.3 fixed possible HNSW index corruption during vacuum, and 0.8.6/0.8.7 fixed IVFFlat build buffer overflows. External extension — not in core PostgreSQL.
 
 ## Table of Contents
 
@@ -354,15 +354,23 @@ PG14-PG18 release notes contain **zero pgvector items** — pgvector is wholly e
 | 0.6.0 | 2024-01-29 | Parallel HNSW builds — 8× speedup with 8 workers |
 | 0.7.0 | 2024-04-29 | `halfvec` (float16), `sparsevec`, `binary_quantize()`, `<+>` L1 distance, `<~>` hamming, `<%>` jaccard, `bit_hamming_ops`, `bit_jaccard_ops`, L1 indexing for HNSW |
 | 0.8.0 | 2024-10-30 | Iterative index scans (`hnsw.iterative_scan`, `ivfflat.iterative_scan`), `hnsw.max_scan_tuples`, `hnsw.scan_mem_multiplier`, `ivfflat.max_probes` |
-| 0.8.1 | 2025-08-12 | Bug fixes; PG18 compatibility |
-| 0.8.2 | 2026-02-25 | Buffer-overflow fixes, Windows improvements (latest at planning time) |
+| 0.8.1 | 2025-09-04 | PG18 support; faster `binary_quantize` |
+| 0.8.2 | 2026-02-25 | Buffer-overflow fixes, Windows `install` target, `Index Searches` in PG18 `EXPLAIN` |
+| 0.8.3 | 2026-06-17 | **Fixed possible HNSW index corruption during vacuum**; Hamming/Jaccard regression on PG18 |
+| 0.8.4 | 2026-06-30 | `hnsw graph not repaired` vacuum error; IVFFlat build exceeding `maintenance_work_mem` |
+| 0.8.5 | 2026-07-08 | Lower IVFFlat build memory on small tables |
+| 0.8.6 | 2026-07-29 | IVFFlat build overflow on 32-bit; array-to-`sparsevec` cast limit; IVFFlat nested-loop scan memory |
+| 0.8.7 | 2026-10-01 | IVFFlat build buffer overflow (#1036); `avg` error on zero rows |
+
+> [!WARNING] pgvector 0.9.0 drops PG13 and PG14
+> The unreleased 0.9.0 on master lists "Dropped support for Postgres 13 and 14" (plus async I/O for index scans and index-vacuum progress reporting). PG14 clusters stay on 0.8.x. Do not treat 0.9.0 features as released until it is tagged.[^2]
 
 Verify your installed version:
 
     SELECT extversion FROM pg_extension WHERE extname = 'vector';
 
 > [!NOTE] PostgreSQL 14 / 15 / 16 / 17 / 18
-> Zero pgvector-related items in any PG14-PG18 release notes. pgvector is provided entirely by the external extension and tracks PostgreSQL APIs across all five supported majors (verified at planning time against pgvector v0.8.2). After `pg_upgrade`, ensure `pgvector` package version supporting target PG major is installed before starting new cluster.
+> Zero pgvector-related items in any PG14-PG18 release notes. pgvector is provided entirely by the external extension and tracks PostgreSQL APIs across all five supported majors (verified 2026-11-14 against pgvector v0.8.7; no released version claims PG19 support yet). After `pg_upgrade`, ensure `pgvector` package version supporting target PG major is installed before starting new cluster.
 
 ## Recipes
 
@@ -708,11 +716,12 @@ Common stacks:
 
 22. **No `vector` array type indexed.** `vector[]` (array of vectors) cannot be HNSW/IVFFlat indexed. For multi-vector documents, use one row per vector (with foreign key back to document).
 
-23. **Latest pgvector version not always compatible with latest PG.** Verify via [pgvector CHANGELOG][changelog] before upgrading PostgreSQL major. As of 2026-05-14, pgvector 0.8.2 supports PG14-PG18.
+23. **Latest pgvector version not always compatible with latest PG.** Verify via [pgvector CHANGELOG][changelog] before upgrading PostgreSQL major. As of 2026-11-14, pgvector 0.8.7 supports PG13+ (README); 0.9.0 will drop PG13 and PG14.
 
 ## See Also
 
 - [`20-text-search.md`](./20-text-search.md) — linguistic FTS via `tsvector` (complement to vector for hybrid search)
+- [`103-pg-textsearch.md`](./103-pg-textsearch.md) — BM25 keyword ranking; its RRF recipe fuses BM25 and pgvector results for hybrid search
 - [`22-indexes-overview.md`](./22-indexes-overview.md) — index-type decision matrix
 - [`24-gin-gist-indexes.md`](./24-gin-gist-indexes.md) — GIN/GiST mechanics that informed pgvector index design
 - [`26-index-maintenance.md`](./26-index-maintenance.md) — REINDEX CONCURRENTLY for vector indexes
@@ -739,9 +748,9 @@ Common stacks:
 
 [^1]: pgvector README. <https://github.com/pgvector/pgvector> — verbatim quotes for vector storage limits, halfvec storage, sparsevec storage, HNSW vs IVFFlat trade-off paragraph, IVFFlat *"Add the data first, then create the index"* warning. WebFetch-verified at planning time.
 
-[^2]: pgvector CHANGELOG.md. <https://github.com/pgvector/pgvector/blob/master/CHANGELOG.md> — per-version feature attributions: 0.5.0 HNSW (2023-08-28), 0.6.0 parallel HNSW build (2024-01-29), 0.7.0 halfvec + sparsevec + binary_quantize + L1 + hamming + jaccard (2024-04-29), 0.8.0 iterative scans (2024-10-30), 0.8.2 latest at planning time (2026-02-25). WebFetch-verified.
+[^2]: pgvector CHANGELOG.md. <https://github.com/pgvector/pgvector/blob/master/CHANGELOG.md> — per-version feature attributions: 0.5.0 HNSW (2023-08-28), 0.6.0 parallel HNSW build (2024-01-29), 0.7.0 halfvec + sparsevec + binary_quantize + L1 + hamming + jaccard (2024-04-29), 0.8.0 iterative scans (2024-10-30), 0.8.3–0.8.7 bug-fix releases (2026-06-17 to 2026-10-01), 0.9.0 unreleased (drops PG13/14). Re-checked 2026-11-14.
 
-[^3]: pgvector GitHub releases (via gh API tags). Latest version 0.8.2 confirmed 2026-02-25 commit cab9da7. WebFetch-verified.
+[^3]: pgvector GitHub releases (via gh API tags). Tags only, no GitHub Releases objects. Latest tag v0.8.7 (2026-10-01), checked 2026-11-14.
 
 [^4]: PostgreSQL 14 release notes. <https://www.postgresql.org/docs/14/release-14.html> — verified ZERO pgvector-related items. WebFetch-verified.
 

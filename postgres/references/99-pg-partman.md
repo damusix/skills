@@ -402,7 +402,14 @@ pg_partman is wholly external. **All five PG major release notes (PG14 / PG15 / 
 | 5.2.0 | 2024-11-22 | UUIDv7 + custom-encoded methods for time-based partitioning. Microsecond epoch precision. **Superuser requirement removed.** `default_table` column removed from `part_config` (kept as `create_parent()` arg). Control column may be NULL (with care). |
 | 5.3.0 | 2025-10-09 | New `partition_data_async()` for smaller batched moves out of default partition (time-based only). `p_ignored_columns` support. UUID partitioning support in `partition_data_time()` / `_proc()`. |
 | 5.4.0 | 2026-01-05 | Renamed `create_parent()` → `create_partition()` + `create_sub_parent()` → `create_sub_partition()` (old names retained). New `config_cleanup()` strips pg_partman state while leaving partitioned table intact. `p_ignore_infinity` parameter for default-table handling. |
-| 5.4.3 | 2026-03-05 | Latest stable at planning time. Toast inheritance from template; fixes 5.4.2 control-file version-mismatch bug. |
+| 5.4.1 | 2026-02-09 | Secure `search_path` on all functions; procedures schema-qualify object calls. |
+| 5.4.3 | 2026-03-05 | Toast inheritance from template; fixes 5.4.2 control-file version-mismatch bug. |
+| **5.5.0** | **2026-07-22** | **Security release, breaking defaults.** Latest stable. See warning below. New `part_config` columns `detach_before_drop` (detach then drop, for partition sets referenced by foreign keys) and `maintenance_role` (RLS on config tables). Child tables inherit per-column statistics targets. One failing partition set no longer aborts maintenance for the others (warning logged, `last_run` set to NULL). |
+
+> [!WARNING] pg_partman 5.5.0 security changes
+> - The default of `pg_partman_bgw.role` is now `partman_maintainer`. If you never set it explicitly, the background worker errors until that role exists with the needed privileges. If you set it to a superuser role, upstream "HIGHLY" advises switching to a non-superuser role.
+> - With a retention schema (`retention_schema`), that schema must be owned by the role that owns the child tables.
+> - Fixes SQL-injection / privilege-escalation paths in the time encoder/decoder functions, `pg_jobmon` integration, and template-table property inheritance (CVE IDs listed in the CHANGELOG). Upgrade with `ALTER EXTENSION pg_partman UPDATE TO '5.5.0'`.[^2]
 
 > [!NOTE] All five PG majors contain ZERO pg_partman release-note items
 > Verified at planning time across PG14 / PG15 / PG16 / PG17 / PG18 release notes. Any version-specific behavior change comes from pg_partman's own release cadence, not from PG. If a tutorial claims "PG18 introduced partman feature X" — verify against [pg_partman CHANGELOG.txt][^2] directly.
@@ -768,6 +775,7 @@ SELECT partman.config_cleanup(p_parent_table := 'public.events');
 - [86-pg-upgrade.md](./86-pg-upgrade.md) — pg_partman binary must exist on target cluster before pg_upgrade
 - [92-kubernetes-operators.md](./92-kubernetes-operators.md) — operator-managed partman extension
 - [96-timescaledb.md](./96-timescaledb.md) — TimescaleDB as alternative for time-based partitioning automation; 96's Decision Matrix cites 99 as the native-partitioning alternative
+- [104-pgmq.md](./104-pgmq.md) — pgmq partitioned queues delegate partition creation and retention to pg_partman
 - [98-pg-cron.md](./98-pg-cron.md) — canonical scheduler for `run_maintenance_proc()`
 - [100-pg-versions-features.md](./100-pg-versions-features.md) — PG14 minimum requirement and version-gated features affecting partman behavior
 - [101-managed-vs-baremetal.md](./101-managed-vs-baremetal.md) — pg_partman in managed-Postgres allowlists
@@ -776,7 +784,7 @@ SELECT partman.config_cleanup(p_parent_table := 'public.events');
 ## Sources
 
 [^1]: pg_partman README — https://github.com/pgpartman/pg_partman (PG14+ requirement, license, install)
-[^2]: pg_partman CHANGELOG.txt — https://github.com/pgpartman/pg_partman/blob/master/CHANGELOG.txt (per-version timeline 4.x → 5.4.3)
+[^2]: pg_partman CHANGELOG — https://github.com/pgpartman/pg_partman/blob/master/CHANGELOG.md (per-version timeline 4.x → 5.5.0; 5.5.0 security notes checked 2026-11-14)
 [^3]: pg_partman docs — https://github.com/pgpartman/pg_partman/blob/master/doc/pg_partman.md (function signatures, `part_config` columns, parameters)
 [^4]: pg_partman howto — https://github.com/pgpartman/pg_partman/blob/master/doc/pg_partman_howto.md (template-table pattern, sub-partitioning)
 [^5]: pg_partman 5.0.0 upgrade doc — https://github.com/pgpartman/pg_partman/blob/master/doc/pg_partman_5.0.0_upgrade.md (v4 → v5 migration steps)

@@ -38,6 +38,9 @@ Load this file when:
 > [!WARNING] JIT was introduced in PG11 and defaulted ON in PG12 — not PG12 introduced
 > A common misconception attributes "JIT introduction" to PG12. **PG11** added JIT (default `off`); **PG12** flipped the default to `on`. Verbatim PG11 release-note quote: *"Add Just-in-Time (JIT) compilation of some parts of query plans to improve execution speed (Andres Freund). This feature requires LLVM to be available. It is not currently enabled by default, even in builds that support it."*[^pg11-jit] Verbatim PG12 release-note quote: *"Enable Just-in-Time (JIT) compilation by default, if the server has been built with support for it (Andres Freund)."*[^pg12-default]
 
+> [!WARNING] PostgreSQL 19
+> PostgreSQL 19 changes `jit` to be disabled by default; the documented default is `off`. The release notes state that this change requires sites that run many large analytical queries to enable JIT manually (for example `ALTER SYSTEM SET jit = on;` or per role). The "on by default since PG12" statements in this file hold for PG12–18.[^pg19-jit-default]
+
 > [!WARNING] LLVM version floor rises with each major
 > JIT requires `--with-llvm` at build time. The minimum LLVM version is **not constant across PG majors** — building or running with too old an LLVM silently produces a server with `jit_provider = ''` (empty) and `SHOW jit;` returns `off` regardless of the GUC setting. Floors: **PG16 = LLVM 3.9+**, **PG17 = LLVM 10+** (verbatim *"Require LLVM version 10 or later (Thomas Munro)"*[^pg17-llvm10]), **PG18 = LLVM 14+** (verbatim *"If LLVM is enabled, require version 14 or later (Thomas Munro)"*[^pg18-llvm14]). On `pg_upgrade` to PG17 or PG18, the new server binary may refuse to JIT-compile if the host still has only an older LLVM installed.
 
@@ -49,7 +52,7 @@ Load this file when:
 
 PostgreSQL's JIT engine rests on five rules. Each rule names a misconception that surfaces in production tuning conversations.
 
-1. **JIT is opt-in at build time, on by default at runtime since PG12.** The PostgreSQL distribution does not include LLVM. A binary built **without** `--with-llvm` cannot JIT-compile anything; the `jit` GUC silently has no effect. To verify your build supports JIT: `SELECT pg_jit_available();` returns `true` only if the JIT provider library loaded successfully. Distributions vary: the official Debian/Ubuntu `postgresql-NN` packages ship JIT in a separate `postgresql-NN-jit` package on some channels; the official Docker image includes JIT in the main image. Verify before tuning.[^pg-jit-available]
+1. **JIT is opt-in at build time, and on by default at runtime in PG12–18 (off by default again in PG19).** The PostgreSQL distribution does not include LLVM. A binary built **without** `--with-llvm` cannot JIT-compile anything; the `jit` GUC silently has no effect. To verify your build supports JIT: `SELECT pg_jit_available();` returns `true` only if the JIT provider library loaded successfully. Distributions vary: the official Debian/Ubuntu `postgresql-NN` packages ship JIT in a separate `postgresql-NN-jit` package on some channels; the official Docker image includes JIT in the main image. Verify before tuning.[^pg-jit-available]
 
 2. **JIT decision is per-query, made at plan time, based on the planner's total cost estimate.** The verbatim docs rule: *"the total estimated cost of a query ... is used. The estimated cost of the query will be compared with the setting of jit_above_cost. If the cost is higher, JIT compilation will be performed."*[^jit-decision] Three independent cost thresholds (`jit_above_cost`, `jit_inline_above_cost`, `jit_optimize_above_cost`) each gate one phase. The decision is at **plan time, not execution time** — for prepared statements with generic plans, the GUC values **at PREPARE time** apply, not the values at EXECUTE time.[^jit-decision]
 
@@ -139,7 +142,7 @@ To disable JIT for any individual phase, set its cost GUC to `-1`. Setting `jit_
 
 | GUC | Default | Description | Context |
 |---|---|---|---|
-| `jit` | `on` (PG12+) | *"Determines whether JIT compilation may be used by PostgreSQL, if available."*[^jit-config] Setting `off` disables JIT regardless of cost. | user |
+| `jit` | `on` (PG12–18); `off` (PG19) | *"Determines whether JIT compilation may be used by PostgreSQL, if available."*[^jit-config] Setting `off` disables JIT regardless of cost. | user |
 | `jit_provider` | `llvmjit` | *"This variable is the name of the JIT provider library to be used."*[^jit-provider] Only the built-in `llvmjit` is shipped. | postmaster |
 | `jit_above_cost` | `100000` | Query-cost threshold for JIT compilation. `-1` disables.[^cost-gucs] | user |
 | `jit_inline_above_cost` | `500000` | Query-cost threshold for inlining. `-1` disables inlining. Must be `>= jit_above_cost` to be meaningful.[^cost-gucs] | user |
@@ -248,6 +251,7 @@ This surfaces the queries the cluster has spent the most cumulative JIT time on.
 | **PG16** | **Zero** JIT-specific release-note items confirmed by direct fetch. |
 | **PG17** | Three JIT items: (1) `deform_counter` in `EXPLAIN` output; (2) `jit_deform_count` / `jit_deform_time` in `pg_stat_statements`; (3) LLVM 10+ required. Verbatim quotes: *"Add JIT deform_counter details to EXPLAIN"*[^pg17-deform-explain], *"Add JIT deform_counter details to pg_stat_statements"*[^pg17-deform-pss], *"Require LLVM version 10 or later"*[^pg17-llvm10]. |
 | **PG18** | One JIT item: LLVM 14+ required. Verbatim: *"If LLVM is enabled, require version 14 or later (Thomas Munro)."*[^pg18-llvm14] **No new JIT features.** |
+| **PG19** (RC) | **`jit` default changes from `on` to `off`.** Verbatim: *"Change [JIT] to be disabled by default... This change requires sites that are doing many large analytical queries to manually enable JIT."*[^pg19-jit-default] |
 
 The JIT subsystem has been **structurally stable** since PG12. PG13 and PG16 had zero JIT release-note items. PG14 and PG18 only bumped the LLVM build requirement. The two substantive end-user JIT additions in the PG14-PG18 range are PG15's `pg_stat_statements` counters and PG17's deform-counter split (which appears in two places: `EXPLAIN` output and `pg_stat_statements`).
 
@@ -320,7 +324,7 @@ This forces all three JIT phases for every query in the session. Useful for meas
 
 ```sql
 SELECT pg_jit_available();          -- returns t if --with-llvm was used at build time
-SHOW jit;                            -- the GUC, defaults to on (PG12+)
+SHOW jit;                            -- the GUC, defaults to on in PG12-18 and off in PG19
 SHOW jit_provider;                   -- 'llvmjit' on supported builds, empty otherwise
 -- If pg_jit_available() returns false but jit=on, the binary was built without LLVM.
 ```
@@ -601,3 +605,5 @@ The server logs an error at startup when it cannot load the JIT provider, but do
 [^jit-dev]: PostgreSQL 16 documentation, runtime-config-developer.html — `jit_debugging_support` (default off), `jit_dump_bitcode` (default off), `jit_expressions` (default on, *"Determines whether expressions are JIT compiled, when JIT compilation is activated."*), `jit_profiling_support` (default off), `jit_tuple_deforming` (default on, *"Determines whether tuple deforming is JIT compiled, when JIT compilation is activated."*). https://www.postgresql.org/docs/16/runtime-config-developer.html
 
 [^pg-jit-available]: PostgreSQL 16 documentation, `pg_jit_available()` function — returns `boolean` indicating whether JIT compilation support is available in the current backend. Reference: jit.html chapter and functions-info.html. https://www.postgresql.org/docs/16/jit.html
+
+[^pg19-jit-default]: PostgreSQL 19 release notes (RC2), Migration: *"Change [JIT] to be disabled by default... This change requires sites that are doing many large analytical queries to manually enable JIT."* https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION ; docs: *"jit (boolean)... The default is off."* https://www.postgresql.org/docs/19/runtime-config-query.html

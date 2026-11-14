@@ -645,6 +645,7 @@ The `FOR EACH STATEMENT` trigger with a transition table (`REFERENCING NEW TABLE
 
 - [`41-transactions.md`](./41-transactions.md) — BEGIN/COMMIT/ROLLBACK semantics; idle_in_transaction_session_timeout for stuck listeners; the LISTEN-cannot-be-2PC restriction (gotcha #17).
 - [`43-locking.md`](./43-locking.md) — Queue tables with `FOR UPDATE SKIP LOCKED` for durable work delivery; the canonical Recipe 4 for queue-table consumers.
+- [`104-pgmq.md`](./104-pgmq.md) — pgmq, a packaged queue-table extension with visibility timeouts and archives; optional NOTIFY on insert to wake consumers.
 - [`44-advisory-locks.md`](./44-advisory-locks.md) — Cooperative coordination locks; contrast with NOTIFY for session-singleton patterns. Note that advisory locks do NOT follow transaction semantics (Rule 2 there), while NOTIFY does (Rule 2 here).
 - [`39-triggers.md`](./39-triggers.md) — `AFTER ROW` and `AFTER STATEMENT` triggers calling `pg_notify`; transition tables for set-based notifications.
 - [`74-logical-replication.md`](./74-logical-replication.md) — Cross-cluster propagation of row changes (the durable alternative to LISTEN/NOTIFY when you need cross-cluster delivery).

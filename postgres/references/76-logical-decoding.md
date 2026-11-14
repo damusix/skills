@@ -330,6 +330,9 @@ Common use:
 
 `decoderbufs` is the Debezium connector's preferred plugin for PG ≤ 11; Debezium ≥ 1.x can use `pgoutput` instead — preferred for newer deployments.
 
+> [!WARNING] Minor releases 2026-08-13 / 2026-11-12
+> CVE-2026-6471 (logical decoding could `dlopen` an arbitrary file) added the `output_plugin_libraries` GUC in the 2026-08-13 minors (18.6, 17.11, and the matching older branches). By default only the plugins shipped with PostgreSQL (`pgoutput` and `test_decoding`) are allowed, so third-party plugins such as `wal2json` and `decoderbufs` must be listed, for example `output_plugin_libraries = 'pgoutput, test_decoding, my_trusted_decoder'`.[^minor-18-6] CVE-2026-120145 (2026-11-12 minors) makes the server reject subscriber system catalogs as logical replication targets.[^minor-nov-announce] Full CVE list: <https://www.postgresql.org/support/security/>.
+
 ## Per-version Timeline
 
 | Version | Changes |
@@ -635,7 +638,7 @@ Workaround for the DDL-not-replicated restriction. Cross-reference `40-event-tri
 - [`74-logical-replication.md`](./74-logical-replication.md) — user-facing CREATE PUBLICATION / SUBSCRIPTION model built on logical decoding
 - [`75-replication-slots.md`](./75-replication-slots.md) — slot lifecycle, retention, invalidation, failover slots
 - [`73-streaming-replication.md`](./73-streaming-replication.md) — physical replication; `wal_level = logical` configuration
-- [`33-wal.md`](./33-wal.md) — `wal_level` setting (`logical` required for logical decoding)
+- [`33-wal.md`](./33-wal.md) — `wal_level` setting (`logical` required for logical decoding on PG14–18; PG19 enables it automatically when needed at `replica`)
 - [`40-event-triggers.md`](./40-event-triggers.md) — DDL capture workaround for the DDL-not-replicated restriction
 - [`58-performance-diagnostics.md`](./58-performance-diagnostics.md) — `pg_stat_replication_slots` view, walsender wait events
 - [`72-extension-development.md`](./72-extension-development.md) — writing a custom output plugin (C extension)
@@ -687,3 +690,8 @@ Workaround for the DDL-not-replicated restriction. Cross-reference `40-event-tri
 [^pg18-recvlogical]: PostgreSQL 18 release notes — `pg_recvlogical --enable-failover`, `--enable-two-phase` synonym (Hayato Kuroda); `pg_createsubscriber --enable-two-phase` (Shubham Khanna). https://www.postgresql.org/docs/release/18.0/
 
 [^pg18-2pc]: PostgreSQL 18 release notes — `ALTER SUBSCRIPTION` can change slot 2PC behavior (Hayato Kuroda, Ajin Cherian, Amit Kapila, Zhijie Hou). https://www.postgresql.org/docs/release/18.0/
+
+
+[^minor-18-6]: PostgreSQL 18.6 release notes (2026-08-13). <https://www.postgresql.org/docs/release/18.6/>
+
+[^minor-nov-announce]: PostgreSQL 18.7, 17.12, 16.16, 15.20, 14.25, and 19 RC 2 released (2026-11-12). CVE-2026-120145, "Logical replication can write to subscriber system catalogs". <https://www.postgresql.org/about/news/postgresql-187-1712-1616-1520-1425-and-19-rc-2-released-3442/>

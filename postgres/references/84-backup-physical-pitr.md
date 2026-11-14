@@ -60,7 +60,7 @@ Five rules drive every physical-backup + PITR decision.
 | Full backup + WAL archive for PITR | `pg_basebackup -D /backup -X stream -Fp` + `archive_library` set | stream | -Fp directory with checksums verified | -X stream guarantees WAL-needed-for-consistency captured |
 | Set up standby from base backup | `pg_basebackup -D /var/lib/pgsql/data -X stream -R` | — | `-R` writes `standby.signal` + `primary_conninfo` | -R = zero post-config |
 | Server-side compression (PG15+) | `pg_basebackup --target=server:/backup --compress=server-zstd:5` | client-side | server-side for fewer client-server bytes | client-side compression wastes CPU on backup server |
-| Modern archiving (PG15+) | `archive_library = 'basic_archive'` + `basic_archive.archive_directory` | empty | Custom C archive module via pgBackRest/Barman | `archive_command` shell overhead caps throughput |
+| Modern archiving (PG15+) | `archive_library = 'basic_archive'` + `basic_archive.archive_directory` | empty | Custom C archive module (pgBackRest and Barman document `archive_command` only) | `archive_command` shell overhead caps throughput |
 | Cluster never archived → enable | Set `archive_mode = on`, `wal_level >= replica`, `archive_command` OR `archive_library`, restart | off | both `archive_mode=on` AND archive target | restart required for archive_mode change |
 | PITR to specific timestamp | `recovery_target_time = '2026-05-13 14:00:00 UTC'` | — | Always pair with `recovery_target_action = pause` | pause lets you verify before promotion |
 | PITR to LSN | `recovery_target_lsn = '0/1500000'` | — | Useful when you know exact transaction position | timestamp granularity is COMMIT-record-resolution |
@@ -212,7 +212,7 @@ Refuses to overwrite. `fsync` ensures durability. Production teams use **pgBackR
     archive_library = 'basic_archive'
     basic_archive.archive_directory = '/var/lib/pgsql/archive'
 
-Restart required for `archive_library` change. `basic_archive` is reference module; production uses pgBackRest custom module or similar.
+Restart required for `archive_library` change. `basic_archive` is reference module; production tools (pgBackRest, Barman, WAL-G) document `archive_command`; see [`85-backup-tools.md`](./85-backup-tools.md).
 
 #### Monitoring archiving
 
@@ -336,6 +336,9 @@ The synthetic full backup is a standalone PGDATA directory — restore from it l
 Verbatim purpose[^pg-walsummary]:
 
 > "pg_walsummary is used to print the contents of WAL summary files. These binary files are found with the `pg_wal/summaries` subdirectory of the data directory, and can be converted to text using this tool. This is not ordinarily necessary, since WAL summary files primarily exist to support incremental backup, but it may be useful for debugging purposes."
+
+> [!WARNING] Minor releases 2026-11-12
+> The 2026-11-12 minors (18.7 and the matching older branches) fixed several bugs that corrupted incremental backups, and the 2026-08-13 minors fixed a visibility-map-bit WAL-logging bug. If you use incremental backups (PG17+), take a new full backup after updating: existing incremental backup files should not be trusted.[^minor-18-7][^minor-aug-announce]
 
 ### Per-version timeline
 
@@ -798,3 +801,6 @@ Useful for "restore last full backup with no point-in-time twist" — server pro
 [^pg17-summarize-wal]: PostgreSQL 17 release notes, https://www.postgresql.org/docs/release/17.0/ — verbatim: "Allow the creation of WAL summarization files (Robert Haas, Nathan Bossart, Hubert Depesz Lubaczewski). These files record the block numbers that have changed within an LSN range and are useful for incremental file system backups. This is controlled by the server variables `summarize_wal` and `wal_summary_keep_time`, and introspected with `pg_available_wal_summaries()`, `pg_wal_summary_contents()`, and `pg_get_wal_summarizer_state()`."
 [^pg18-combinebackup-link]: PostgreSQL 18 release notes, https://www.postgresql.org/docs/release/18.0/ — verbatim: "Add pg_combinebackup option `-k`/`--link` to enable hard linking (Israel Barth Rubio, Robert Haas). Only some files can be hard linked. This should not be used if the backups will be used independently."
 [^pg18-verify]: PostgreSQL 18 release notes, https://www.postgresql.org/docs/release/18.0/ — verbatim: "Allow pg_verifybackup to verify tar-format backups (Amul Sul)"
+
+[^minor-18-7]: PostgreSQL 18.7 release notes (2026-11-12), incremental backup fixes. <https://www.postgresql.org/docs/release/18.7/>
+[^minor-aug-announce]: PostgreSQL 18.6, 17.11, 16.15, 15.19, 14.24, and 19 Beta 3 released (2026-08-13). <https://www.postgresql.org/about/news/postgresql-186-1711-1615-1519-1424-and-19-beta-3-released-3365/>
