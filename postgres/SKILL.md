@@ -1,6 +1,6 @@
 ---
 name: postgres
-description: Comprehensive PostgreSQL reference for developers and DBAs covering versions 14–18, plus PostgreSQL 19 changes. Use whenever the user asks about PostgreSQL syntax, DDL/DML/DQL, joins, LATERAL, CTEs, window functions, GROUPING SETS, DISTINCT ON, RETURNING, ON CONFLICT, PL/pgSQL, functions, procedures, triggers, views, materialized views, indexes (B-tree/GIN/GiST/BRIN/Hash/Bloom), MVCC, VACUUM, autovacuum, WAL, TOAST, partitioning, replication (streaming/logical), backup, PITR, HA (Patroni/repmgr), pgBouncer, EXPLAIN ANALYZE, RLS, roles, extensions (pgvector, PostGIS, TimescaleDB, Citus, pg_trgm, pg_cron, pg_textsearch, pgmq), JSON/JSONB, full-text search, BM25 ranking, message queues, UUID, timestamptz, COPY, system catalogs, collations, large objects, cursors, GUC, or any Postgres administration, performance, security, replication, backup, or recovery topic.
+description: PostgreSQL reference (versions 14–18, plus PostgreSQL 19 changes) to consult before writing or changing anything that runs on Postgres. Use for any SQL or database work that touches Postgres, even when the user only asks to build a feature: queries, schemas, DDL, migrations, indexes, constraints, data types, functions, triggers, PL/pgSQL, RLS, and ORM or query-builder code that emits Postgres SQL; reviewing or debugging SQL; EXPLAIN plans; locking, transactions, VACUUM, WAL, partitioning, replication, backup, upgrades, pooling, monitoring, tuning, and security. Also covers JSONB, full-text search, BM25 ranking, message queues, UUIDs, timestamptz, COPY, catalogs, and extensions (pgvector, PostGIS, TimescaleDB, Citus, pg_trgm, pg_cron, pg_partman, pg_textsearch, pgmq). Load it whenever the project uses Postgres (a postgres:// URL, a Postgres driver, .sql files, a migrations folder) and read the matching references before writing SQL, so version differences and known pitfalls are checked first.
 ---
 
 
@@ -23,7 +23,21 @@ When this skill is loaded, follow these steps to answer the user's question:
 3. **Follow See Also.** Each reference ends with a **See Also** section linking related files. Follow it for cross-cutting questions (e.g. a VACUUM question pulls in MVCC, autovacuum, and wraparound).
 4. **Answer using the file.** Lead with the direct answer or code, then version notes via admonitions, then caveats, then citation URLs.
 5. **Never answer from memory alone** when a reference file exists for the topic. The references are the source of truth for this skill; the model's training data is not version-specific enough.
-6. **Assume PG16 unless told otherwise.** If the user does not state a version, answer for PG16 and add a one-line note for differences on PG17/PG18 (and PG19, a release candidate until GA). Only ask the user which version they are on if the answer materially changes across supported versions (e.g. wraparound mechanics, planner statistics behavior, archive_command vs archive_library).
+6. **Assume PG16 unless told otherwise.** If the user does not state a version, answer for PG16 and add a one-line note for differences on PG17/PG18 (and PG19, a release candidate until GA). Only ask the user which version they are on if the answer materially changes across supported versions (e.g. wraparound mechanics, planner statistics behavior, archive_command vs archive_library). When the project pins a version (a Docker tag, a CI service image, `SELECT version()`), use that one.
+
+**When the task is to build, not to answer.** Writing a schema, migration, query, index, trigger, function, or ORM model that targets Postgres goes through the same lookup, before any code is written:
+
+1. **List the Postgres operations the change involves:** new tables, column types, keys and constraints, indexes, `ALTER` on a populated table, JSONB access, bulk loads, queue or locking patterns.
+2. **Route each operation through the Routing Table and read the matching sections.** Common starting points:
+    - Column types: 14, 17, 18, 19.
+    - Keys and constraints: 37, 38.
+    - Indexes: 22, then the type-specific file.
+    - DDL on live tables: 01 for lock levels, 43, and 26 for `CONCURRENTLY`.
+    - Partitioning: 35.
+    - RLS: 47.
+    - Bulk loads: 66.
+    - Work queues: 104 or 43.
+3. **Write the code the references support.** In the reply, name any pitfall the references raised that shaped the code, such as a lock level, a type choice, or a version difference.
 
 > [!NOTE]
 > When a Postgres question does not obviously match a single file, load these cross-cutting entry points first: `references/102-skill-cookbook.md` (symptom-driven recipes spanning multiple files), `references/22-indexes-overview.md` (index decision routing), `references/56-explain.md` (plan reading), `references/64-system-catalogs.md` (catalog introspection).
