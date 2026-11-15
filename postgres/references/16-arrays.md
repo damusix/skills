@@ -48,10 +48,10 @@ If you really want **set semantics** (deduplication, mathematical set operations
 Five rules govern almost every array surprise:
 
 1. **Every type has a parallel array type, auto-created.** `integer` has `_int4` (displayed as `integer[]`). You do not `CREATE TYPE foo[]`; the array type is materialized in `pg_type` automatically with `typarray` pointing back to the element type's OID.[^arrays]
-2. **Arrays are 1-indexed by default, but the lower bound is a property of the value, not the type.** The literal `'[2:4]={a,b,c}'::text[]` has lower bound 2. Built constructors (`ARRAY[1,2,3]`, `array_append`, `array_cat`) always produce lower bound 1; the unusual lower bounds only show up if you wrote a non-default literal or fed `array_fill` an explicit lower-bound argument.[^arrays]
+2. **Arrays are 1-indexed by default, but the lower bound is a property of the value, not the type.** The literal `'[2:4]={a,b,c}'::text[]` has lower bound 2. Concatenation and append/prepend can preserve non-default lower bounds; subscript assignment and `array_fill` can also create them.[^arrays]
 3. **Subscripting an out-of-bounds index returns NULL, not an error.** This is the most frequent source of silent bugs. `(ARRAY[1,2,3])[10]` is `NULL`. Slicing a fully-out-of-range range returns an *empty* zero-dimensional array, not NULL.[^arrays]
 4. **Declared size and dimension are decorative.** `integer[3][3]` does *not* constrain the array to 3×3. The grammar accepts the syntax; the engine ignores the limits and stores any size and any dimensionality. Use a `CHECK` constraint if you actually need a bound.[^arrays]
-5. **Equality is element-wise; "contains" is the `@>` operator.** `a = b` returns true only when every element matches in order. `a @> b` returns true when every element of `b` appears somewhere in `a`. Mixing these up is the second-most-frequent array bug after off-by-one indexing.[^funcs]
+5. **Equality compares elements and dimensionality.** Arrays with the same elements but different dimensions or lower bounds are not equal. `a @> b` tests element containment instead.[^funcs]
 
 Important corollary to rule 2: **PostgreSQL ignores the declared size in `integer[3][3]` and does not enforce dimensionality** — the documented behavior is verbatim: *"PostgreSQL ignores declared size limits and does not enforce the declared number of dimensions."*[^arrays]
 
@@ -168,8 +168,8 @@ Replace a slice:
 
 Append, prepend, concatenate:
 
-    UPDATE t SET tags = tags || 'new'         WHERE id = 1;   -- append
-    UPDATE t SET tags = 'first' || tags       WHERE id = 1;   -- prepend
+    UPDATE t SET tags = array_append(tags, 'new')  WHERE id = 1;
+    UPDATE t SET tags = array_prepend('first', tags) WHERE id = 1;
     UPDATE t SET tags = tags || ARRAY['x','y'] WHERE id = 1;  -- concat
     UPDATE t SET tags = array_append(tags, 'new');             -- function form
 
@@ -191,7 +191,7 @@ This works for 1D arrays only. Multidimensional enlargement is rejected.
 There is **no `array_insert(at_position, value)`** in core PostgreSQL. To insert into the middle, slice around the target index:
 
     -- Insert 'X' at position 3 in arr = {a,b,c,d,e}
-    UPDATE t SET arr = arr[1:2] || 'X' || arr[3:] WHERE id = 1;
+    UPDATE t SET arr = arr[1:2] || ARRAY['X'] || arr[3:] WHERE id = 1;
     -- Result: {a,b,X,c,d,e}
 
 
@@ -200,7 +200,7 @@ There is **no `array_insert(at_position, value)`** in core PostgreSQL. To insert
 
 | Operator | Signature | Meaning | Indexable by |
 |---|---|---|---|
-| `=` | `anyarray = anyarray` | Element-wise equality (same length, all elements `IS NOT DISTINCT FROM` corresponding) | B-tree on whole-array, GIN `array_ops` |
+| `=` | `anyarray = anyarray` | Element-wise equality including dimensions and lower bounds | B-tree on whole-array, GIN `array_ops` |
 | `<>` `<` `<=` `>` `>=` | `anyarray <op> anyarray` | Element-wise comparison, sort by first difference | B-tree |
 | `@>` | `anyarray @> anyarray` | Left contains every element of right (duplicates ignored) | GIN `array_ops` |
 | `<@` | `anyarray <@ anyarray` | Left contained by right | GIN `array_ops` |
@@ -333,16 +333,12 @@ The B-tree index access method **also supports arrays**, but only for whole-arra
 - `gin_pending_list_limit` (default 4 MB per table-level setting `fastupdate=on`): GIN insertions go to a pending list first, flushed to the main index on threshold or VACUUM. High-churn array tables can see lookup-amplification if the pending list grows. Lower the per-table value or set `fastupdate=off` on tables that read more than they write.
 - `gin_fuzzy_search_limit` (default 0 — unlimited): caps the number of rows returned from a single GIN scan. Useful for protecting against runaway predicate-popular queries.
 
-**Functional GIN on an unnested array** lets you index just the elements when the array contains structures:
-
-    -- For text[] of structured tokens, normalize lowercase
-    CREATE INDEX ON posts USING gin (LOWER(tags::text)::text[]);
-
+**Functional GIN on a derived array** can index an immutable expression matching the query:
     -- Or for queries on a derived array
     CREATE INDEX ON events USING gin ((string_to_array(LOWER(tags_csv), ',')));
 
 > [!NOTE] PostgreSQL 18
-> GIN index builds (initial `CREATE INDEX` and `REINDEX`) can be parallel.[^pg18-gin-parallel] No code change required — `max_parallel_maintenance_workers > 0` is sufficient.
+> GIN index builds can use parallel workers.[^pg18-gin-parallel] Worker limits, available workers, memory budget, and the cost model determine whether workers are requested and launched. Concurrent builds parallelize only the first table scan.
 
 **The intarray contrib extension** offers operators (`&&`, `@>`, `<@`) that work only on integer arrays without NULLs, with GIN (`gin__int_ops`) and GiST (`gist__int_ops`, `gist__intbig_ops`) operator classes. From the docs: *"The operators `&&`, `@>` and `<@` are equivalent to PostgreSQL's built-in operators of the same names, except that they work only on integer arrays that do not contain nulls, while the built-in operators work for any array type. This restriction makes them faster than the built-in operators in many cases."*[^intarray] Reach for it when you have a hot, large integer-array workload with no NULLs; otherwise stick with the built-in `array_ops`.
 
@@ -425,7 +421,7 @@ The `ORDER BY` inside `array_agg` is **not optional for determinism**. Without i
 
     -- Insert 'X' at position 3 in arr = {a,b,c,d,e}
     UPDATE t
-       SET arr = arr[1:2] || 'X' || arr[3:]
+       SET arr = arr[1:2] || ARRAY['X'] || arr[3:]
      WHERE id = 1;
     -- Result: {a, b, X, c, d, e}
 
@@ -455,13 +451,14 @@ Pattern matching against elements is **not GIN-indexable** with `array_ops`. For
 ### Recipe 7 — Deduplicate while preserving order
 
 
-    -- Custom: built-in array_distinct does not exist
-    SELECT array_agg(DISTINCT elem) AS unique_unordered,
-           array_agg(elem ORDER BY pos) AS preserve_order_with_dups,
-           (SELECT array_agg(elem ORDER BY MIN(pos))
-              FROM unnest(arr) WITH ORDINALITY AS u(elem, pos)
-              GROUP BY elem) AS dedup_preserve_first_seen
-      FROM t;
+    SELECT t.id,
+           ARRAY(
+               SELECT elem
+               FROM unnest(t.arr) WITH ORDINALITY AS u(elem, pos)
+               GROUP BY elem
+               ORDER BY min(pos)
+           ) AS dedup_preserve_first_seen
+    FROM t;
 
 PostgreSQL does not ship an `array_distinct` function. The standard idiom is `array_agg(DISTINCT ...)`, but it loses ordering. For order-preserving dedup, group by element with `MIN(pos)`.
 
@@ -477,11 +474,10 @@ PostgreSQL does not ship an `array_distinct` function. The standard idiom is `ar
 
     -- None of these tags present:
     WHERE NOT (tags && ARRAY['draft','deleted'])
-    -- Equivalent:
-    WHERE tags @> ARRAY[]::text[]   -- (trivially true; do not use)
+    -- For non-NULL tags without NULL elements:
     WHERE NOT EXISTS (SELECT 1 FROM unnest(tags) AS t WHERE t = ANY (ARRAY['draft','deleted']))
 
-The `NOT (a && b)` form is the most readable — and it is GIN-indexable on `a`.
+`NOT (a && b)` is readable, but the negated predicate is not itself a GIN index condition. NULL arrays or NULL elements require explicit semantics.
 
 
 ### Recipe 9 — Compute "is this row missing any required tag?"

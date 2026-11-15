@@ -1,6 +1,6 @@
 # MVCC Internals
 
-PostgreSQL implements concurrency control via **multi-version concurrency control** (MVCC). Every row that has ever existed is identified by an `(xmin, xmax)` pair stamped into its tuple header. A reading transaction picks a *snapshot* — a frozen point-in-time view of which transactions have committed — and answers visibility questions by comparing each tuple's `(xmin, xmax)` against that snapshot. There is no row-level read lock; readers and writers do not block each other.
+PostgreSQL implements concurrency control via **multi-version concurrency control** (MVCC). Heap tuple versions carry transaction identifiers in their headers. A snapshot records which transactions were in progress, and PostgreSQL combines that information with transaction status, command IDs and tuple flags to decide visibility. Ordinary reads and writes generally do not block one another.
 
 Data-structure view of MVCC: how tuples and snapshots are laid out and how the visibility decision is computed. Operational counterparts: `28-vacuum-autovacuum.md` for dead-tuple reclamation, `29-transaction-id-wraparound.md` for the 32-bit XID counter and freeze process, `30-hot-updates.md` for in-place UPDATE optimization, `42-isolation-levels.md` for snapshot semantics under Read Committed / Repeatable Read / Serializable, and `43-locking.md` for explicit locks.
 
@@ -45,9 +45,9 @@ Five rules that drive every gotcha downstream:
 
 1. **Every tuple has `xmin` (the XID that created it) and `xmax` (the XID that deleted/updated it, or 0).** An `UPDATE` is logically a `DELETE` of the old tuple followed by an `INSERT` of the new one; the old tuple gets its `xmax` stamped and a new tuple is written with a fresh `xmin`. This is the same machinery for inserts, updates, and deletes — there is no in-place update of a row's user-visible data without writing a new tuple.[^mvcc-intro][^page-layout]
 2. **A snapshot is `(xmin, xmax, xip[])` — the set of "what was running and what had already committed when I took this snapshot."** Visibility is a *function* of the tuple's `xmin` / `xmax` evaluated against the reader's snapshot; nothing about the tuple changes when a transaction commits. The same tuple is visible to one reader and invisible to another depending on whose snapshot you ask.[^current-snapshot]
-3. **`(xmin, xmax)` are bare 32-bit XIDs.** Wraparound is real, finite, and must be prevented by freezing. The `FrozenTransactionId` sentinel marks a tuple as "older than every normal XID, always visible." Freezing is what VACUUM does. See [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md).[^routine-vacuuming]
+3. **Heap transaction IDs are 32-bit XIDs.** Wraparound must be prevented by freezing. On supported versions freezing normally sets infomask bits and preserves the original `xmin`, treating it as older than every normal XID. See [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md).[^routine-vacuuming]
 4. **Reading never blocks writing; writing never blocks reading.** A `SELECT` does not take row-level locks. Two concurrent `UPDATE`s on the same row conflict, but a `SELECT` against an actively-being-updated row simply sees the pre-update version (under Read Committed at the start of the statement; under Repeatable Read at the start of the transaction).[^mvcc-intro][^iso]
-5. **A tuple cannot be reclaimed while any running transaction's snapshot could still see it.** Even a tuple whose `xmax` committed long ago stays in the heap if even one open transaction has a snapshot from before that commit. The cluster-wide *xmin horizon* — the minimum `xmin` across every running transaction, replication slot, and prepared transaction — gates reclamation. Long-running transactions cause bloat cluster-wide.[^routine-vacuuming]
+5. **VACUUM must preserve versions visible to relevant snapshots.** Long-running transactions, prepared transactions, replication slots and standby feedback can delay cleanup. Horizon scope depends on whether the relation is database-local or shared.[^routine-vacuuming]
 
 ## Syntax / Mechanics
 
@@ -113,12 +113,12 @@ Quick decoder via pageinspect — given a 16-bit infomask integer, expand to sym
 
 ### The visibility rule
 
-A heap tuple is visible to a transaction `T` (whose snapshot is `S`) if and only if:
+A simplified visibility rule for a tuple created by another transaction:
 
-1. `t_xmin` is in a state that `S` considers "committed and earlier" — i.e. `t_xmin` is committed in CLOG, `t_xmin < S.xmax`, and `t_xmin` is not in `S.xip` (the active-transactions array).
-2. **AND** either `t_xmax = 0` (the tuple has not been deleted or row-locked), or `t_xmax` is in a state that `S` considers "not yet committed" — i.e. `t_xmax` is still running (in `S.xip`), `t_xmax >= S.xmax`, or `t_xmax` aborted in CLOG.
+1. Its inserting transaction must have committed before the snapshot and must not be in progress in that snapshot.
+2. A committed delete or update visible to the snapshot makes the old version invisible. An aborted, in-progress, or later deletion does not. A lock-only `xmax` does not delete the tuple.
 
-A tuple's `xmax = T_self` always sees its own deletion (under Read Committed) — handled by the `cmin/cmax` (command-ID) check, which is one level below `xid`-level visibility and is what makes `RETURNING *` after a `DELETE` return the deleted rows from the current statement's frame.
+Own writes, command IDs, subtransactions, frozen tuples and MultiXacts require additional handling. See the version-pinned implementation in [`heapam_visibility.c`](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/access/heap/heapam_visibility.c).
 
 The Read Committed and Repeatable Read snapshots come from different *moments in time* but use the same visibility rule. The verbatim docs definition:
 
@@ -178,11 +178,11 @@ The first time a backend evaluates `t_xmin` or `t_xmax` against CLOG and determi
 Hint bits are:
 
 - **Set asynchronously and lazily.** The first reader after commit pays a small per-tuple cost to look up CLOG and stamp the bit. Subsequent readers get a CLOG-free fast path.
-- **Not WAL-logged by default** (unless `wal_log_hints = on` or `data_checksums` is enabled — both of which are needed for `pg_rewind` to work correctly; see [`89-pg-rewind.md`](./89-pg-rewind.md)).
+- **Hint-bit page changes can be protected by full-page WAL images** when `wal_log_hints = on` or data checksums are enabled. Either setting satisfies this prerequisite for `pg_rewind`; they are not both required.
 - **Dirty pages.** A pure `SELECT` against just-committed data can dirty pages — the hint-bit update is a heap modification. The first scan after a bulk insert is *much* more expensive than the second; this is why pre-warming after bulk loads can be valuable.
 
 > [!NOTE] PostgreSQL 18
-> Data checksums are now enabled by default in `initdb` for new clusters.[^pg18-checksums] This implies `wal_log_hints` is effectively in force for those clusters — every hint-bit update is WAL-logged. Operationally: the post-bulk-load "first scan" pages still get dirtied, but the WAL volume is paid back by `pg_rewind` and corruption-detection capability. See [`88-corruption-recovery.md`](./88-corruption-recovery.md).
+> Data checksums are enabled by default in `initdb` for new PG18 clusters.[^pg18-checksums] Hint-bit changes can require full-page WAL images; not every individual hint-bit update generates its own WAL record.
 
 ### MultiXact
 
@@ -240,30 +240,20 @@ The `pg_visibility` extension introspects the VM:
 
 ### Dead, live, all-visible, all-frozen — four states
 
-Every tuple in the heap is in one of four states at any moment from the perspective of the cluster's current xmin horizon:
-
-| State | `xmin` state | `xmax` state | Reclaimable? | Counted in `n_live_tup` |
-|---|---|---|---|---|
-| **Live** | committed, ≥ horizon | 0 or aborted | No — still visible | Yes |
-| **Recently dead** | committed | committed, ≥ horizon | No — still visible to some snapshot | No (counted in `n_dead_tup`) |
-| **Dead** | committed | committed, < horizon | Yes — VACUUM can reclaim | No |
-| **Aborted** | aborted | n/a | Yes — never was visible | No |
-
-VACUUM's job is to find tuples in the "dead" state and reclaim them. A tuple is dead iff its `xmax` is committed *and* less than the cluster's xmin horizon — meaning no current or future snapshot can see it.
+VACUUM distinguishes live, recently dead, dead and aborted tuple versions. A committed live tuple may be older or newer than a horizon. A deleted version remains recently dead while some relevant snapshot can see it; a dead or aborted version can eventually be reclaimed. Row locks and MultiXacts require separate interpretation of `xmax`.[^routine-vacuuming]
 
 `pg_stat_all_tables.n_dead_tup` is the planner's estimate of dead tuples; it drives autovacuum scheduling. See [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md).
 
 ### The xmin horizon
 
-The **cluster-wide xmin horizon** is the minimum of:
+Relevant visibility horizons depend on the relation and can be held back by:
 
 1. `pg_stat_activity.backend_xmin` across every running backend (each active transaction's snapshot xmin).
 2. The `xmin` field of every active replication slot (physical and logical).
 3. The `xmin` of every prepared transaction (2PC; see [`41-transactions.md`](./41-transactions.md)).
 4. Standby `xmin` reported via `hot_standby_feedback`, if enabled (see [`77-standby-failover.md`](./77-standby-failover.md)).
-5. Cursors held by `WITH HOLD` cursors across `COMMIT` (see [`13-cursors-and-prepares.md`](./13-cursors-and-prepares.md)).
 
-VACUUM can only reclaim tuples whose `xmax` committed strictly before this horizon. Anything younger is "recently dead" — VACUUM knows it's dead but cannot remove it because some snapshot could still see it.
+Committed deletes newer than the applicable horizon can remain recently dead. Aborted inserts are another source of reclaimable tuples; `xmax` may also represent a lock rather than a delete.
 
 Two backend-level columns expose this directly:
 
@@ -279,20 +269,20 @@ The single most important diagnostic query for "why is VACUUM not reclaiming blo
     ORDER BY age(backend_xmin) DESC
     LIMIT 10;
 
-Whichever PID is at the top — that's the backend whose snapshot is holding the horizon back.
+The oldest listed backend is a candidate, not necessarily the sole blocker. Check prepared transactions, slots and standby feedback as well.
 
 ### The long-running transaction problem
 
-A single transaction that has held a snapshot for hours or days will hold the xmin horizon back for the entire cluster, on every table. Bloat accumulates everywhere — even on tables the long-running transaction has never read.
+A transaction holding an old snapshot can delay cleanup for relevant relations in its database and shared catalogs, even on tables it has not read.
 
-The five xmin horizon sources (§The xmin horizon above) map to four triage targets:
+The horizon sources above map to four triage targets:
 
 | Offender | Symptom | Fix |
 |---|---|---|
 | Idle-in-transaction session | `state = 'idle in transaction'`, `xact_start` very old | `idle_in_transaction_session_timeout = '5min'` |
 | Long-running query | `state = 'active'`, same query for hours | `statement_timeout`; kill via `pg_cancel_backend` |
-| Abandoned replication slot | `pg_replication_slots.active = false`, large `restart_lsn` lag | Drop the slot; see [`75-replication-slots.md`](./75-replication-slots.md) |
-| Stale prepared transaction | Row in `pg_prepared_xacts` from days ago | `ROLLBACK PREPARED 'name'` |
+| Inactive replication slot | Old `xmin` or `catalog_xmin` | Confirm consumer and recovery consequences before dropping the slot |
+| Stale prepared transaction | Row in `pg_prepared_xacts` from days ago | Resolve with the transaction owner; commit or roll back according to the 2PC decision |
 
 The `pg_stat_activity.backend_xmin` diagnostic (above) surfaces the first two; `pg_replication_slots.xmin` and `pg_prepared_xacts` surface the last two.
 
@@ -360,7 +350,7 @@ Reading the output:
     ORDER BY age(backend_xmin) DESC
     LIMIT 5;
 
-The PID at the top of the result is the one bloating every table. `xmin_age` is measured in XIDs, not seconds; an `xmin_age` of 50 million in a write-heavy cluster might be one minute, while in a quiet cluster it might be days.
+The oldest listed backend is a candidate horizon holder. Check the relevant database, replication slots, prepared transactions and standby feedback before intervention. `xmin_age` is measured in XIDs, not seconds.
 
 ### Recipe 3 — Also check replication slots and prepared transactions
 
@@ -431,10 +421,8 @@ Session A again:
 
     -- session A (still in transaction)
     SELECT count(*) FROM orders;                   -- still N — RR snapshot is frozen
-    SELECT pg_visible_in_snapshot(
-        (SELECT pg_current_xact_id_if_assigned()),   -- B's XID hypothetically
-        pg_current_snapshot()
-    );
+    -- To test B's XID, capture B's pg_current_xact_id() before it commits
+    -- and pass that captured xid8 explicitly to pg_visible_in_snapshot.
     COMMIT;
     SELECT count(*) FROM orders;                   -- N+1
 
@@ -443,15 +431,15 @@ This is the experimental demonstration of the visibility rule: the same row is i
 ### Recipe 7 — Verify a tuple is or is not frozen
 
     SELECT
-      ctid,
-      xmin,
-      xmax,
+      t_ctid,
+      t_xmin,
+      t_xmax,
       (heap_tuple_infomask_flags(t_infomask, t_infomask2)).*
     FROM (
       SELECT (heap_page_items(get_raw_page('orders', 0))).*
     ) hp;
 
-A frozen tuple has `HEAP_XMIN_FROZEN` in the flags array. After a `VACUUM FREEZE orders;` followed by re-inspection, all rows on that page should show `HEAP_XMIN_FROZEN`. Alternatively, on PG13+ the raw `xmin` value will be displayed as `2` (`FrozenTransactionId`).
+A frozen tuple has `HEAP_XMIN_FROZEN` among the combined flags. `VACUUM FREEZE` freezes eligible tuples; concurrent snapshots can prevent some from being frozen. Supported versions normally retain the original `xmin`, rather than replacing it with 2.[^routine-vacuuming]
 
 ### Recipe 8 — Measure the impact of hint-bit dirtying after a bulk load
 
@@ -529,9 +517,9 @@ The presence of `HEAP_HOT_UPDATED` (on the old) and `HEAP_ONLY_TUPLE` (on the ne
 
 ## Gotchas / Anti-patterns
 
-1. **`SELECT count(*)` is not free** — it must compute visibility for every row. There is no row-count metadata cached in PG. Use `pg_class.reltuples` (planner estimate) or maintain a counter via triggers if you need cheap counts.
+1. **`SELECT count(*)` is not free.** PostgreSQL must count rows visible to the snapshot, using a table scan or a qualifying index-only scan. `pg_class.reltuples` is only an estimate.
 2. **Idle-in-transaction sessions silently bloat every table.** `idle_in_transaction_session_timeout` should be set to a value short enough to bound bloat — typically 5-10 minutes in OLTP. Without it, a connection-pool client that holds a transaction open while it does external I/O will hold the cluster xmin horizon back for the duration. See `81-pgbouncer.md`.
-3. **`hot_standby_feedback = on` propagates the standby's xmin to the primary.** A long-running query on a standby with feedback on holds the primary's xmin horizon back exactly as if the query were on the primary. Standby reporting queries should be designed to be short, or `hot_standby_feedback` should be off (accepting query cancellations on the standby). See [`77-standby-failover.md`](./77-standby-failover.md).
+3. **`hot_standby_feedback = on` propagates the standby's xmin to the primary.** Long-running standby snapshots can delay cleanup of relevant primary relations. See [`77-standby-failover.md`](./77-standby-failover.md).
 4. **An abandoned replication slot is an indefinite bloat accelerator.** Slots have no built-in timeout. The `max_slot_wal_keep_size` GUC (PG13+) prevents unbounded *WAL* retention but does *not* release the slot's xmin pin. Monitor `pg_replication_slots` and drop slots whose consumer is gone. See [`75-replication-slots.md`](./75-replication-slots.md).
 5. **Hint bits dirty pages on first read.** See §Hint bits above. First `SELECT` after a bulk load is expensive; pre-warm or accept the cost — never benchmark on the first scan.
 6. **`VACUUM FULL` is not "VACUUM but more thorough"** — it rewrites the entire table and takes `ACCESS EXCLUSIVE`. Plain VACUUM marks space reusable; `VACUUM FULL` actually shrinks the relation. Use `pg_repack` or `pg_squeeze` for online table-bloat removal (see [`26-index-maintenance.md`](./26-index-maintenance.md)).
@@ -539,9 +527,9 @@ The presence of `HEAP_HOT_UPDATED` (on the old) and `HEAP_ONLY_TUPLE` (on the ne
 8. **`HEAP_XMIN_COMMITTED` set with `HEAP_XMIN_INVALID` also set means frozen, not contradictory.** Both bits set is the encoding of `HEAP_XMIN_FROZEN`. This trips inspectors who try to interpret the bits independently.
 9. **Subtransaction overflow is silent.** Once a backend has >64 simultaneous subxids, every subsequent visibility check involving its XIDs hits `pg_subtrans`. The cluster-wide symptom is high `BufferContent` lock contention. Cause: `EXCEPTION` blocks in tight loops (one subxact per iteration; rolling back on exception is what creates the subxact). See [`08-plpgsql.md`](./08-plpgsql.md) gotcha #9.
 10. **`old_snapshot_threshold` is gone in PG17+.** Code or documentation that recommends setting it to fight bloat from long-running transactions is obsolete. The right answer is timeouts and slot hygiene.[^pg17-ost]
-11. **MultiXact wraparound is a separate ceiling from XID wraparound.** A foreign-key-heavy workload may hit MultiXact freeze pressure before XID freeze pressure; monitor both `pg_database.datfrozenxid` *and* `pg_database.datminmxid` via `age()`. See [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md).
+11. **MultiXact wraparound is separate from XID wraparound.** Monitor `age(datfrozenxid)` and `mxid_age(datminmxid)`. See [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md).
 12. **`pg_visible_in_snapshot` does not consult CLOG.** It tells you whether the XID was outside the snapshot's active-set when the snapshot was taken, not whether it's currently committed. To check commit status, use `pg_xact_status(xid8)`.[^functions-info]
-13. **Read Committed can see "phantom" inserts mid-statement.** A `SELECT ... FROM big_table` running for 30 seconds sees rows committed up to the statement's start; new inserts committed during the scan are invisible. But a *subsequent* statement in the same transaction will see them, because Read Committed takes a fresh snapshot per statement. See [`42-isolation-levels.md`](./42-isolation-levels.md).
+13. **Read Committed takes a fresh snapshot per statement.** A plain `SELECT` does not see inserts committed during its scan; a subsequent statement can see them.
 14. **The visibility map is conservative.** A bit being unset does not mean the page has invisible rows — it might just mean VACUUM has not yet processed the page. Index-only scans will fall back to heap fetches; this is *correct*, not a bug.[^vm]
 15. **DDL is mostly not MVCC-safe.** `TRUNCATE` and the table-rewriting `ALTER TABLE` forms (e.g., `ALTER COLUMN ... TYPE`) commit instantly visible — concurrent transactions using older snapshots see an empty table or fail. The verbatim docs caveat: *"after the truncation or rewrite commits, the table will appear empty to concurrent transactions, if they are using a snapshot taken before the DDL command committed."*[^mvcc-caveats] See [`01-syntax-ddl.md`](./01-syntax-ddl.md) and [`41-transactions.md`](./41-transactions.md).
 16. **`xmin` overflow at 4 billion is real.** Without freezing, after 2^31 transactions, the modular comparison fails and tuples that should be "old" appear "in the future" — silent corruption. This is what anti-wraparound autovacuum prevents. See [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md).
@@ -549,7 +537,7 @@ The presence of `HEAP_HOT_UPDATED` (on the old) and `HEAP_ONLY_TUPLE` (on the ne
 18. **A snapshot taken inside `pg_dump` will hold the horizon back for the duration of the dump.** Long dumps on hot clusters cause real bloat. Use `pg_dump --jobs` (parallel) or `pg_basebackup` for very large clusters. See [`83-backup-pg-dump.md`](./83-backup-pg-dump.md) and [`84-backup-physical-pitr.md`](./84-backup-physical-pitr.md).
 19. **`SELECT pg_current_xact_id()` *assigns* an XID.** If you only want to check whether the transaction already has one, use `pg_current_xact_id_if_assigned()`.[^functions-info] Calling `pg_current_xact_id()` in a read-only transaction converts it into a writing transaction for XID-allocation purposes.
 20. **TOAST tuples have their own MVCC.** A TOASTed value lives in `pg_toast.pg_toast_<oid>` and has its own `xmin`/`xmax` on the toast chunks. When you DELETE a row, the main heap tuple's `xmax` is set, but the toast chunks become reclaimable independently. See [`31-toast.md`](./31-toast.md).
-21. **The xmin horizon can be held back by an unrelated database in the cluster.** XID wraparound is cluster-wide. A long-running transaction in `db1` holds the horizon back for `db2`'s tables too — every autovacuum on every table in the cluster.
+21. **Horizon scope depends on the relation.** Ordinary database-local tables and shared catalogs have different visibility horizons. Investigate the relevant database, shared catalogs, slots and standby feedback rather than assuming every transaction pins every table cluster-wide.
 22. **`HEAP_HOT_UPDATED` on the old tuple does not mean the row is logically deleted; it means it was replaced via HOT.** The old tuple is still visible to snapshots from before the UPDATE. See [`30-hot-updates.md`](./30-hot-updates.md).
 
 ## See Also
@@ -568,7 +556,6 @@ The presence of `HEAP_HOT_UPDATED` (on the old) and `HEAP_ONLY_TUPLE` (on the ne
 - [`88-corruption-recovery.md`](./88-corruption-recovery.md) — `data_checksums`, `pg_amcheck`
 - [`89-pg-rewind.md`](./89-pg-rewind.md) — WAL logging of hint-bit updates and its interaction with diverged timelines.
 - [`08-plpgsql.md`](./08-plpgsql.md) — subtransaction overflow from `EXCEPTION` blocks in tight loops (gotcha #9).
-- [`13-cursors-and-prepares.md`](./13-cursors-and-prepares.md) — `WITH HOLD` cursors as xmin-horizon holders.
 
 ## Sources
 

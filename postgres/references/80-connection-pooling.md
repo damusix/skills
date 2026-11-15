@@ -47,9 +47,9 @@ Five rules:
 
 2. **Pool sizing formula = active connections, not max connections.** Community wiki rule: `active connections ≈ (CPU cores × 2) + effective_spindle_count`[^wiki-conn]. Verbatim: *"for optimal throughput the number of active connections should be somewhere near ((core_count * 2) + effective_spindle_count)"*. NVMe / fully-cached datasets → spindle term = 0. Pool size of 16-50 typically saturates 8-16-core machine. Bigger pool = lock contention + context switching + memory pressure, not more throughput.
 
-3. **Three pool modes form a feature/throughput dial.** Session mode (one client = one backend for connection lifetime, transparent, expensive). Transaction mode (backend lease per transaction, default for pgBouncer, loses session-level state). Statement mode (lease per statement, breaks multi-statement transactions, rare). Picking transaction over session = ~10-100× connection-reuse multiplier; cost = giving up SET/LISTEN/cursors-WITH-HOLD/advisory-session-locks.
+3. **Three pool modes form a feature/throughput dial.** Session mode leases a backend for the client connection; transaction mode leases one per transaction; statement mode disallows multi-statement transactions. PgBouncer defaults to session mode.
 
-4. **PG17 + libpq close-prepared = transaction-mode prepared statements work.** Pre-PG17 + pgBouncer transaction mode: every prepared statement ties client to backend, defeats pooling. PG17 added `PQclosePrepared()` / `PQclosePortal()`[^pg17-close]; pgBouncer 1.21+ (Oct 2023, supports protocol-level Close even on older servers) tracks named prepared statements across server-side pool members. Transaction-mode + prepared statements no longer mutually exclusive.
+4. **Protocol-level named prepared statements work in transaction mode with PgBouncer 1.21+ when `max_prepared_statements` is nonzero.** PostgreSQL 17 libpq's close functions are not a prerequisite. SQL `PREPARE` remains session-bound.
 
 5. **Idle-in-transaction kills cluster; idle-outside-transaction merely annoys.** `idle_in_transaction_session_timeout` (PG default 0 = disabled) kills sessions holding open transactions while idle — these block VACUUM, hold locks, retain xmin horizon. `idle_session_timeout` PG14+ kills idle-not-in-transaction sessions — only annoying (slot held, memory consumed, no horizon impact). Set the former aggressively (30s-5min); set the latter only with explicit pooler-awareness[^idle-session-warning].
 
@@ -60,7 +60,7 @@ Five rules:
 | App workload < 50 concurrent users, short transactions | App-side pool + direct PG, session mode | Adding pgBouncer adds complexity for nothing | Pool overhead > savings |
 | Web app, > 100 concurrent users, short transactions | App-side pool + pgBouncer transaction mode | Session mode for 1000 clients to 50 backends | Transaction mode = mandatory for ratio >10:1 |
 | Need session-level state (SET, LISTEN, advisory locks, temp tables across transactions) | pgBouncer session mode OR direct PG | Transaction mode + SET — breaks silently | Transaction mode disallows SET |
-| Need protocol-level prepared statements + transaction-mode pooling | PG17+ libpq + pgBouncer 1.21+ + `max_prepared_statements > 0` | Pre-PG17 + transaction-mode + named PREPARE | Pre-PG17 ties client to backend |
+| Need protocol-level prepared statements + transaction-mode pooling | pgBouncer 1.21+ + `max_prepared_statements > 0` | SQL-level `PREPARE` in transaction mode | Protocol-level tracking does not require PG17 |
 | Batch jobs with one long transaction each | App-side pool, low pool_size, session mode | Transaction mode (no benefit for one-tx-per-job) | Pooling adds nothing for long single tx |
 | Serverless / Lambda / FaaS with bursty connection storms | pgBouncer or pgcat in front; **never** raw libpq | Each Lambda invocation opening + dropping connection | Fork cost + procarray contention = catastrophic |
 | Multi-tenant SaaS with per-tenant role | Pool per role/tenant or transaction-mode pool with SET LOCAL only | One global pool with SET ROLE on checkout | Wasted server-side memory; pool fragmentation |
@@ -148,7 +148,7 @@ pgBouncer terminology (industry standard)[^pgb-usage]:
 | Transaction | Single transaction | "A server connection is assigned to a client only during a transaction. When PgBouncer notices that transaction is over, the server connection will be put back into the pool." |
 | Statement | Single statement | "Most aggressive method. The server connection will be put back into the pool immediately after a query completes. Multi-statement transactions are disallowed in this mode as they would break the assumption of statement pooling." |
 
-**Default and almost-always-right choice = transaction mode.** Lease per transaction = highest reuse + correct semantics for stateless web requests.
+**PgBouncer defaults to session mode.** Choose transaction mode for workloads that do not rely on unsupported session state.
 
 **Session mode is mandatory** when client code:
 
@@ -226,7 +226,7 @@ Use case: dedicated monitoring + replication + maintenance roles never get locke
 | **awslabs/pgbouncer-fast-switchover** | C (pgBouncer fork) | session / transaction | AWS-maintained | "intercept and programmatically change client queries before they are sent to the server" — adds query rewriting + failover speedup |
 | **App-side pools** | language-native | session-equivalent only | Library-dependent | HikariCP (Java), psycopg pool (Python), node-postgres (Node), pgx (Go) |
 
-**Default recommendation = pgBouncer.** Smallest operational surface, broadest production evidence, transaction mode + PG17 close-prepared = mature. Pgpool-II + pgcat are valid for specific use cases (load balancing, sharding) but heavier.
+**Default recommendation = pgBouncer.** It supports transaction-mode protocol-level named prepared statements from 1.21 when tracking is enabled. Pgpool-II and pgcat are alternatives for different routing needs.
 
 ## Per-Version Timeline
 
@@ -238,8 +238,8 @@ Use case: dedicated monitoring + replication + maintenance roles never get locke
 | PG17 | `PQclosePrepared()` / `PQclosePortal()` libpq functions (Jelte Fennema-Nio)[^pg17-close] — explicit support for pgBouncer-style closing of named prepared statements + portals; pgBouncer 1.21+ (Oct 2023) tracks named prepared statements across pool members via protocol-level Close (not strictly requiring PG17, but PG17 libpq helpers make it canonical for app drivers); `pg_dump`/`pgBouncer` + scram-passthrough improvements; `event_triggers` GUC disables event triggers cluster-wide for debugging (cross-reference [`40-event-triggers.md`](./40-event-triggers.md)) | PG17 release notes, pgBouncer changelog |
 | PG18 | No headline connection-pooling-feature changes; async I/O subsystem reduces per-backend I/O wait[^pg18-aio] | PG18 release notes |
 
-> [!NOTE] PG17 + pgBouncer 1.21 = transaction-mode prepared statements
-> Pre-PG17, transaction-mode + prepared statements = mutually exclusive (each PREPARE ties client to backend). pgBouncer 1.21 (Oct 2023, pre-PG17 GA) added protocol-level named-prepared-statement tracking. PG17 added libpq `PQclosePrepared()` so client drivers can portably close prepared statements. Set `max_prepared_statements = 100-200` in pgBouncer config[^pgb-changelog]:
+> [!NOTE] PgBouncer 1.21+ transaction-mode prepared statements
+> PgBouncer tracks protocol-level named prepared statements when `max_prepared_statements` is nonzero. This does not require PG17 libpq; SQL-level `PREPARE` is not tracked.[^pgb-changelog]
 >
 > *"Add support for protocol-level named prepared statements! This is probably one of the most requested features for PgBouncer ... In synthetic benchmarks this feature was able to increase query throughput anywhere from 15% to 250%, depending on the workload."*
 
@@ -274,10 +274,10 @@ default_pool_size = 20                  # ~ (cores × 2) + 4 buffer
 max_client_conn = 2000                  # 100× backend count
 reserve_pool_size = 5
 reserve_pool_timeout = 3
-server_reset_query = DISCARD ALL        # Clean state between client leases
+server_reset_query = DISCARD ALL        # Used in session mode by default
 server_idle_timeout = 600                # Close backend idle for 10 min
 
-max_prepared_statements = 200            # PG17+ libpq + pgBouncer 1.21+
+max_prepared_statements = 200            # pgBouncer 1.21+; verify version default
 ```
 
 Three-config-block convention: postgresql.conf + pgBouncer config + app driver connection string. App connects to `127.0.0.1:6432` not `:5432`.
@@ -389,7 +389,7 @@ ALTER ROLE batchjobs SET idle_in_transaction_session_timeout = '5min';
 ```
 
 > [!NOTE] Per-role + pgBouncer transaction mode caveat
-> Per-role `ALTER ROLE SET` values do NOT propagate across pgBouncer transaction-mode pool returns. pgBouncer's `server_reset_query = DISCARD ALL` may clear them. Cross-reference [`46-roles-privileges.md`](./46-roles-privileges.md) gotcha #6. Mitigations: (a) make the value cluster-wide in `postgresql.conf`, or (b) set in pgBouncer's `connect_query`, or (c) use `SET LOCAL` per transaction.
+> `ALTER ROLE SET` applies when the PostgreSQL server session logs in as that role. It does not apply per client if PgBouncer uses a forced server user. Use `SET LOCAL` per transaction where client-specific settings are needed. `server_reset_query` is not normally run in transaction mode.
 
 ### Recipe 8 — Migrate from session to transaction mode (verification checklist)
 
@@ -425,7 +425,7 @@ WHERE query ~* 'CREATE\s+TEMP'
 
 Each non-empty result = code change needed before flipping `pool_mode = transaction`.
 
-### Recipe 9 — Verify pgBouncer transaction-mode prepared statements (PG17+)
+### Recipe 9 — Verify pgBouncer transaction-mode prepared statements
 
 ```sql
 -- After enabling max_prepared_statements > 0 in pgBouncer 1.21+
@@ -435,8 +435,8 @@ Each non-empty result = code change needed before flipping `pool_mode = transact
 SHOW STATS;
 SHOW POOLS;
 
--- Server-side verification via pg_stat_statements
--- Same query repeated should show calls > 1 with stable queryid (queryid stable across sessions/clients).
+-- Exercise a named protocol-level prepared statement across transactions
+-- with the actual application driver; check results and pooler errors.
 ```
 
 App drivers using protocol-level extended-query messages (most modern drivers) benefit automatically. SQL-level `PREPARE` still requires session mode.
@@ -526,7 +526,7 @@ Use full `DISCARD ALL` unless you have a specific reason. Faster than reconnecti
 
 4. **`pg_advisory_lock` in transaction-mode pool.** Lock held in backend, but client's next transaction may land on different backend. Lock orphan + correctness bug. Use `pg_advisory_xact_lock`.
 
-5. **SQL-level `PREPARE` / `EXECUTE` in transaction-mode pool.** Prepared name lives only on that backend. Next transaction may not find it. Use protocol-level prepared statements (PG17+ libpq + pgBouncer 1.21+).
+5. **SQL-level `PREPARE` / `EXECUTE` in a transaction-mode pool.** Prepared names live on a backend. Use protocol-level named prepared statements with pgBouncer 1.21+ and nonzero `max_prepared_statements`.
 
 6. **`idle_in_transaction_session_timeout = 0` (default).** Means: any client bug that holds open transaction → VACUUM blocked indefinitely, xmin horizon held back, bloat accumulates. Set to 30s-5min cluster-wide. Setting this GUC is a high-impact, low-risk change for most production deployments; it prevents indefinite transaction holds that silently accumulate bloat.
 
@@ -544,7 +544,7 @@ Use full `DISCARD ALL` unless you have a specific reason. Faster than reconnecti
 
 13. **Application connecting directly to PG when pgBouncer is also deployed.** Bypasses pool entirely. Either remove direct path, or accept dual-connect for specific session-mode workloads.
 
-14. **`max_prepared_statements = 0` (pgBouncer default) + protocol-level prepared statements.** pgBouncer 1.21+ supports them in transaction mode only when this GUC is non-zero. Default zero = feature disabled, every PREPARE re-sent.
+14. **`max_prepared_statements = 0` disables pgBouncer's protocol-level tracking.** It defaults to zero in 1.21–1.23 and 200 since 1.24; set it nonzero for transaction pooling to support named protocol statements.
 
 15. **`max_connections` raise without reboot plan.** Postmaster-context GUC. Requires restart, not reload. Plan capacity ahead.
 

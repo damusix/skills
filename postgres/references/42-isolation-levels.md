@@ -57,7 +57,7 @@ Five rules drive every isolation-level decision:
 
 4. **`SERIALIZABLE` is implemented via SSI (Serializable Snapshot Isolation), not by locking reads.** Verbatim: *"The Serializable isolation level is implemented using a technique known in academic database literature as Serializable Snapshot Isolation, which builds on Snapshot Isolation by adding checks for serialization anomalies."*[^txn-iso] Reads acquire *predicate locks* (`SIReadLock` in `pg_locks`) that don't block other transactions but participate in conflict detection. Verbatim: *"In PostgreSQL these locks do not cause any blocking and therefore can not play any part in causing a deadlock."*[^txn-iso] The cost of `SERIALIZABLE` is the *retry contract*, not blocking.
 
-5. **`SERIALIZABLE` requires applications to retry on SQLSTATE `40001`.** Verbatim: *"It is important that an environment which uses this technique have a generalized way of handling serialization failures (which always return with an SQLSTATE value of '40001')."*[^txn-iso] *"Applications using this level must be prepared to retry transactions due to serialization failures."*[^txn-iso] If your application code cannot wrap its database calls in a retry-from-`BEGIN` loop, you cannot use `SERIALIZABLE` safely. The `DEFERRABLE READ ONLY` form is the *only* SERIALIZABLE shape that cannot abort.
+5. **`SERIALIZABLE` requires applications to retry on SQLSTATE `40001`.** Retry the whole transaction. A `SERIALIZABLE READ ONLY DEFERRABLE` transaction avoids serialization failures after obtaining a safe snapshot, but can still fail for other reasons.[^txn-iso]
 
 > [!WARNING] Five PG majors with zero changes
 > PostgreSQL 14, 15, 16, 17, and 18 release notes contain **zero items** about isolation-level semantics, snapshot model, SSI, predicate locks, or serialization-failure handling. The semantics are stable since the PG9.1 SSI introduction. PG17 did remove `old_snapshot_threshold` (see [`27-mvcc-internals.md`](./27-mvcc-internals.md) gotcha #10) but that was a vacuum/visibility-window setting, not an isolation-level change. If a tutorial claims "PG18 improved SERIALIZABLE," verify against the release notes directly.
@@ -123,21 +123,21 @@ And: *"However, `SELECT` does see the effects of previous updates executed withi
 
 What this means operationally:
 
-- **`UPDATE` re-reads.** When an `UPDATE` finds a row that another transaction modified after the snapshot but before this `UPDATE` reached it, the second `UPDATE` *waits* for the first to commit/rollback, then re-reads the row's latest committed version and re-evaluates its `WHERE` clause against the new version. If the new version still matches, the update proceeds against the *latest* version (not the original snapshot). This is "first-updater-wins" semantics — not a serialization failure, just a brief block.
+- **`UPDATE` re-reads.** When a target row was concurrently modified, the second updater waits and re-evaluates its `WHERE` clause against the latest committed version before proceeding.[^txn-iso]
 - **`SELECT FOR UPDATE` and `SELECT FOR SHARE` follow the same re-read rule.** Verbatim: *"Because of the above rules, it is possible for an updating command to see an inconsistent snapshot: it can see the effects of concurrent updating commands on the same rows it is trying to update, but it does not see effects of those commands on other rows in the database."*[^txn-iso]
 - **No protection against lost updates.** Two concurrent `UPDATE accounts SET balance = balance - 100 WHERE id = 5` are both safe (each takes a row lock and re-reads). But two concurrent `value = balance - 100` reads followed by `UPDATE accounts SET balance = $value WHERE id = 5` *are not* — each computes its own `$value` from its own snapshot and stomps the other.
 - **Phantom rows** can appear between two `SELECT count(*) FROM ... WHERE ...` calls in the same transaction.
 
 ### REPEATABLE READ
 
-A single snapshot is taken at the first query/DML in the transaction and **all** subsequent reads in the transaction see exactly that snapshot — committed-before-snapshot data only, regardless of how many other transactions commit during this transaction.
+A single snapshot is taken at the first query/DML. Subsequent reads see that snapshot plus the transaction's own preceding writes, but not concurrent commits after the snapshot.[^txn-iso]
 
 Verbatim: *"The _Repeatable Read_ isolation level only sees data committed before the transaction began; it never sees either uncommitted data or changes committed by concurrent transactions during the transaction's execution."*[^txn-iso]
 
 What this means:
 
-- **Same-row consistency.** Two `SELECT * FROM t WHERE id = 5` within a transaction always return the same row data.
-- **Phantom prevention.** Two `SELECT count(*) FROM t WHERE owner = 'alice'` always return the same count, even if another transaction commits new matching rows.
+- **Same-row consistency.** Repeated reads see the same concurrent database state, except for this transaction's own writes.
+- **Phantom prevention.** Repeated reads do not see new matching rows committed by concurrent transactions.
 - **`UPDATE` and `DELETE` raise serialization failure if the row was modified by a concurrent committed transaction.** This is the "first-committer-wins" rule. The application receives `ERROR: could not serialize access due to concurrent update` (SQLSTATE `40001`) and must retry the entire transaction from `BEGIN`.
 - **Write skew is still possible.** Two transactions can each `SELECT` a set of rows that satisfy a constraint, then each `UPDATE` a non-overlapping subset, and both commit successfully even though the *combined* effect violates the application's invariant. This is the precise gap that SERIALIZABLE closes.
 
@@ -157,7 +157,7 @@ How SSI works (conceptually, no verbatim source quote available — the academic
 1. Every read in a SERIALIZABLE transaction acquires a **predicate lock** (called `SIReadLock` in PG) on the row(s), page(s), or relation it touched. The granularity is chosen by the executor based on plan shape.
 2. These locks **do not block** other transactions — they only flag a *potential dependency*.
 3. The transaction manager tracks **read-write dependencies** between concurrent transactions. When `T2` writes data that `T1` previously read (or vice versa), an edge is recorded in the dependency graph.
-4. At commit time, if the dependency graph contains a **dangerous structure** (a cycle of read-write conflicts that would imply no serial ordering can produce these results), one transaction is aborted with SQLSTATE `40001`.
+4. PostgreSQL detects dangerous read-write dependency structures and may abort a transaction with SQLSTATE `40001`, including conservatively when an actual cycle is not proven.
 
 Verbatim from the docs: *"To guarantee true serializability PostgreSQL uses _predicate locking_, which means that it keeps locks which allow it to determine when a write would have had an impact on the result of a previous read from a concurrent transaction, had it run first. In PostgreSQL these locks do not cause any blocking and therefore can _not_ play any part in causing a deadlock."*[^txn-iso]
 
@@ -323,7 +323,7 @@ Two important MVCC caveats that surface at every isolation level:
 
 **TRUNCATE and table-rewriting ALTER TABLE are not MVCC-safe.** Verbatim: *"Some DDL commands, currently only TRUNCATE and the table-rewriting forms of ALTER TABLE, are not MVCC-safe. This means that after the truncation or rewrite commits, the table will appear empty to concurrent transactions, if they are using a snapshot taken before the DDL command committed."*[^mvcc-caveats]
 
-A REPEATABLE READ transaction that read 1000 rows from `accounts` may see 0 rows on its next `SELECT` if a `TRUNCATE accounts` committed between them. This is documented behavior, not a bug.
+A REPEATABLE READ transaction with an old snapshot can see an empty table after a concurrent rewrite only if it had not accessed that table before the DDL began. An earlier read holds an `ACCESS SHARE` lock that blocks the rewrite until transaction end.[^mvcc-caveats]
 
 **System catalog access bypasses isolation level.** Verbatim: *"Internal access to the system catalogs is not done using the isolation level of the current transaction. This means that newly created database objects such as tables are visible to concurrent Repeatable Read and Serializable transactions, even though the rows they contain are not."*[^mvcc-caveats]
 
@@ -544,25 +544,7 @@ COMMIT;  -- nothing was written; pure read transaction.
 
 **Why all three flags matter together:** Verbatim — *"The `DEFERRABLE` transaction property has no effect unless the transaction is also `SERIALIZABLE` and `READ ONLY`."*[^set-tx]
 
-For a report that runs hourly via [`pg_cron`](./98-pg-cron.md):
-
-```sql
-SELECT cron.schedule(
-    'hourly-revenue-report',
-    '0 * * * *',
-    $$
-    BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE;
-    INSERT INTO report_revenue (run_at, hourly_total)
-    SELECT now(), sum(amount) FROM transactions
-    WHERE created_at >= date_trunc('hour', now() - interval '1 hour')
-      AND created_at <  date_trunc('hour', now());
-    COMMIT;
-    $$
-);
-```
-
-> [!WARNING] DEFERRABLE READ ONLY transactions can write — to a different transaction
-> The READ ONLY flag means *this transaction* cannot write to non-temp tables. But the canonical reporting pattern often writes the *result* of the report somewhere. Either: (a) write the result into a TEMP table inside the DEFERRABLE READ ONLY transaction and `INSERT INTO permanent_table SELECT * FROM temp_table` in a separate following transaction; or (b) move the write into a separate non-DEFERRABLE transaction (the recipe above's `INSERT INTO report_revenue SELECT ...` form is *not* READ ONLY — fix as needed).
+To persist a report result, compute it in the read-only transaction and write it in a separate transaction. Use a temporary table created before the read-only transaction or return the results to the client; writes to permanent tables are not allowed in a read-only transaction.[^set-tx]
 
 ### Recipe 6 — Set isolation per-session vs per-transaction
 
@@ -633,7 +615,7 @@ COMMIT;
 COMMIT;
 ```
 
-All three sessions saw the *same* committed-rows snapshot. This is what `pg_dump --jobs=N` does internally. Note: SERIALIZABLE snapshot export/import is supported (verbatim from `SET TRANSACTION`), but SERIALIZABLE-using-imported-snapshot transactions cannot become read-write — they're read-only.
+All three sessions use the same snapshot. SERIALIZABLE imports must come from a SERIALIZABLE exporter; a read-write SERIALIZABLE transaction cannot import a snapshot exported by a read-only transaction. See <https://www.postgresql.org/docs/16/sql-set-transaction.html>.
 
 ### Recipe 9 — Inspect predicate locks (SIReadLock)
 
@@ -700,7 +682,10 @@ BEGIN
             TG_TABLE_NAME, current_setting('transaction_isolation')
         USING ERRCODE = 'invalid_transaction_state';
     END IF;
-    RETURN NEW;  -- BEFORE-INSERT/UPDATE/DELETE — pass-through
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
 END $$;
 
 CREATE TRIGGER require_serializable
@@ -774,7 +759,7 @@ If you need SSI guarantees for the report, run it on the primary with `BEGIN ISO
 
 10. **SERIALIZABLE is not supported on hot standby.** Verbatim: *"Support for the Serializable transaction isolation level has not yet been added to hot standby replication targets."*[^mvcc-caveats] BEGIN ISOLATION LEVEL SERIALIZABLE on a standby errors out. Reporting on a standby uses REPEATABLE READ at most, with the documented transient-inconsistency caveat.
 
-11. **TRUNCATE and ALTER TABLE are not MVCC-safe.** Verbatim: *"Some DDL commands, currently only TRUNCATE and the table-rewriting forms of ALTER TABLE, are not MVCC-safe. This means that after the truncation or rewrite commits, the table will appear empty to concurrent transactions, if they are using a snapshot taken before the DDL command committed."*[^mvcc-caveats] A REPEATABLE READ transaction reading a table that another transaction TRUNCATEs may see the table as empty mid-transaction. This is documented behavior, not a bug.
+11. **TRUNCATE and table-rewriting ALTER TABLE are not MVCC-safe.** A transaction with a snapshot predating the DDL can see the table as empty if it had not already accessed the table and acquired a conflicting lock. If it already read the table, its `ACCESS SHARE` lock prevents the DDL from completing until transaction end.[^mvcc-caveats]
 
 12. **System catalog access bypasses isolation.** Verbatim: *"Internal access to the system catalogs is not done using the isolation level of the current transaction. This means that newly created database objects such as tables are visible to concurrent Repeatable Read and Serializable transactions, even though the rows they contain are not."*[^mvcc-caveats] A REPEATABLE READ transaction can see a CREATE TABLE that committed *after* its snapshot was taken — but it cannot see any rows in that table.
 

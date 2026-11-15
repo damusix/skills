@@ -52,7 +52,7 @@ Five rules.
 
 2. **Plugin is a shared library, named at slot creation.** `pg_create_logical_replication_slot(slot_name, 'plugin_name')` binds the slot to a plugin. Cannot change plugin without dropping + recreating slot. Built-in: `pgoutput` (binary protocol for native replication). Contrib: `test_decoding`. Third-party: `wal2json`, `decoderbufs`, `pglogical_output`, custom. `[^lc-output-plugin]`
 
-3. **`REPLICA IDENTITY` decides what's in OLD for UPDATE / DELETE.** Default = PK columns. `FULL` = every column (high WAL volume). `USING INDEX idx` = named unique-not-null index. `NOTHING` = nothing (UPDATE / DELETE error or skip). DDL on table without acceptable REPLICA IDENTITY breaks decoding silently for UPDATE / DELETE. `[^replica-identity]`
+3. **`REPLICA IDENTITY` controls old-row identification for UPDATE and DELETE.** A table published for these operations without a suitable identity rejects the operation on the publisher; it does not silently succeed while dropping it from native replication.[^replica-identity]
 
 4. **Decoding can spill to disk.** When transaction exceeds `logical_decoding_work_mem` (default 64 MB), changes spill to `$PGDATA/pg_replslot/<slot>/`. PG14+ supports **streaming in-progress transactions** so subscribers see changes before COMMIT — but plugin must implement `stream_*` callbacks. `[^lc-mem]` `[^pg14-stream]`
 
@@ -79,7 +79,7 @@ Three smell signals.
 
 1. **Custom plugin emitting JSON.** Use `wal2json` — actively maintained with well-tested edge cases.
 2. **Slot lag climbing under bursty INSERTs.** Either subscriber too slow, or `logical_decoding_work_mem` too low forcing spill. Raise the GUC OR enable streaming.
-3. **UPDATE / DELETE silently absent from decoded stream.** Source table likely missing REPLICA IDENTITY. Check `pg_class.relreplident`.
+3. **UPDATE / DELETE fails on a published table.** Check whether its publication includes the operation and the table has a usable replica identity.
 
 ## Mechanics
 
@@ -190,7 +190,7 @@ Build via PGXS (`72-extension-development.md`). Install to `$libdir`. Use plugin
 
 Before PG14, plugins received `change_cb` calls only after COMMIT. Large transactions buffered in memory until commit, spilled to `pg_replslot/` past `logical_decoding_work_mem`. PG14+ adds `stream_*` callbacks so plugins receive changes incrementally — subscriber can apply or discard before commit.
 
-Plugin opts into streaming by setting `ctx->streaming = true` in `startup_cb`. Subscriber opts in via `streaming = on` (or `streaming = parallel` PG16+, default PG18+) on `CREATE SUBSCRIPTION`.
+Streaming requires the plugin's streaming callbacks and a compatible client request. Native subscribers opt in with `streaming = on` or `streaming = parallel` (PG16+) on `CREATE SUBSCRIPTION`.
 
 ### Two-phase commit decoding
 
@@ -219,16 +219,16 @@ Per-table setting controlling what's in OLD for UPDATE / DELETE decoding. Set vi
 
 | Mode | OLD contents | UPDATE / DELETE behavior |
 |---|---|---|
-| `DEFAULT` | PK columns | Works if table has PK; fails silently otherwise |
+| `DEFAULT` | PK columns | Published UPDATE/DELETE errors on the publisher if there is no primary key |
 | `USING INDEX idx` | Columns of named unique-not-null index | Works for tables with unique not-null index but no PK |
 | `FULL` | Every column | Works always; high WAL volume |
-| `NOTHING` | Nothing | UPDATE / DELETE not decoded |
+| `NOTHING` | Nothing | Published UPDATE/DELETE errors on the publisher when identity is required |
 
 Inspect via `pg_class.relreplident` (`d` = default, `n` = nothing, `f` = full, `i` = using index).
 
 Verbatim docs from `sql-altertable.html`: *"This form changes the information which is written to the write-ahead log to identify rows which are updated or deleted."* `[^alter-table]`
 
-Default for ordinary tables is `DEFAULT`. Default for system tables is `NOTHING`. Tables with no PK and no chosen index decoded only for INSERT — UPDATE / DELETE silently missing from the stream (gotcha #4).
+Default for ordinary tables is `DEFAULT`. A publication that publishes UPDATE or DELETE requires a replica identity; without one, the publisher rejects those operations.
 
 ### Memory + spill (logical_decoding_work_mem)
 
@@ -280,9 +280,8 @@ Verbatim docs: *"test_decoding is an example of a logical decoding output plugin
 
 Emits SQL-like text. Designed for diagnostics + plugin-author reference. Not for production CDC.
 
-Install (PG13+ trusted extension cross-reference `69-extensions.md`):
+`test_decoding` is an output plugin library, not an extension to install with `CREATE EXTENSION`. Create a slot using its plugin name:
 
-    CREATE EXTENSION IF NOT EXISTS test_decoding;
     SELECT pg_create_logical_replication_slot('debug_slot', 'test_decoding');
 
 Read changes (commit them in another session first):
@@ -352,7 +351,7 @@ Common use:
 In session A:
 
     -- Install + create slot
-    CREATE EXTENSION IF NOT EXISTS test_decoding;
+    -- Create a dedicated test slot
     SELECT pg_create_logical_replication_slot('debug_slot', 'test_decoding');
 
     -- Generate some changes
@@ -389,30 +388,9 @@ Cleanup:
 
     pg_recvlogical --drop-slot --slot=cli_slot --dbname=mydb
 
-### Recipe 3: Stream via Streaming Replication Protocol (Python)
+### Recipe 3: Consume via the replication protocol
 
-    import psycopg
-    from psycopg.replication import LogicalReplicationConnection
-
-    conn = psycopg.Connection.connect(
-        "host=primary dbname=mydb user=replicator replication=database"
-    )
-    cur = conn.cursor()
-    cur.create_replication_slot("py_slot", output_plugin="test_decoding")
-
-    cur.start_replication(slot_name="py_slot",
-                          options={"include-xids": "0"})
-
-    def consume(msg):
-        print(msg.payload)
-        msg.cursor.send_feedback(flush_lsn=msg.data_start)
-
-    try:
-        cur.consume_stream(consume)
-    except KeyboardInterrupt:
-        cur.drop_replication_slot("py_slot")
-
-`send_feedback(flush_lsn=...)` ACKs the slot, freeing WAL. **Without ACK, the slot retains WAL indefinitely** — cross-reference `75-replication-slots.md` gotcha #1.
+Use `pg_recvlogical` as in Recipe 2, or a replication-protocol client that persists each transaction and its commit position before acknowledging it. Acknowledging an LSN before durable processing can lose changes after a consumer crash. The consumer must tolerate duplicate delivery after a server crash.
 
 ### Recipe 4: Set REPLICA IDENTITY for tables without PK
 
@@ -441,7 +419,7 @@ Decoding UPDATE / DELETE on a PK-less table requires a unique not-null index OR 
     FROM pg_class
     WHERE relname = 'sessions';
 
-### Recipe 5: Find tables that will silently lose UPDATE / DELETE from decoding
+### Recipe 5: Find tables lacking replica identity
 
     SELECT n.nspname || '.' || c.relname AS table_name,
            CASE c.relreplident
@@ -462,7 +440,7 @@ Decoding UPDATE / DELETE on a PK-less table requires a unique not-null index OR 
            OR c.relreplident = 'n')
     ORDER BY table_name;
 
-Any row returned is a table whose UPDATE / DELETE will not appear in decoded streams.
+Any row returned lacks a usable configured identity. If a publication includes UPDATE or DELETE for that table, those operations fail on the publisher until an identity is configured.
 
 ### Recipe 6: Raise logical_decoding_work_mem for bulk-write workload
 
@@ -481,8 +459,7 @@ Effect on existing walsenders: takes effect on next walsender start. Existing lo
            spill_txns, spill_count, spill_bytes,
            stream_txns, stream_count, stream_bytes,
            total_txns, total_bytes
-    FROM pg_stat_replication_slots
-    WHERE slot_type = 'logical';
+    FROM pg_stat_replication_slots;
 
 `spill_*` non-zero → transactions exceeded `logical_decoding_work_mem`. Raise the GUC OR enable streaming on consumer.
 
@@ -593,7 +570,7 @@ Workaround for the DDL-not-replicated restriction. Cross-reference `40-event-tri
 
 3. **Large objects not decoded.** Verbatim docs: *"Large objects … are not replicated. There is no workaround for that, other than storing data in normal tables."* Use `bytea` columns.
 
-4. **REPLICA IDENTITY DEFAULT + no PK = silent UPDATE / DELETE drop.** Decoder cannot identify row. Run Recipe 5 to audit.
+4. **REPLICA IDENTITY DEFAULT + no PK rejects published UPDATE / DELETE.** Configure a suitable identity before enabling those operations in a publication.
 
 5. **`pg_logical_slot_get_changes` consumes changes — `peek` does not.** Calling `_get_` while a real consumer is attached silently swallows changes from that consumer.
 

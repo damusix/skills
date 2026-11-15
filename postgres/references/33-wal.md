@@ -1,6 +1,6 @@
 # Write-Ahead Log (WAL)
 
-The Write-Ahead Log is the durability, replication, and recovery substrate of PostgreSQL. Every committed change passes through it before reaching the heap, and every recovery scenario — crash, replica catch-up, point-in-time restore, incremental backup — replays it. Tuning WAL means trading three things against each other: durability, write throughput, and recovery time.
+Write-Ahead Log (WAL) records changes needed for crash recovery, physical replication, and point-in-time recovery. Logged changes must reach durable WAL before the corresponding data pages reach disk. Temporary and unlogged relation data are exceptions; asynchronous commit can acknowledge a transaction before its WAL is durable.[^wal-intro][^wal-config]
 
 ## Table of Contents
 
@@ -39,9 +39,9 @@ Five rules drive every WAL decision.
 
 2. **`wal_level` is the dial that decides what the WAL is *for*.** `minimal` writes the minimum needed for crash recovery only — no archiving, no replication. `replica` (the default) writes enough for archiving and physical replication. `logical` adds row-identifier information needed for logical decoding. **You cannot run a base backup on `minimal`.** Cite the GUC reference, not folklore.[^wal-level]
 
-3. **`full_page_writes` protects against torn pages and is on by default.** *"PostgreSQL periodically writes full page images to permanent WAL storage before modifying the actual page on disk. By doing this, during crash recovery PostgreSQL can restore partially-written pages from WAL."*[^fpw] Turning it off is correct **only** on file systems that already prevent partial 8 KB page writes (ZFS, btrfs with appropriate settings) — and even then, most operators leave it on.
+3. **Keep `full_page_writes` enabled for crash recovery.** Disabling it requires verified protection against partial PostgreSQL-page writes throughout the storage stack. The manual gives ZFS as an example; a generic copy-on-write filesystem label is not sufficient evidence.[^fpw]
 
-4. **`wal_buffers` is a small staging cache, not a tunable performance knob.** Default `-1` = auto-sized to `1/32` of `shared_buffers`, clamped between `64 kB` and one WAL segment (`16 MB`).[^wal-buffers] Manually raising it past the segment size is wasted; the buffer drains every commit.
+4. **`wal_buffers` stages WAL not yet written to disk.** Automatic sizing with `-1` is capped at one WAL segment, but explicit values are not capped there. Most installations should retain automatic sizing unless measurements justify an override.[^wal-buffers]
 
 5. **The cost of a WAL record is variable — and full-page-writes dominate.** A small UPDATE may log ~80 bytes plus the change; the *first* modification of any page after a checkpoint logs the entire 8 KB page. This is why checkpoint frequency and WAL volume are tightly coupled (see [`34-checkpoints-bgwriter.md`](./34-checkpoints-bgwriter.md)).
 
@@ -53,11 +53,11 @@ Five rules drive every WAL decision.
 |---|---|---|---|
 | Run base backups, replicas, or PITR | `wal_level = replica` (default) | `wal_level = minimal` | `minimal` cannot support `pg_basebackup` or replication |
 | Run logical replication or CDC | `wal_level = logical` | `replica` | Logical decoding requires row-identifier info in WAL |
-| Reduce WAL volume on a write-heavy cluster (PG15+) | `wal_compression = lz4` | `wal_compression = pglz` | `lz4` is faster CPU + better compression on PG15+[^pg15-comp] |
+| Reduce full-page-image WAL volume (PG15+) | Benchmark supported `pglz`, `lz4`, or `zstd` | assuming one algorithm always compresses best | Build support and CPU/storage workload determine the tradeoff.[^wal-config] |
 | Bound storage retained for a stuck replica | `max_slot_wal_keep_size = '32GB'` | `max_slot_wal_keep_size = -1` (default) | Default is **unlimited** — slots can fill the disk[^max-slot] |
 | Archive WAL to object storage | `archive_library = '<module>'` (PG15+) | shell `archive_command` for high-throughput | Library is faster and avoids fork-per-segment[^pg15-lib] |
 | Allow incremental file-system backups (PG17+) | `summarize_wal = on` | nothing — needs the GUC explicitly | Without summarization, `pg_basebackup --incremental` cannot run[^pg17-sum] |
-| Maximize write throughput on commit-heavy workload (some data loss tolerance) | `synchronous_commit = off` | `synchronous_commit = on` (default) | Trades durability for ~3-10x commit throughput |
+| Reduce commit-wait latency for noncritical transactions | `SET LOCAL synchronous_commit = off` | disabling `fsync` | Acknowledged transactions may be lost on crash; benchmark throughput.[^wal-config] |
 | Force a WAL switch on a low-traffic primary | `archive_timeout = '5min'` | leaving at `0` | Without this, low-traffic clusters can hold one segment open indefinitely |
 | Inspect a WAL segment | `pg_waldump -p pg_wal/ 00000001...` | reading the segment file directly | The on-disk format is undocumented; `pg_waldump` is the supported reader |
 
@@ -74,13 +74,13 @@ WAL lives in the `$PGDATA/pg_wal` directory. From `wal-internals.html`: *"WAL fi
 The **LSN (Log Sequence Number)** is a 64-bit byte offset into WAL — *"the insert position is described by a Log Sequence Number (LSN) that is a byte offset into the WAL, increasing monotonically with each new record."*[^lsn] LSNs render as two hex words separated by `/` (e.g., `1/A3F00128`). Functions:
 
 ```sql
-SELECT pg_current_wal_lsn();              -- current insertion point (primary)
+SELECT pg_current_wal_lsn();              -- current WAL write location (primary)
 SELECT pg_last_wal_replay_lsn();          -- last replayed LSN (standby)
 SELECT pg_walfile_name(pg_current_wal_lsn());  -- which segment file is current
 SELECT pg_wal_lsn_diff('1/B0000000', '1/A3F00128') AS bytes_between;
 ```
 
-Each segment is divided into 8 KB pages (the same size as a heap page, by default). WAL records can span pages but never span segments — the boundary between segments is a record boundary.
+Each segment is divided into WAL pages, normally 8 KB. Records can span pages; do not assume record boundaries match page boundaries.[^wal-int]
 
 A WAL record contains:
 
@@ -116,12 +116,7 @@ Three values:
 
 Default `on`. When on, the first modification of any 8 KB page after a checkpoint emits a full page image to WAL. From `wal-reliability.html`: *"PostgreSQL periodically writes full page images to permanent WAL storage before modifying the actual page on disk."*[^fpw] This is the only way to recover from a *torn page* — an OS or hardware-level partial write where the 8 KB page was split mid-write across power loss.
 
-**File systems where you can turn it off:**
-
-- ZFS (atomic writes by COW design)
-- Other COW file systems with confirmed atomic-write semantics
-
-**Where you cannot turn it off safely:** ext4, xfs, NTFS, every traditional journaled file system.
+Keep `full_page_writes = on` unless the storage configuration has verified protection against partial PostgreSQL-page writes and the recovery implications have been reviewed. Copy-on-write alone is not a guarantee for every filesystem and device configuration.[^fpw][^wal-config]
 
 > [!NOTE] PostgreSQL 18
 > Data checksums are now enabled by default at `initdb`.[^pg18-cksum] Hint-bit changes — previously not WAL-logged — are now WAL-logged on new PG18 clusters because checksums require it (see [`27-mvcc-internals.md`](./27-mvcc-internals.md)). The practical consequence: every page's first write after a checkpoint, including hint-bit-only changes, will produce a full page image. WAL volume increases on read-heavy workloads that had been silently dirtying pages from hint-bit updates.
@@ -142,8 +137,8 @@ Compresses **full page images** only, not the regular WAL record data. Values:
 | `off` (default) | all versions | No compression |
 | `on` | all versions | PG14–18: alias for `pglz`. PG19: selects the first of `zstd`, `lz4`, `pglz` that is available |
 | `pglz` | all versions | Original PostgreSQL LZ |
-| `lz4` | PG15+[^pg15-comp] | Faster + better compression than pglz |
-| `zstd` | PG15+[^pg15-comp] | Better compression than lz4, more CPU |
+| `lz4` | PG15+[^pg15-comp] | Requires an LZ4-enabled build; benchmark speed and compression |
+| `zstd` | PG15+[^pg15-comp] | Requires a Zstandard-enabled build; benchmark CPU cost and compression |
 
 > [!NOTE] PostgreSQL 15
 > Verbatim: *"Allow WAL full page writes to use LZ4 and Zstandard compression (Andrey Borodin, Justin Pryzby). This is controlled by the `wal_compression` server setting."*[^pg15-comp]
@@ -159,9 +154,9 @@ The compression target is the FPW, which is the dominant cost on write-heavy wor
 SHOW wal_buffers;       -- typically 4MB on a 128MB shared_buffers default
 ```
 
-Default `-1` (auto): *"selects a size equal to 1/32nd (about 3%) of shared_buffers, but not less than `64kB` nor more than the size of one WAL segment, typically `16MB`."*[^wal-buffers] Setting larger than one segment is silently capped.
+Default `-1` selects `shared_buffers / 32`, with an automatic range of 64 kB to one WAL segment. Positive manual settings can exceed one segment; values below 32 kB are treated as 32 kB.[^wal-buffers]
 
-Set explicitly to `16MB` on machines where `shared_buffers > 512MB` — the auto-sizing caps at one segment, so the explicit setting saves the calculation and makes monitoring more predictable.
+Leave automatic sizing unless measurements such as WAL buffer-full events justify changing it. An explicit 16 MB setting does not avoid meaningful recurring computation.
 
 ### synchronous_commit
 
@@ -169,9 +164,9 @@ Set explicitly to `16MB` on machines where `shared_buffers > 512MB` — the auto
 |---|---|---|---|
 | `off` | weakest | lowest | In the WAL writer's queue; may be lost on crash within `wal_writer_delay × 3` (~600 ms default) |
 | `local` | local-only | low | Flushed to local disk only; standby may not yet have it |
-| `remote_write` | medium | medium | Sync standby has *received* WAL (RAM); not yet on standby disk |
+| `remote_write` | local WAL durable; standby OS write complete | medium | Current synchronous standby has written WAL to its filesystem, but it need not survive a standby OS crash |
 | `on` (default) | strong | medium-high | Sync standby has *flushed* WAL to its own disk |
-| `remote_apply` | strongest | highest | Sync standby has *replayed* WAL into its database; reads on standby are guaranteed to see this commit |
+| `remote_apply` | local and required standby WAL durable and applied | highest | Current synchronous standby(s) have replayed the commit; new snapshots there can see it, unlike older snapshots or other asynchronous replicas |
 
 `local` and `off` apply only to the primary — they bypass the sync-standby wait entirely. `remote_write` / `on` / `remote_apply` are meaningful only when `synchronous_standby_names` is set (see [`73-streaming-replication.md`](./73-streaming-replication.md)).
 
@@ -202,18 +197,18 @@ To enable archiving: set `wal_level >= replica`, set `archive_mode = on`, and pr
 # postgresql.conf
 wal_level = replica
 archive_mode = on
-archive_command = 'test ! -f /mnt/archive/%f && cp %p /mnt/archive/%f'
+archive_command = 'pgbackrest --stanza=main archive-push %p'
 archive_timeout = '5min'
 ```
 
 `%p` substitutes the path to the WAL segment relative to PGDATA; `%f` is the bare segment filename.
 
-**Safety rule from the docs:** *"Archive commands and libraries should generally be designed to refuse to overwrite any pre-existing archive file."*[^arch-safety] The `test ! -f && cp` pattern enforces this — production deployments should use `pgBackRest`, `Barman`, or `WAL-G`, which handle compression, retention, encryption, and concurrent archiving (see [`85-backup-tools.md`](./85-backup-tools.md)).
+Configure and test the backup tool's stanza, repository, credentials, and restore path before relying on this example. An archive must not overwrite different existing content and must return success only after durable storage. If identical content is already durably archived, a retry should succeed. A `test ! -f && cp` example is not a complete production archive implementation.[^arch-safety]
 
 > [!NOTE] PostgreSQL 15
 > `archive_library` introduced module-based archiving. *"Allow archiving via loadable modules (Nathan Bossart). Previously, archiving was only done by calling shell commands. The new server variable `archive_library` can be set to specify a library to be called for archiving."*[^pg15-lib] Library-based archiving avoids the fork-per-segment cost and is much faster at high WAL rates.
 
-`archive_mode = always` makes a standby continue archiving after it is promoted; `archive_mode = on` archives only on the primary. The `always` mode is also required for `pg_backup_stop` to wait on a standby.
+`archive_mode = always` archives received or restored WAL while the node is a standby, and generated WAL after promotion. `on` archives during normal primary operation but not standby recovery. On a standby, `pg_backup_stop` waits for archiving only with `always`.[^wal-config]
 
 ```sql
 SELECT * FROM pg_stat_archiver;
@@ -228,10 +223,10 @@ SELECT * FROM pg_stat_archiver;
 Two independent mechanisms prevent `pg_wal/` from being truncated:
 
 - **`wal_keep_size`** (PG13+, replaced `wal_keep_segments`): *"minimum size of past WAL files kept in the `pg_wal` directory."*[^wal-keep] Set this to keep enough WAL for a replica that briefly disconnects. Default `0` (no extra retention beyond what replication slots demand).
-- **Replication slots**: a slot's `restart_lsn` is the oldest LSN it might still need. WAL up to that LSN is **never** truncated, regardless of `wal_keep_size`. This is how a stuck slot fills the disk.
+- **Replication slots**: a slot's `restart_lsn` identifies its oldest required WAL. Slots retain WAL independently of `wal_keep_size`, subject to `max_slot_wal_keep_size` enforcement at checkpoints.
 
 > [!NOTE] PostgreSQL 13+
-> `max_slot_wal_keep_size` caps how much WAL a slot can retain. *"If `max_slot_wal_keep_size` is -1 (the default), replication slots may retain an unlimited amount of WAL files. Otherwise, if restart_lsn of a replication slot falls behind the current LSN by more than the given size, the standby using the slot may no longer be able to continue replication."*[^max-slot] Setting a finite value sacrifices the replica's ability to catch up in favor of protecting the primary's disk. The replica becomes invalid and must be rebuilt from a base backup.
+> `max_slot_wal_keep_size` limits slot retention at checkpoints, not total instantaneous disk use. With `-1` (the default), slots can retain unlimited WAL.[^max-slot] A finite value can allow required WAL to be removed. A physical standby may recover it from a suitable archive; otherwise it needs rebuilding. An invalidated logical slot requires consumer recovery or resynchronization. Choose the limit with the recovery plan, WAL rate, and available space.
 
 ```sql
 SELECT slot_name, active, restart_lsn,
@@ -241,7 +236,7 @@ SELECT slot_name, active, restart_lsn,
  ORDER BY bytes_behind DESC;
 ```
 
-`wal_status` values: `reserved` (within `max_slot_wal_keep_size`), `extended` (using more than `max_wal_size` but within the slot cap), `unreserved` (about to be invalidated), `lost` (slot is broken, replica must be rebuilt).
+`wal_status` values: `reserved` (required WAL is within `max_wal_size`), `extended` (beyond `max_wal_size` but still retained), `unreserved` (the slot no longer guarantees retention; needed files may be removed at the next checkpoint), and `lost` (the slot is unusable). `unreserved` can recover before removal.[^slot-view]
 
 ### WAL Summarization (PG17+)
 
@@ -261,7 +256,7 @@ Inspection:
 ```sql
 SELECT * FROM pg_available_wal_summaries() ORDER BY end_lsn DESC LIMIT 5;
 SELECT * FROM pg_get_wal_summarizer_state();
--- summarized_lsn | pending_lsn | summarizer_pid | summarized_tli
+-- summarized_tli | summarized_lsn | pending_lsn | summarizer_pid
 ```
 
 Per-block detail:
@@ -355,30 +350,20 @@ commit_delay = 0
 commit_siblings = 5
 ```
 
-The `max_slot_wal_keep_size = 64GB` is the single most important production setting beyond the defaults — it bounds how much disk a stuck replica or abandoned slot can consume.
+The example `max_slot_wal_keep_size = 64GB` trades slot retention against consumer recovery. It is not a hard disk-use bound: enforcement occurs at checkpoints, and archiving failures or other retention requirements can keep additional WAL.
 
 ### Recipe 2: Find what's holding WAL on disk
 
 ```sql
-WITH retention AS (
-    SELECT
-        pg_current_wal_lsn() AS current_lsn,
-        (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_keep_size') * 1024 * 1024 AS keep_size_bytes,
-        pg_size_bytes(current_setting('max_slot_wal_keep_size')) AS max_slot_bytes
-)
-SELECT
-    slot_name,
-    active,
-    wal_status,
-    pg_size_pretty(safe_wal_size) AS safe_remaining,
-    pg_size_pretty(pg_wal_lsn_diff(retention.current_lsn, restart_lsn)) AS slot_holding_back,
-    age(active_pid::text::int)::text AS pid_age,
-    restart_lsn
-FROM pg_replication_slots, retention
-ORDER BY pg_wal_lsn_diff(retention.current_lsn, restart_lsn) DESC;
+SELECT slot_name, active, active_pid, wal_status,
+       pg_size_pretty(safe_wal_size) AS safe_remaining,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal,
+       restart_lsn
+FROM pg_replication_slots
+ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC NULLS LAST;
 ```
 
-A `wal_status` of `extended` or `unreserved` means the slot is past `max_wal_size` and is racing toward invalidation. `lost` means the slot is already broken.
+`extended` means required WAL exceeds `max_wal_size`, not that the slot is necessarily near invalidation. Inspect `safe_wal_size` when a finite slot cap is configured. `unreserved` means required WAL is no longer protected by the slot; `lost` means the slot is unusable.[^slot-view]
 
 ### Recipe 3: Verify archiving is healthy
 
@@ -410,7 +395,7 @@ SELECT pg_switch_wal();
 SELECT pg_current_wal_lsn(), pg_walfile_name(pg_current_wal_lsn());
 ```
 
-Useful in cron when `archive_timeout` is not set and you want a low-traffic primary to flush WAL to archive on a schedule. The PG18 release notes formally added `num_done` to `pg_stat_checkpointer` to track this.
+Use this to request archiving of a completed transaction's segment, then verify archive success. `pg_stat_checkpointer` counts checkpoints, not WAL segment switches.
 
 ### Recipe 5: Measure wal_compression impact on your cluster
 
@@ -472,18 +457,18 @@ SELECT pg_reload_conf();
 SELECT * FROM pg_get_wal_summarizer_state();
 
 -- List recent summary files
-SELECT tli, start_lsn, end_lsn, size
+SELECT tli, start_lsn, end_lsn
   FROM pg_available_wal_summaries()
  ORDER BY end_lsn DESC
  LIMIT 10;
 ```
 
-Once `summarize_wal = on`, `pg_basebackup --incremental=/path/to/prior_manifest` becomes usable. See [`84-backup-physical-pitr.md`](./84-backup-physical-pitr.md) for the full incremental backup workflow.
+Incremental backups require summaries covering the required interval since the prior backup, not merely an enabled summarizer. Check availability and keep the prior backup chain and manifests. See [`84-backup-physical-pitr.md`](./84-backup-physical-pitr.md).[^wal-summary-functions]
 
 ### Recipe 8: Per-transaction async commit for high-volume ingest
 
 ```sql
--- Bulk loader path: tolerate ~600ms data loss on crash for 3-10x throughput
+-- Noncritical ingest: asynchronous commit can lose acknowledged data on crash.
 BEGIN;
 SET LOCAL synchronous_commit = off;
 
@@ -493,7 +478,7 @@ INSERT INTO event_summary SELECT day, count(*) FROM events GROUP BY day;
 COMMIT;
 ```
 
-The session-level setting (`SET synchronous_commit`) lasts for the session; the `SET LOCAL` form is transaction-scoped and reverts at COMMIT. **Do not** use `synchronous_commit = off` cluster-wide on transactional workloads — the data-loss window is at the *cluster* level, not the connection.
+`SET LOCAL` lasts until transaction end. Asynchronous commit affects the durability guarantee of transactions that commit with it enabled; it does not turn otherwise synchronous transactions into asynchronous ones. Choose it only where loss of acknowledged data is acceptable.[^wal-config]
 
 ### Recipe 9: LSN math for replication lag
 
@@ -509,10 +494,10 @@ SELECT
     sync_state,
     extract(epoch from (now() - reply_time)) AS reply_age_s
   FROM pg_stat_replication
- ORDER BY bytes_unreplayed DESC NULLS LAST;
+ ORDER BY pg_wal_lsn_diff(flush_lsn, replay_lsn) DESC NULLS LAST;
 ```
 
-Four lag stages: sent → written (to OS buffer on standby) → flushed (to standby disk) → replayed (visible to queries on standby). A standby that is lagging on the *replay* side but caught up on flush is usually blocked by a long-running query on the standby (see `hot_standby_feedback` in [`73-streaming-replication.md`](./73-streaming-replication.md)).
+Four lag stages: sent → written (to the standby's OS) → flushed (to durable storage) → replayed (available to fresh snapshots on the standby). Replay lag can reflect recovery conflicts, configured replay delay, paused recovery, or insufficient replay throughput. Inspect standby logs and recovery state before attributing it to a query.
 
 ### Recipe 10: Reduce WAL volume by raising checkpoint_timeout
 
@@ -527,22 +512,19 @@ max_wal_size = '16GB'
 checkpoint_completion_target = 0.9  # default since PG14
 ```
 
-The FPI cost on every page is paid once per checkpoint cycle. Doubling `checkpoint_timeout` does not double WAL volume — it cuts it because each modified page is FPI'd half as often. The trade is longer crash-recovery time on restart. See [`34-checkpoints-bgwriter.md`](./34-checkpoints-bgwriter.md) for the full discussion.
+Longer checkpoint intervals can reduce repeated full-page images when the same pages are modified across intervals. The reduction is workload-dependent and is not guaranteed to be proportional. Budget disk space and longer crash recovery before raising the settings.
 
-### Recipe 11: Identify the LSN of an event by transaction id
+### Recipe 11: Correlate a transaction with WAL
 
-```sql
--- Find the LSN of a committed transaction
-SELECT pg_xact_commit_timestamp_origin(xid) AS commit_ts,
-       pg_xact_status(xid) AS status
-  FROM (SELECT 12345::xid AS xid) sub;
+    -- The epoch-bearing xid8 must come from a recorded transaction identifier.
+    SELECT pg_xact_status('12345'::xid8);
 
--- Find which WAL file contains a given LSN
-SELECT pg_walfile_name('1/A3F00128');
--- => 00000001000000010000000A
-```
+    -- Requires track_commit_timestamp to have been enabled for this transaction.
+    SELECT * FROM pg_xact_commit_timestamp_origin('12345'::xid);
 
-Useful when correlating an application-level event timestamp with WAL contents (e.g., "what did the database write at 14:32 UTC?"). For point-in-time recovery, you typically use `recovery_target_time` rather than `_lsn` — see [`84-backup-physical-pitr.md`](./84-backup-physical-pitr.md).
+    SELECT pg_walfile_name('1/A3F00128'::pg_lsn);
+
+Neither transaction-status nor commit-timestamp functions return an LSN. To locate a transaction's WAL records, inspect retained WAL using `pg_waldump --xid=<32-bit-xid>` with the appropriate timeline and range. Do not infer an epoch or recovery target from a reused 32-bit XID alone.[^xid-functions]
 
 ### Recipe 12: Audit WAL-related GUCs
 
@@ -571,7 +553,7 @@ CHECKPOINT;
 ```
 
 > [!WARNING] CHECKPOINT is not for routine use
-> *"CHECKPOINT is not intended for use during normal operation."*[^chkpt] It forces an immediate, unthrottled checkpoint regardless of `checkpoint_completion_target`. The only legitimate uses are: forcing WAL drainage before a planned shutdown that needs a specific recovery point, and ensuring everything is flushed before taking a file-system-level snapshot. Calling `CHECKPOINT` in a tight loop is a self-inflicted I/O storm.
+> Manual CHECKPOINT can cause substantial I/O and is not intended for routine application use.[^chkpt] It may reduce recovery time before a correctly coordinated filesystem snapshot, but does not make an ordinary live file copy into a valid backup. Snapshot all volumes consistently or use PostgreSQL's supported base-backup procedure.
 
 > [!NOTE] PostgreSQL 15
 > `CHECKPOINT` now respects the `pg_checkpoint` predefined role — non-superusers granted membership can issue it.[^pg15-chkpt-role]
@@ -580,13 +562,13 @@ CHECKPOINT;
 
 1. **`wal_level = minimal` cannot run base backups.** `pg_basebackup` requires `replica` or higher. If you set `minimal` for "performance" you lose the ability to take physical backups or attach replicas — the cluster will fail when you try.
 
-2. **`fsync = off` is a data-loss switch, not a performance knob.** A crash with `fsync = off` typically requires `pg_resetwal` and a `pg_dump`/restore. Never set this on a cluster you care about — even bulk-loaders should use `synchronous_commit = off` instead.
+2. **`fsync = off` can cause unrecoverable corruption after an OS crash or power loss.** Keep it enabled on persistent production clusters. Do not prescribe `pg_resetwal` as an automatic response to a crash; prefer recovery from a valid backup. Asynchronous commit is a separate tradeoff that can lose recent commits without compromising database consistency.[^wal-config]
 
 3. **`max_slot_wal_keep_size = -1` (the default) lets one stuck slot fill the disk.** Set a finite cap on every production cluster. An invalid slot is recoverable (rebuild the replica from a base backup); a full disk is a complete outage.
 
-4. **`archive_command` failures do not retry on a schedule.** PostgreSQL retries the command on every WAL switch — if the command keeps failing, `pg_wal/` grows without bound until the disk fills. Always alert on `pg_stat_archiver.failed_count`.
+4. **Failed archive commands are retried periodically.** Repeated failures retain WAL and can fill disk. Monitor recent failures, archive progress, disk use, and server logs; some archiver crashes are not counted in `pg_stat_archiver`.[^arch-safety]
 
-5. **`archive_command` must not return success unless the segment is durably stored.** A naive `cp %p /archive/%f` returns 0 before the OS has fsynced; on a crash, the segment is half-written and unusable. Use `cp ... && sync ...`, or better, use a battle-tested archive tool (pgBackRest, Barman, WAL-G).
+5. **Archive success requires durable, correct content.** Use a tested archive tool or implementation that handles persistence, interrupted copies, retries, and existing-content checks. A plain copy or an unverified `sync` addition is not a complete archival durability protocol.[^arch-safety]
 
 6. **`archive_command` and `archive_library` cannot both be set in PG16+.** *"Prevent `archive_library` and `archive_command` from being set at the same time."*[^pg16-mutex] On pre-PG16, `archive_library` silently overrode `archive_command`; on PG16+ the cluster refuses to start with both.
 
@@ -594,34 +576,34 @@ CHECKPOINT;
 
 8. **`synchronous_commit = off` does NOT skip the WAL writer.** It only skips the *commit wait*. The WAL writer still flushes at `wal_writer_delay` (200 ms default). Data is durable within ~600 ms of the WAL writer cycle, not "lost forever."
 
-9. **`full_page_writes = off` is correct only on COW file systems.** On ext4/xfs/NTFS, a power loss during an 8 KB write can leave the page in an inconsistent state that crash recovery cannot detect. The page may pass checksum (silently writing wrong values) or fail with `invalid page in block` errors.
+9. **Do not disable `full_page_writes` based only on a filesystem label.** Verify prevention of partial PostgreSQL-page writes across the complete storage stack; otherwise crash recovery can leave unrecoverable or silent corruption.[^fpw]
 
-10. **`wal_buffers > 16MB` is silently capped.** The default `-1` auto-sizes to `min(shared_buffers/32, wal_segment_size)`. Setting larger than the segment size is wasted memory.
+10. **Only automatic `wal_buffers` sizing is capped at one segment.** Manual settings can exceed it, although very large values may offer little benefit.[^wal-buffers]
 
-11. **`pg_switch_wal()` on an idle primary still rotates segments.** The new segment is mostly empty; archived as a full 16 MB. On a low-traffic cluster, this can balloon archive storage. Use `archive_timeout` as the rotation mechanism, not periodic `pg_switch_wal()`.
+11. **`pg_switch_wal()` does nothing without WAL activity since the last switch.** With activity, forcing early switches can produce mostly empty archived segments that still occupy a full segment.[^wal-admin-functions]
 
-12. **`wal_segment_size` cannot be changed without re-initdb.** It's set at `initdb` time via `--wal-segsize` and is a permanent property of the cluster. Larger segments (32–64 MB) reduce filesystem metadata pressure but make archive scripts slower per segment.
+12. **Choose `wal_segment_size` at initialization for normal operations.** Although `pg_resetwal --wal-segsize` can alter it offline, that destructive salvage utility is not a production tuning mechanism. Plan backup/archive compatibility before changing the layout.[^resetwal]
 
-13. **`recovery_target_lsn` requires exact LSN match.** Off-by-one to a non-record boundary fails with `recovery target lsn X has not been reached`. Use `recovery_target_time` for human-readable targets.
+13. **An LSN recovery target is not required to equal a record boundary.** Recovery stops according to WAL record positions and `recovery_target_inclusive`. It fails if recovery ends before reaching the configured target; rehearse the chosen target before relying on it.[^wal-config]
 
 14. **`pg_waldump` cannot read `.partial` segments.** *"pg_waldump cannot read WAL files with suffix `.partial`. If those files need to be read, `.partial` suffix needs to be removed from the file name."*[^pgwaldump-partial] Rename the file before inspecting.
 
 15. **Logical replication slots can hold xmin back.** A logical slot pins the database's `catalog_xmin`, preventing autovacuum from cleaning old catalog tuples. Abandoned logical slots cause silent catalog bloat — see [`27-mvcc-internals.md`](./27-mvcc-internals.md) Recipe 3.
 
-16. **`synchronous_commit = remote_apply` makes COMMIT wait for standby replay.** This guarantees read-your-writes consistency across replicas but adds the standby's apply latency to every commit. Use it deliberately, per-transaction, not as a default.
+16. **`remote_apply` waits for the current required synchronous standby(s), not every replica.** Reads need a new snapshot on a standby that acknowledged replay. Older snapshots and other asynchronous replicas are not covered.[^wal-config]
 
     > [!NOTE] PostgreSQL 19
     > PostgreSQL 19 adds `WAIT FOR LSN 'lsn' [ WITH ( MODE 'standby_replay|standby_write|standby_flush|primary_flush', TIMEOUT '...', NO_THROW ) ]`, which waits until a given LSN is reached. The default mode is `standby_replay`. It is an option for read-your-writes on a standby alongside `remote_apply`.[^pg19-wait]
 
-17. **`archive_timeout` does not skip empty segments.** If `archive_timeout = 5min` and no writes occur, the WAL writer still emits a segment switch — the archive script will see a near-empty 16 MB file every 5 minutes. Heartbeat writes (Recipe 4) are more efficient.
+17. **`archive_timeout` switches only when there has been database activity.** It does not create periodic empty archives on a completely idle server. Segments closed early still have the configured segment length.[^wal-config]
 
-18. **Hint bits and full_page_writes interact.** A read can set hint bits (HEAP_XMIN_COMMITTED / HEAP_XMIN_INVALID) and dirty a page; if it's the first dirty after a checkpoint *and* `full_page_writes = on`, the entire page goes to WAL. On PG18 with data checksums default on, this also true for hint-bit-only changes that previously skipped WAL. Read-heavy workloads on PG18 see more WAL volume than identical workloads on PG17.
+18. **Hint-only full-page images depend on checksums or `wal_log_hints`.** A hint-bit-only update is not WAL-logged merely because `full_page_writes` is on. PG18's default-on checksums can increase WAL compared with an older cluster that had both checksums and `wal_log_hints` disabled.[^wal-config]
 
 19. **`pg_stat_wal` lost columns in PG18.** Monitoring code that reads `wal_write` / `wal_sync` / `wal_write_time` / `wal_sync_time` from `pg_stat_wal` will get column-does-not-exist errors after upgrade.[^pg18-statwal] The equivalent data is in `pg_stat_io` filtered by `object = 'wal'`. Migrate queries before upgrading.
 
 20. **WAL summarization is opt-in.** *"summarize_wal = off"* is the default on PG17. Without it, `pg_basebackup --incremental` will refuse to run with an error about missing summaries. Turn it on at install time, not when you need incremental backups.
 
-21. **`commit_delay` does nothing under `commit_siblings`.** The delay applies only when at least `commit_siblings` (default 5) transactions are already waiting. On a low-concurrency cluster, `commit_delay` has zero effect.
+21. **`commit_siblings` counts other concurrent open transactions, not only commit waiters.** `commit_delay` applies only when that threshold is met and `fsync` is enabled.[^wal-config]
 
 22. **`wal_compression = on` is an alias for `pglz` on PG15–18.** Setting `wal_compression = on` on PG15–18 gives you `pglz`, not `lz4`. The string `'on'` does not pick the best compressor — pick the algorithm explicitly.
 
@@ -708,3 +690,15 @@ CHECKPOINT;
 [^pg19-wait]: PostgreSQL 19 release notes (RC2), Replication: the `WAIT` command (`WAIT FOR LSN`) and `wal_sender_shutdown_timeout` (by default, senders still wait forever). Command reference: https://www.postgresql.org/docs/19/sql-wait.html . Release notes: https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-REPLICATION
 
 [^pg19-wal-fpi]: PostgreSQL 19 release notes (RC2), Monitoring: `pg_stat_wal` and `pg_stat_get_backend_wal()` report full-page-image bytes. https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-SYSTEM-VIEWS
+
+[^wal-config]: PostgreSQL 16, Write Ahead Log configuration: durability, buffering, archiving, and recovery targets. <https://www.postgresql.org/docs/16/runtime-config-wal.html>
+
+[^slot-view]: PostgreSQL 16, `pg_replication_slots`: WAL retention states and horizon columns. <https://www.postgresql.org/docs/16/view-pg-replication-slots.html>
+
+[^wal-summary-functions]: PostgreSQL 17, WAL Summary Information Functions: result shapes and summary coverage. <https://www.postgresql.org/docs/17/functions-info.html#FUNCTIONS-INFO-WAL-SUMMARY>
+
+[^xid-functions]: PostgreSQL 16, transaction information and commit timestamp functions. <https://www.postgresql.org/docs/16/functions-info.html#FUNCTIONS-PG-SNAPSHOT>
+
+[^wal-admin-functions]: PostgreSQL 16, backup control functions, including `pg_switch_wal`. <https://www.postgresql.org/docs/16/functions-admin.html#FUNCTIONS-ADMIN-BACKUP>
+
+[^resetwal]: PostgreSQL 16, `pg_resetwal`: last-resort restrictions and `--wal-segsize`. <https://www.postgresql.org/docs/16/app-pgresetwal.html>

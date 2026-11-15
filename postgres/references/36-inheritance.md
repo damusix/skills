@@ -127,7 +127,7 @@ Two equivalent notations control recursion:
 ```sql
 -- Both apply only to the parent, ignoring children
 SELECT * FROM ONLY cities;
-SELECT * FROM cities ONLY;        -- equivalent
+-- ONLY precedes the table name; there is no trailing ONLY form.
 
 -- Both apply to the parent and all descendants (default)
 SELECT * FROM cities;
@@ -268,7 +268,7 @@ The verbatim CREATE TABLE rule[^createtable]:
 
 > If a column in the parent table is an identity column, that property is not inherited. A column in the child table can be declared identity column if desired.
 
-This is the cleanest "do not inherit" rule in the docs because it is explicit. The same applies to generated columns — `GENERATED ALWAYS AS (expr)` and `GENERATED ALWAYS AS IDENTITY` are per-table column properties.
+Identity properties are not inherited. Generated columns are different: a child of a generated column must also be generated, although its generation expression can differ. See <https://www.postgresql.org/docs/16/ddl-generated-columns.html>.
 
 For inheritance hierarchies that need a single global sequence, share an explicit sequence across children:
 
@@ -297,7 +297,7 @@ The verbatim caveats subsection[^caveats]:
 
 The `INSERT` exception is the most operationally damaging. `INSERT INTO cities ...` always inserts into `cities`; the row does not get routed to a child based on its content. This is why inheritance is unsuited to partitioning — every application using inheritance for partitioning needs a `BEFORE INSERT` trigger that redirects rows to the correct child. Declarative partitioning handles this routing in the core.
 
-The `ALTER TABLE ... RENAME` exception is subtle: rename a column on the parent and child columns keep the old name, leading to schema drift. Cross-reference [`01-syntax-ddl.md`](./01-syntax-ddl.md) lock-level matrix.
+Renaming a table does not rename its children. Renaming an inherited column propagates to descendants; the inherited column cannot be renamed independently on a child. See <https://www.postgresql.org/docs/16/sql-altertable.html>.
 
 
 ### Inheritance vs declarative partitioning
@@ -528,8 +528,7 @@ Use `ONLY` to apply just to the parent:
 
 ```sql
 ALTER TABLE ONLY cities ADD CONSTRAINT name_not_empty CHECK (name <> '') NO INHERIT;
--- attaches to parent only; new children created later will inherit normally,
--- but existing children remain unconstrained
+-- attaches only to the parent; NO INHERIT also excludes future children
 ```
 
 
@@ -570,40 +569,7 @@ Compare to `ALTER TABLE ... DETACH PARTITION` in declarative partitioning ([`35-
 
 ### Recipe 11: Migrate inheritance-partitioned table to declarative partitioning
 
-The canonical migration. Reuses much of [`35-partitioning.md`](./35-partitioning.md) Recipe 3.
-
-```sql
--- BEFORE: inheritance partitioning by month
--- events (parent, no data), events_2026_01, events_2026_02, ...
-
--- 1. Build the new declarative parent under a different name
-CREATE TABLE events_new (
-    id          bigint GENERATED ALWAYS AS IDENTITY,
-    occurred_at timestamptz NOT NULL,
-    payload     jsonb NOT NULL
-) PARTITION BY RANGE (occurred_at);
-
-CREATE TABLE events_new_2026_01 PARTITION OF events_new
-    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
--- repeat per partition
-
--- 2. Copy data from each inheritance child into the matching declarative partition
-INSERT INTO events_new_2026_01 SELECT * FROM ONLY events_2026_01;
--- repeat per month, ideally in a chunked transaction loop
-
--- 3. (Brief lock window) Atomic rename
-BEGIN;
-LOCK TABLE events IN ACCESS EXCLUSIVE MODE;
-ALTER TABLE events RENAME TO events_old;
-ALTER TABLE events_new RENAME TO events;
-COMMIT;
-
--- 4. Verify, then drop the old hierarchy
-DROP TABLE events_old CASCADE;
-```
-
-> [!WARNING]
-> The atomic rename step requires `ACCESS EXCLUSIVE` on the parent table — readers and writers block briefly. Schedule a maintenance window for clusters with continuous traffic. For zero-downtime migration, use logical replication ([`74-logical-replication.md`](./74-logical-replication.md)) into a fresh cluster.
+Prepare the new parent and partitions, then stop all writers, including direct writes to children, for the entire copy and cutover. Copy every parent and child row while writes are stopped. Check and rebind dependent views, foreign keys, grants, triggers, and sequence ownership; a rename does not move dependencies to the new table. Keep the old hierarchy until the data and dependencies have been verified. For an online migration, use a coordinated change-capture and cutover procedure rather than a one-time copy.
 
 
 ### Recipe 12: PG18 `VACUUM ONLY` to preserve pre-PG18 cron behavior
@@ -649,7 +615,7 @@ This is the inheritance equivalent of "broken FK after a `NO INHERIT`" — `pg_a
 
 ## Gotchas / Anti-patterns
 
-1. **`UNIQUE` / `PRIMARY KEY` does not propagate** — the single most damaging surprise. Duplicates across the hierarchy are silently allowed unless you declare the constraint on every child. The docs use the word *"dysfunctional"* for this[^createtable]. Cross-reference Recipe 7 for the coordinating-sequence workaround.
+1. **`UNIQUE` / `PRIMARY KEY` does not propagate.** Even separate constraints on every child do not enforce uniqueness across the hierarchy.[^createtable]
 
 2. **`FOREIGN KEY` does not propagate either direction.** Outbound FKs on the parent must be redeclared on every child. Inbound FKs `REFERENCES cities(name)` accept only parent values, not child values — and the docs explicitly say *"there is no good workaround for this case"*[^ddl-inherit-fk].
 
@@ -659,7 +625,7 @@ This is the inheritance equivalent of "broken FK after a `NO INHERIT`" — `pg_a
 
 5. **`INSERT` does not route automatically.** This is the killer reason inheritance is bad for partitioning. Every application using inheritance for partitioning needs a `BEFORE INSERT` trigger on the parent that redirects rows to the correct child. Declarative partitioning routes automatically.
 
-6. **`ALTER TABLE ... RENAME` does not recurse**[^caveats]. Renaming a column on the parent leaves child columns with the old name — silent schema drift across the hierarchy. Use `ALTER TABLE` on each child explicitly, or migrate to declarative partitioning where rename is automatic for the parent (and children are required to match anyway).
+6. **Renaming a table does not rename child tables.** Renaming an inherited column propagates to descendants; do not rename each child independently. See <https://www.postgresql.org/docs/16/sql-altertable.html>.
 
 7. **`REINDEX` and `VACUUM` (pre-PG18) do not recurse**[^caveats]. Pre-PG18 you had to enumerate children explicitly. PG18+ `VACUUM` recurses by default — a silent behavior change on upgrade. `REINDEX` still does not.
 
@@ -669,7 +635,7 @@ This is the inheritance equivalent of "broken FK after a `NO INHERIT`" — `pg_a
 
 10. **Identity columns are not inherited**[^createtable]. The column itself is inherited (data type, NOT NULL); the IDENTITY property is not. The child can declare its own IDENTITY, but it will use a *different* sequence by default.
 
-11. **Generated columns are not inherited as generated.** Same rule as identity. If the parent has `GENERATED ALWAYS AS (...)`, the child has the column but not the generation expression — verify with `pg_attribute.attgenerated`.
+11. **Generated columns must remain generated in children.** The generation expression may differ from the parent's. Identity properties, by contrast, are not inherited. See <https://www.postgresql.org/docs/16/ddl-generated-columns.html>.
 
 12. **Indexes do not propagate.** Create the same index on every child explicitly, including expression indexes, partial indexes, and covering indexes. Build them `CONCURRENTLY` per child to avoid blocking; see [`26-index-maintenance.md`](./26-index-maintenance.md).
 

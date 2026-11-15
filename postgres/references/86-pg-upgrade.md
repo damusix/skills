@@ -51,9 +51,9 @@ Five rules.
 
 **Rule 2 — Both clusters must be shut down cleanly before invocation.** Not a hot upgrade. Schedule downtime window. `--check` mode is the only flag that runs against a live old cluster.
 
-**Rule 3 — Statistics reset (pre-PG18) OR preserved (PG18+) — extended statistics never preserved.** Pre-PG18: planner statistics in `pg_statistic` reset, must run `vacuumdb --all --analyze-in-stages` after upgrade or query plans regress for hours/days. PG18+: per-column statistics preserved automatically. Verbatim PG18 release-note: *"Allow pg_upgrade to preserve optimizer statistics (Corey Huinker, Jeff Davis, Nathan Bossart). Extended statistics are not preserved. Also add pg_upgrade option `--no-statistics` to disable statistics preservation."*[^pg18-stats] Operational consequence: PG18+ still requires `vacuumdb --all --analyze-only --analyze-in-stages` for *extended* stats (those created via `CREATE STATISTICS`) and for cumulative-vacuum thresholds.
+**Rule 3 — PG18 preserves some, not all, planner statistics.** For earlier targets run staged ANALYZE; for PG18 follow both `vacuumdb` commands emitted by `pg_upgrade`. See <https://www.postgresql.org/docs/18/pgupgrade.html>.
 
-**Rule 4 — Logical replication slots transferred only when source ≥ PG17.** PG17 introduced slot+subscription migration (Hayato Kuroda et al.). Verbatim docs: *"This only works for old PostgreSQL clusters that are version 17 or later."*[^pg17-slots] Upgrading FROM PG14/15/16 → ANY target = slot state lost, applications must recreate slots + reset subscribers' replication origin manually. Cross-reference [`75-replication-slots.md`](./75-replication-slots.md).
+**Rule 4 — Logical slots transfer only when the source is PG17+ and all documented prerequisites hold.** Earlier sources require coordinated rebootstrap or another consumer-specific migration that avoids gaps and duplicates. See <https://www.postgresql.org/docs/17/pgupgrade.html>.
 
 **Rule 5 — pg_upgrade does NOT migrate `pg_hba.conf`, custom GUCs, `archive_command`, scheduled jobs, or extension binaries.** All operational configuration outside `$PGDATA/pg_*` system files must be copied manually OR baked into deployment automation. Verify before declaring upgrade complete.
 
@@ -82,7 +82,7 @@ Five rules.
 | Multi-CPU parallel upgrade | `--jobs N` | serial when migrating many databases or large tablespaces | Per-database parallelism. |
 | Source ≥ PG17, want to preserve logical slots | upgrade as normal | manually recreating slots after | Slots migrate automatically (PG17+ only)[^pg17-slots]. |
 | Source ≤ PG16, want to preserve replication | logical replication blue/green | pg_upgrade for replication continuity | pg_upgrade cannot migrate slots from pre-PG17. Cross-reference [`87-major-version-upgrade.md`](./87-major-version-upgrade.md). |
-| PG18+ target, skip stats preservation (testing) | `--no-statistics` | running ANALYZE post-upgrade redundantly | Reverts to pre-PG18 behavior. Verbatim docs[^pg18-stats]. |
+| PG18+ target, skip stats preservation (testing) | `--no-statistics` | assuming stats are available | Regenerate statistics after upgrade. |
 | Test upgrade procedure | spin disposable host, run `--check` + actual upgrade | running directly on production | Practice the runbook end-to-end. |
 | Cross-platform (Linux → Windows etc.) | dump + restore via [`83-backup-pg-dump.md`](./83-backup-pg-dump.md) | pg_upgrade | pg_upgrade requires same architecture + endianness. |
 | Reduce post-upgrade ANALYZE time | `vacuumdb --all --analyze-in-stages --jobs=$(nproc)` | single-threaded `ANALYZE` | Parallelizes across databases. |
@@ -218,7 +218,7 @@ Operational gap list — verify each:
 - **Replication slots from pre-PG17 sources** — must be recreated post-upgrade.
 - **Extended statistics** (objects defined via `CREATE STATISTICS`) — recreated automatically but underlying data is reset; rerun `ANALYZE` even on PG18+.
 - **`pg_stat_statements` data** — extension catalog migrates but accumulated counters reset. Cross-reference [`57-pg-stat-statements.md`](./57-pg-stat-statements.md).
-- **Scheduled jobs** (pg_cron, pg_partman maintenance) — recreate via your deployment automation; cron tables migrate as data, but `cron.job_run_details` history resets. Cross-reference [`98-pg-cron.md`](./98-pg-cron.md), [`99-pg-partman.md`](./99-pg-partman.md).
+- **Scheduler runtime configuration** — `cron.job`, `cron.job_run_details`, and pg_partman configuration are ordinary extension table data and normally survive `pg_upgrade`. Recheck compatible extension binaries, preload settings, authentication, and maintenance scheduling before enabling jobs. Do not recreate preserved jobs blindly. Cross-reference [`98-pg-cron.md`](./98-pg-cron.md) and [`99-pg-partman.md`](./99-pg-partman.md).
 
 ### reg* OID-Referencing Types Block Upgrade
 
@@ -279,7 +279,7 @@ Prerequisites for slot/subscription migration (source ≥ PG17):
 
 If any prereq fails → `--check` errors with explicit message naming the slot.
 
-For pre-PG17 sources: slots cannot be migrated. Subscribers must be paused, slot state captured (via `pg_replication_slots`), slots recreated on new cluster with matching `confirmed_flush_lsn`, subscribers reattached. This is operationally fragile — prefer logical-replication-based blue/green upgrade for clusters with critical replication slots.
+For pre-PG17 sources, pg_upgrade cannot migrate logical slots or their positions. Plan a coordinated rebootstrap or a consumer-specific migration that prevents gaps and duplicates; creating a new slot with the same name cannot restore the old `confirmed_flush_lsn`. See <https://www.postgresql.org/docs/17/pgupgrade.html>.
 
 ### Statistics Preservation (PG18+)
 
@@ -294,7 +294,7 @@ Decision table:
 | Source version | Target version | Per-column stats preserved? | Extended stats preserved? | Post-upgrade ANALYZE required? |
 |---|---|---|---|---|
 | Any | ≤ PG17 | ❌ No | ❌ No | Yes — full `vacuumdb --all --analyze-in-stages` |
-| Any | PG18+ (default) | ✅ Yes | ❌ No | Reduced — `vacuumdb --all --analyze-in-stages --missing-stats-only` for extended stats + `vacuumdb --all --analyze-only` for cumulative |
+| Any | PG18+ (default) | Supported column stats | No | Run both `vacuumdb` commands emitted by `pg_upgrade` |
 | Any | PG18+ with `--no-statistics` | ❌ No | ❌ No | Same as pre-PG18 target |
 
 Cross-reference [`55-statistics-planner.md`](./55-statistics-planner.md) for what's in `pg_statistic` vs `pg_statistic_ext_data`.
@@ -449,12 +449,11 @@ PGSETUP_INITDB_OPTIONS="--data-checksums" \
 #   wal_level=logical
 #   max_replication_slots >= number of slots on source
 #   max_wal_senders >= max_replication_slots + replicas
-#   shared_preload_libraries includes all output-plugin libraries
+#   install required logical output plugins and allow them via output_plugin_libraries
 cat >> /var/lib/pgsql/18/data/postgresql.conf <<EOF
 wal_level = logical
 max_replication_slots = 20
 max_wal_senders = 20
-shared_preload_libraries = 'pgoutput'
 EOF
 
 # Run --check first.
@@ -481,7 +480,7 @@ systemctl start postgresql-18
 psql -c "SELECT slot_name, slot_type, plugin, database, active, restart_lsn, confirmed_flush_lsn
          FROM pg_replication_slots;"
 
-# Subscribers reconnect automatically once they see the slot active.
+# Re-enable subscriptions after the upgrade and repoint them if the endpoint changed.
 ```
 
 Cross-reference [`75-replication-slots.md`](./75-replication-slots.md) for slot lifecycle.
@@ -495,7 +494,7 @@ Source = PG16 or earlier → slots not migrated. Procedure:
 psql -At -c "SELECT slot_name, plugin, database, two_phase
              FROM pg_replication_slots WHERE slot_type='logical';" > /tmp/slots.txt
 
-# 2. Stop all subscribers (DROP SUBSCRIPTION on subscriber side, or DISABLE if you want to resume same name).
+# 2. Disable subscribers after draining their changes; do not drop them blindly.
 # On EACH subscriber cluster:
 psql -c "ALTER SUBSCRIPTION my_sub DISABLE;"
 
@@ -508,12 +507,12 @@ while IFS='|' read -r slot_name plugin database two_phase; do
     psql -d "$database" -c "SELECT pg_create_logical_replication_slot('$slot_name', '$plugin');"
 done < /tmp/slots.txt
 
-# 5. On each subscriber, refresh and re-enable.
-psql -c "ALTER SUBSCRIPTION my_sub REFRESH PUBLICATION WITH (copy_data = true);"
-psql -c "ALTER SUBSCRIPTION my_sub ENABLE;"
+# 5. Rebootstrap each subscriber from a coordinated snapshot using the
+# subscriber/consumer-specific procedure. REFRESH PUBLICATION does not
+# recopy existing tables, and recreating a slot cannot recover old positions.
 ```
 
-This loses unreplicated transactions between source-stop and new-slot-creation. For zero-data-loss preservation across pre-PG17 upgrades, use logical-replication blue/green pattern — cross-reference [`87-major-version-upgrade.md`](./87-major-version-upgrade.md).
+Plan this migration before stopping the source. See <https://www.postgresql.org/docs/17/pgupgrade.html> and <https://www.postgresql.org/docs/16/sql-altersubscription.html>.
 
 ### Recipe 6 — Inspect pg_upgrade output dir after success
 
@@ -658,11 +657,10 @@ Fix options:
 
 ```bash
 # Source has no checksums; target was initdb'd with --data-checksums.
-# Wipe target, re-initdb without checksums.
-systemctl stop postgresql-18
-rm -rf /var/lib/pgsql/18/data
-PGSETUP_INITDB_OPTIONS="" \
-    /usr/pgsql-18/bin/postgresql-18-setup initdb
+# Initialize a separate, empty target directory without checksums.
+# Do not delete an existing data directory; confirm its contents and ownership.
+sudo -u postgres /usr/pgsql-18/bin/initdb \
+    --no-data-checksums -D /var/lib/pgsql/18/upgrade-target
 ```
 
 **Option B — enable checksums on source first (PG12+, requires cluster offline).**
@@ -718,8 +716,8 @@ For `--copy` mode: old cluster untouched, restart it directly. For `--clone`: sa
 8. **`reg*` OID-referencing types block upgrade.** Eight types blocked (Recipe 7); three allowed (`regclass`, `regrole`, `regtype`). Audit before scheduling.
 9. **Statistics reset on pre-PG18 target.** Query plans regress for hours/days after upgrade without `vacuumdb --all --analyze-in-stages`. Build the post-ANALYZE step into the upgrade runbook (Recipe 9).
 10. **Extended statistics never preserved — even on PG18+ target.** Run `vacuumdb --all --analyze-in-stages --missing-stats-only` post-upgrade on PG18+. Cross-reference [`55-statistics-planner.md`](./55-statistics-planner.md).
-11. **Replication slots from pre-PG17 sources lost.** Subscribers must be paused, slots recreated manually, slot LSNs reseeded (Recipe 5). Plan for downtime + reseed cost on subscriber side. For zero-data-loss preservation, use logical-replication blue/green ([`87-major-version-upgrade.md`](./87-major-version-upgrade.md)).
-12. **PG17+ slot migration requires `wal_level=logical` on target.** Slot migration silently skipped if new cluster initialized with `wal_level=replica`. Set explicitly in target's `postgresql.conf` BEFORE `--check`.
+11. **Logical slots from pre-PG17 sources are not preserved by pg_upgrade.** Coordinate subscriber resynchronization rather than attempting to recreate a slot at an arbitrary old LSN. See <https://www.postgresql.org/docs/17/pgupgrade.html>.
+12. **PG17+ slot migration requires `wal_level=logical` on target.** An unmet prerequisite causes an error; set it before `--check`. See <https://www.postgresql.org/docs/17/pgupgrade.html>.
 13. **`max_replication_slots` must be ≥ slot count on source.** Otherwise `--check` errors. Verify with `SELECT count(*) FROM pg_replication_slots` on source.
 14. **Same encoding required pre-PG16.** PG16+ pg_upgrade sets target's encoding to match source automatically[^pg16-locale]. On PG15 target or earlier, target must be initdb'd with the matching `--encoding`.
 15. **Same architecture + endianness required, always.** Cross-architecture upgrades require dump+restore. pg_upgrade reuses byte layout from data files; no byte-swap pass.
@@ -727,7 +725,7 @@ For `--copy` mode: old cluster untouched, restart it directly. For `--clone`: sa
 17. **Same `--wal-segsize` required.** Non-default WAL segment size on source must match target.
 18. **Pre-existing data on target cluster blocks upgrade.** Target must be empty (only system catalogs from `initdb`). If you connected and created data → drop, re-initdb, or use a fresh target dir.
 19. **`pg_stat_statements` history resets.** Counters in `pg_stat_statements_info` and all `total_*_time` columns return to zero. Cross-reference [`57-pg-stat-statements.md`](./57-pg-stat-statements.md).
-20. **`pg_cron` job history resets but `cron.job` schedule survives.** Jobs continue executing post-upgrade but `cron.job_run_details` accumulated execution history is gone. Cross-reference [`98-pg-cron.md`](./98-pg-cron.md).
+20. **`pg_cron` schedules and stored job history normally survive `pg_upgrade`.** `cron.job_run_details` is table data, not a cumulative statistics counter. Verify extension/runtime configuration and deliberate retention policies before resuming jobs. See <https://github.com/citusdata/pg_cron/blob/v1.6.8/pg_cron--1.2--1.3.sql>.
 21. **OS user permissions matter.** Run pg_upgrade as the OS user that owns BOTH data dirs (typically `postgres`). Mismatched ownership → permission denied mid-upgrade with potentially corrupted target.
 22. **`--swap` (PG18+) renames source directory.** Backup scripts that reference old `$PGDATA` path break silently. Update before relying on `--swap` mode. Verbatim PG18 release-note[^pg18-swap].
 23. **Long-running upgrade fails if disk fills.** `--copy` mode doubles disk usage. `--link` / `--clone` / `--swap` need less but `pg_wal` still grows during catalog migration. Pre-check with `df -h /var/lib/pgsql` (Recipe 11).

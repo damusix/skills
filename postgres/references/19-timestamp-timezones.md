@@ -49,7 +49,7 @@ Five rules drive every decision in this file:
 
 2. **`timestamptz` is *not* "stores a time zone."** It stores a UTC instant. The original input zone is discarded after conversion. Its name is misleading; think of it as `timestamp_utc` if that helps.[^datetime]
 
-3. **Intervals carry three independent fields — months, days, microseconds — for a reason.** `1 month`, `30 days`, and `2592000 seconds` are *different values* because months vary in length and days can be 23 / 24 / 25 hours under DST.[^datetime] Mixing them in arithmetic gives results that depend on the anchor date.
+3. **Intervals carry three independent fields: months, days, microseconds.** These fields can produce different results in timestamp arithmetic because months vary in length and days can be 23 or 25 hours under DST.[^datetime] Interval equality nevertheless treats a month as 30 days and a day as 24 hours.
 
 4. **`now()` is the transaction start time, not the wall clock.** It does not advance during the transaction. Use `clock_timestamp()` for "time when this expression evaluated."[^datetime-fns]
 
@@ -119,7 +119,7 @@ Concretely:
 
     -- Switch zone, query the same value
     SET TimeZone = 'Asia/Tokyo';
-    SELECT '2026-01-15 10:00+00'::timestamptz;    -- 2026-01-15 14:00:00+09         (same instant; rendered in Tokyo)
+    SELECT '2026-01-15 10:00+00'::timestamptz;    -- 2026-01-15 19:00:00+09         (same instant; rendered in Tokyo)
 
 The `timestamp without time zone` value is unaffected by the session zone — but that is the bug, not the feature. If session A inserts `'2026-01-15 10:00'::timestamp` from New York and session B reads it from Tokyo, both see the same wall-clock string with no way to recover the original instant.
 
@@ -165,12 +165,12 @@ The zone argument can be either a text name (`'America/Denver'`) or an interval 
 
 This is the source of every "interval did not do what I expected" surprise.
 
-    SELECT '1 month'::interval = '30 days'::interval;   -- false
+    SELECT '1 month'::interval = '30 days'::interval;   -- true
     SELECT '1 month'::interval = '4 weeks'::interval;   -- false
-    SELECT '1 day'::interval = '24 hours'::interval;    -- false (in DST-relevant arithmetic)
+    -- Adding these intervals to timestamptz may yield different instants across DST.
     SELECT '1 day'::interval = '24 hours'::interval;    -- true under simple equality (because no anchor date is involved)
 
-The last two look contradictory. The resolution: equality of two `interval` values compares them by normalizing to a single unit (microseconds-since-epoch-of-a-fixed-date), but **adding** an interval to a `timestamptz` walks the calendar, so DST may apply.
+Interval comparison uses fixed conversion factors of 30 days per month and 24 hours per day, but adding an interval to a `timestamptz` walks the calendar, so DST may apply.
 
 Concrete DST example (US Eastern, spring-forward 2026-03-08 02:00):
 
@@ -393,7 +393,7 @@ PostgreSQL accepts three forms of zone name:[^datetime]
 
     -- DST-aware: November 1 in 2026 is the day clocks go back
     SET TimeZone = 'America/New_York';
-    SELECT '2026-11-01 01:30'::timestamptz;   -- ambiguous; PG picks the EDT (pre-fall-back) interpretation
+    SELECT '2026-11-01 01:30'::timestamptz;   -- ambiguous; PG picks EST (post-fall-back)
 
     -- DST-blind: 'EST' is fixed at -05:00 always
     SET TimeZone = 'EST';
@@ -500,7 +500,7 @@ This rewrites the table (full ACCESS EXCLUSIVE lock; unsuitable for hot tables i
     CREATE INDEX events_hour_ny_idx
         ON events (date_trunc('hour', occurred_at, 'America/New_York'));
 
-For pre-PG16 you cannot index `date_trunc(text, timestamptz, text)` because the 3-arg form was `STABLE`. Workaround: store the bucketed value in a generated column (`STORED`) and index that.
+Before PG16 this three-argument form is `STABLE`, so neither an expression index nor a generated column can use it. Store the bucket in an ordinary column maintained by application code or a trigger instead.
 
 
 ### 5. Bucketed analytics with `date_bin` (custom-stride windows)
@@ -592,7 +592,7 @@ Reverse direction:
     INSERT INTO events(occurred_at, recorded_at, ...) VALUES (now(), clock_timestamp(), ...);
     COMMIT;
 
-All three rows have the same `occurred_at` (transaction start). Each has a different `recorded_at` (per-statement wall clock), so `ORDER BY recorded_at` reproduces insertion order even within one transaction.
+All three rows have the same `occurred_at` (transaction start). `clock_timestamp()` samples wall time per evaluation, but values can tie or move backward if the system clock changes. Use an explicit ordering key when a reliable order is required.
 
 
 ### 11. Format Postgres timestamps as ISO 8601 strings
@@ -618,7 +618,7 @@ PostgreSQL accepts both `T` and space as the date-time separator on input, but a
 
     SELECT * FROM events
     WHERE occurred_at >= date_trunc('day', now() AT TIME ZONE 'America/New_York') AT TIME ZONE 'America/New_York'
-      AND occurred_at <  date_trunc('day', now() AT TIME ZONE 'America/New_York') AT TIME ZONE 'America/New_York' + interval '1 day';
+      AND occurred_at <  (date_trunc('day', now() AT TIME ZONE 'America/New_York') + interval '1 day') AT TIME ZONE 'America/New_York';
 
 The two `AT TIME ZONE` calls together: first strips the zone (giving the user's local wall clock), then re-anchors to that zone (giving a UTC instant for the user-local midnight).
 
@@ -688,12 +688,12 @@ The single most common bug. The naïve type loses zone information; reads from s
 See Mental Model rule 2. If you need to remember the originating zone (e.g., to render to a user the local time at the recording site), store the zone in a separate `text` column.[^datetime]
 
 
-### 3. `'1 month' = '30 days'` is **false**
+### 3. Interval equality does not imply interchangeable calendar arithmetic
 
-The interval months/days/microseconds-as-three-fields rule.[^datetime] All of these are different values:
+    SELECT interval '1 month' = interval '30 days';   -- true
+    SELECT interval '1 day'   = interval '24 hours';  -- true
 
-    SELECT interval '1 month' = interval '30 days';   -- false
-    SELECT interval '1 day'   = interval '24 hours';  -- false (under DST-relevant addition)
+Comparison treats a month as 30 days and a day as 24 hours. Adding those equal intervals to a timestamp can produce different results because calendar months and DST vary.[^datetime-fns]
 
 
 ### 4. Adding `interval '1 day'` is not the same as adding `'24 hours'`

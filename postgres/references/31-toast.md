@@ -34,14 +34,14 @@ PostgreSQL's TOAST mechanism transparently compresses and/or moves wide column v
 
 ## Five-rule Mental Model
 
-1. **TOAST kicks in only when the whole tuple exceeds ~2 KB.** A column with a 500-byte value never goes out-of-line — the cost is paid at the *row* level, not the *column* level. The threshold is `TOAST_TUPLE_THRESHOLD` (normally 2 KB) [^toast-threshold].
+1. **TOAST is triggered by the size of the whole tuple.** The default threshold is about 2 KB; `toast_tuple_target` adjusts the per-table threshold and target.[^toast-target]
 2. **There are four storage strategies; `EXTENDED` is the default for almost every variable-length type.** PLAIN forbids both compression and out-of-line storage (fixed-length types). EXTENDED tries compression first, then out-of-line. EXTERNAL skips compression and goes straight out-of-line. MAIN tries compression and keeps in-line as long as possible [^four-strategies].
 3. **Compression default is `pglz` on PG14–18 (PG19 changes it to `lz4`); `lz4` is faster and almost always better but only present if PostgreSQL was built `--with-lz4`.** Set per-column with `ALTER TABLE ... ALTER COLUMN ... SET COMPRESSION lz4` (PG14+) or cluster-wide via `default_toast_compression` GUC [^pg14-lz4] [^default-toast].
 4. **Every TOAST-eligible table has a sidecar `pg_toast.pg_toast_<oid>` relation.** It is autovacuumed independently, has its own index, and can become bloated independently of the main table. Read it through `pg_class` (relkind `t`) [^toast-naming].
-5. **Reading a TOASTed column requires joining the TOAST table on every access.** `SELECT *` on a wide-row table pays this cost on every row. `SELECT key, length(blob)` does not de-TOAST. UPDATE of an *unchanged* out-of-line value is free [^update-preserve].
+5. **Accessing an out-of-line value can read its TOAST chunks.** Cost depends on the operation and type: byte length can often use metadata, while character length in a multibyte encoding may need the value. Unchanged out-of-line fields are normally preserved during UPDATE.[^update-preserve]
 
-> [!WARNING] TOAST is invisible at the SQL level — and almost invisible in `EXPLAIN`
-> The TOAST machinery does not appear as a separate plan node. The cost shows up as buffer reads on the TOAST relation. Use `EXPLAIN (ANALYZE, BUFFERS)` and watch for buffer reads against `pg_toast.pg_toast_<oid>` — that is the de-TOAST traffic.
+> [!WARNING] TOAST is not a separate `EXPLAIN` node
+> Buffer totals can include TOAST access, but `EXPLAIN` does not attribute those reads to a named TOAST relation. Result serialization is not necessarily included in PG16 `EXPLAIN ANALYZE`.
 
 ## Decision Matrix: Storage Strategy
 
@@ -70,10 +70,7 @@ The TOAST machinery is triggered when an entire row exceeds `TOAST_TUPLE_THRESHO
 
 > The TOAST management code is triggered only when a row value to be stored in a table is wider than `TOAST_TUPLE_THRESHOLD` bytes (normally 2 kB). The TOAST code will compress and/or move field values out-of-line until the row value is shorter than `TOAST_TUPLE_TARGET` bytes (also normally 2 kB, adjustable) [^toast-threshold].
 
-Both thresholds are *per row*, not per column. A row with one 4 KB column and four 50-byte columns triggers TOAST; a row with twenty 100-byte columns does not, even though the wide values are similar in size.
-
-> [!NOTE]
-> `TOAST_TUPLE_THRESHOLD` is a build-time constant. `TOAST_TUPLE_TARGET` is also normally 2 KB but can be lowered per-table via the `toast_tuple_target` storage parameter (see below).
+Both thresholds are per row, not per column. The per-table `toast_tuple_target` changes the threshold as well as the target; small columns may also move out-of-line when a wide row requires it.[^toast-target]
 
 The order of operations when a row exceeds the threshold:
 
@@ -107,7 +104,7 @@ Setting the strategy is via `ALTER TABLE`:
     ALTER TABLE my_table ALTER COLUMN big_blob SET STORAGE EXTERNAL;
 
 > [!WARNING] `SET STORAGE` does not rewrite existing rows
-> Per the docs: *"Note that `ALTER TABLE ... SET STORAGE` doesn't itself change anything in the table; it just sets the strategy to be pursued during future table updates."* [^alter-storage] Existing rows keep their current storage. To force the rewrite, run a no-op update like `UPDATE my_table SET big_blob = big_blob WHERE big_blob IS NOT NULL` — but this is a full-table rewrite and produces full WAL traffic. For a clean rewrite, use `VACUUM FULL` or `pg_repack` (see [26-index-maintenance.md](./26-index-maintenance.md)).
+> The new strategy applies to future storage decisions. Unchanged out-of-line values are normally preserved, so a no-op update does not guarantee conversion. Verify the result and use a controlled logical reload if conversion is required.[^alter-storage][^update-preserve]
 
 ### Compression: pglz vs lz4
 
@@ -358,17 +355,15 @@ Interpret the ratio:
     -- Step 1: change the per-column default for future writes
     ALTER TABLE events ALTER COLUMN payload SET COMPRESSION lz4;
 
-    -- Step 2: rewrite existing rows. Two options:
-    --   A. Full rewrite via VACUUM FULL (offline, ACCESS EXCLUSIVE)
-    VACUUM FULL events;
-    --   B. Online rewrite via pg_repack (community tool)
-    --   See 26-index-maintenance.md for the pg_repack walkthrough
+    -- Step 2: use a controlled logical dump and restore into a table configured
+    -- for lz4; existing compressed values can survive physical rewrites and
+    -- INSERT ... SELECT. Test the restore and plan for locks and storage.
 
-    -- Step 3: verify the new algorithm
+    -- Step 3: inspect a representative sample after restoration
     SELECT id, pg_column_compression(payload)
     FROM events
     LIMIT 10;
-    -- Expect: 'lz4' for every row
+    -- NULL means not compressed; some data is too small or incompressible.
 
 ### 4. Recompute size impact of `lz4` vs `pglz`
 
@@ -381,8 +376,8 @@ Before deciding cluster-wide, measure on representative data:
     CREATE TABLE t_lz4 (LIKE events INCLUDING ALL);
     ALTER TABLE t_lz4 ALTER COLUMN payload SET COMPRESSION lz4;
 
-    INSERT INTO t_pglz SELECT * FROM events LIMIT 100000;
-    INSERT INTO t_lz4  SELECT * FROM events LIMIT 100000;
+    -- INSERT ... SELECT can retain source compression; use a logical reload
+    -- of representative data into each table instead.[^alter-storage]
 
     -- Compare sizes and decompress timing
     SELECT
@@ -485,8 +480,8 @@ For a cluster originally configured before PG14, migrating to `lz4` cluster-wide
       AND pg_relation_size(t.oid) > 100 * 1024 * 1024  -- > 100 MB
     ORDER BY pg_relation_size(t.oid) DESC;
 
-    -- Step 3: For each large table, set per-column lz4 and rewrite
-    -- (use pg_repack for online; VACUUM FULL for small-and-offline)
+    -- Step 3: plan and test a logical reload per affected table.
+    -- Physical rewrites alone do not guarantee recompression.
 
 ### 11. Distinguish in-line, compressed-in-line, and out-of-line for diagnosis
 
@@ -504,21 +499,9 @@ For a cluster originally configured before PG14, migrating to `lz4` cluster-wide
 - `algo IS NOT NULL` AND `chunk_id IS NOT NULL` → value compressed AND moved out-of-line.
 - `algo IS NULL` AND `chunk_id IS NOT NULL` → value out-of-line uncompressed (`EXTERNAL` strategy).
 
-### 12. Watch TOAST traffic in EXPLAIN BUFFERS
+### 12. Inspect TOAST traffic
 
-The TOAST table buffer reads do not appear as a separate node, but they do count in the `Buffers` line under the parent scan:
-
-    EXPLAIN (ANALYZE, BUFFERS, VERBOSE) SELECT payload FROM events WHERE id = 42;
-    --                       ^^^^^^^ shows reads on both the main heap AND its TOAST relation
-
-Compare to the no-de-TOAST variant:
-
-    EXPLAIN (ANALYZE, BUFFERS, VERBOSE) SELECT id, length(payload) FROM events WHERE id = 42;
-
-The `length()` of a TOASTed varlena is a header read, not a full de-TOAST — `length(payload)` does NOT fetch the chunks. The difference in `Buffers: shared hit/read` between the two plans is the de-TOAST traffic.
-
-> [!NOTE]
-> `octet_length(payload)` is also header-only for TOASTed values; the chunk fetch is skipped because the size lives in the header. Same for `pg_column_size(payload)`.
+TOAST reads can contribute to buffer totals but are not separately named in the plan. PG16 `EXPLAIN ANALYZE` does not send result rows to a client, so selecting a wide column alone is not a reliable measurement of output detoasting. Measure an operation that consumes the value and compare relation I/O statistics for the TOAST table; benchmark the actual client fetch separately. See <https://www.postgresql.org/docs/16/using-explain.html> and [^toast-threshold].
 
 ### 13. Migration: large `bytea` blob → Large Object
 
@@ -539,15 +522,15 @@ Trade-offs:
 
 ## Gotchas / Anti-patterns
 
-1. **`SET STORAGE` does not rewrite existing rows.** New strategy applies only to future writes. Use `VACUUM FULL` or `pg_repack` to rewrite. Same for `SET COMPRESSION`.
+1. **`SET STORAGE` and `SET COMPRESSION` do not rewrite existing rows.** A physical rewrite or `INSERT ... SELECT` does not guarantee recompression. Use a tested logical reload and verify stored values.[^alter-storage]
 
-2. **`SET COMPRESSION lz4` requires server built with `--with-lz4`.** Without it, the GUC accepts `lz4` but actual compression silently falls back. Confirm with `SHOW default_toast_compression` and `pg_column_compression()` on test data.
+2. **LZ4 requires a server built with `--with-lz4`.** Check build support before configuring it.[^default-toast]
 
 3. **The 2 KB threshold is per-row, not per-column.** A row with one 1.5 KB column and several 100-byte columns may not trigger TOAST; a row with three 800-byte columns will.
 
-4. **`SELECT *` on a wide-row table de-TOASTs every selected row.** Even if your application uses only the narrow columns, the wide column is fetched. Use explicit column lists.
+4. **Fetching `SELECT *` from a wide-row table can require detoasting all selected wide values for transmission.** Select only needed columns; server-side plan timing alone may omit client output costs.
 
-5. **`length()` and `octet_length()` are free; substring is not.** Header bytes give the size; substring of a compressed value requires full decompression. For `EXTERNAL` (uncompressed out-of-line), substring is partial-fetch optimized.
+5. **Length cost depends on data type and encoding.** Byte length may use metadata; character length of multibyte text may require reading the value. Uncompressed external `text` and `bytea` can support partial substring fetches.[^four-strategies]
 
 6. **Partial JSONB updates rewrite the whole TOAST value.** `jsonb_set` produces a new value; the entire new value goes through TOAST again. Hot scalar fields belong in their own columns (Recipe 9).
 
@@ -557,7 +540,7 @@ Trade-offs:
 
 9. **TOAST tables cannot set `fillfactor`.** Cross-reference [30-hot-updates.md](./30-hot-updates.md) gotcha #8. They are always packed 100%, and HOT does not apply across the TOAST table's own rows.
 
-10. **`pg_column_size(col)` is not raw size — it is the on-disk size including TOAST pointer header.** For a 10 KB out-of-line value, `pg_column_size` returns ~18 (the pointer), not 10240. Use `octet_length(col::text)` or unwrap the varlena to get the logical content length.
+10. **`pg_column_size` reports the stored value size, accounting for compression.** Do not treat it as the fixed 18-byte external pointer size or as uncompressed logical length. See <https://www.postgresql.org/docs/16/functions-admin.html>.
 
 11. **`pg_column_compression` returns NULL for uncompressed values, *including* for non-TOAST-able types.** Don't write code that assumes NULL means "value missing." Use `IS NOT NULL` to check actual compression; `IS NULL` does not discriminate between "small in-line" and "EXTERNAL out-of-line".
 
@@ -579,7 +562,7 @@ Trade-offs:
 
 20. **Logical replication decodes TOASTed values lazily but transmits them in full.** For very wide values, the logical replication stream can be much larger than the equivalent physical WAL. The `REPLICA IDENTITY FULL` setting forces the old row including TOASTed columns into the WAL — be careful on tables with wide unmodified columns.
 
-21. **TOAST relations are not copied during ATTACH PARTITION CONCURRENTLY.** When attaching a partition, its existing TOAST relation comes with it; cross-partition TOAST tables do not exist. Each partition has its own.
+21. **ATTACH PARTITION has no CONCURRENTLY form.** Each ordinary partition retains its own associated TOAST relation. See <https://www.postgresql.org/docs/16/ddl-partitioning.html>.
 
 22. **No "TOAST de-TOAST" operator appears in EXPLAIN.** The cost is hidden in `Buffers: shared hit/read` under the parent scan. Always use `EXPLAIN (ANALYZE, BUFFERS)` when investigating wide-column queries.
 

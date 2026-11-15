@@ -104,7 +104,7 @@ Five rules that drive every FK design and debugging decision:
 4. **FKs do not inherit — in either direction — and the docs name no workaround.** Verbatim: *"Other types of constraints (unique, primary key, and foreign key constraints) are not inherited"* [^pg16-inherit]. The tutorial chapter is blunter still: *"There is no good workaround for this case"* [^pg16-inherit-no-workaround]. For declarative partitioning, the rules are different and better (see [partitioned tables](#foreign-keys-and-partitioned-tables)).
 
 
-5. **`ADD FOREIGN KEY` takes `SHARE ROW EXCLUSIVE` on both tables, not `ACCESS EXCLUSIVE`.** This is the most-misquoted lock level in Postgres. Verbatim: *"Although most forms of ADD table_constraint require an ACCESS EXCLUSIVE lock, ADD FOREIGN KEY requires only a SHARE ROW EXCLUSIVE lock. Note that ADD FOREIGN KEY also acquires a SHARE ROW EXCLUSIVE lock on the referenced table"* [^pg16-altertable]. Reads on both sides continue; conflicting DDL and `FOR UPDATE`/`FOR NO KEY UPDATE` row locks block. Use `NOT VALID` + `VALIDATE CONSTRAINT` to split the long lock window further (see [`37-constraints.md`](./37-constraints.md) NOT VALID section).
+5. **`ADD FOREIGN KEY` takes `SHARE ROW EXCLUSIVE` on both tables.** Reads and row-locking SELECTs continue, but ordinary INSERT, UPDATE, and DELETE acquire conflicting `ROW EXCLUSIVE` table locks and wait. Use `NOT VALID` and validate later to shorten the write-blocking interval.[^pg16-altertable]
 
 
 ## Decision Matrix
@@ -126,7 +126,7 @@ Five rules that drive every FK design and debugging decision:
 | Adding FK on partitioned table without long lock (PG18+) | `ADD FK ... NOT VALID` then `VALIDATE` | Single `ADD FK` | PG18 lifts the pre-PG18 partitioned-NOT-VALID prohibition [^pg18-notvalid-fk-part] |
 | Same FK column appears in two tables sharing semantics (e.g., `user_id`) | Two independent FKs to the parent | Trigger-based join consistency | Each FK is its own RI trigger pair |
 | Reference-table-only check (no enforcement, document only) on PG18 | `... NOT ENFORCED` | Trigger no-op | PG18 added per-constraint enforcement toggle [^pg18-notenforced] |
-| Time-bounded reference (effective dates) on PG18 | `... REFERENCES tbl (id, valid_at PERIOD)` | EXCLUDE-based hand-rolled | PG18 temporal FKs [^pg18-temporal] |
+| Time-bounded reference (effective dates) on PG18 | `... REFERENCES tbl (id, PERIOD valid_at)` | EXCLUDE-based hand-rolled | PG18 temporal FKs [^pg18-temporal] |
 | Replicate the table via logical replication | Ensure `REPLICA IDENTITY` is `PRIMARY KEY` or a chosen `UNIQUE` index | Rely on FK columns alone | FK columns don't auto-become replica identity [^pg16-pub-replica-identity] |
 
 **Three smell signals** that an FK is causing pain:
@@ -136,7 +136,7 @@ Five rules that drive every FK design and debugging decision:
 
 2. Tests with multiple `INSERT`s in a fixed order keep tripping over a chicken-and-egg cycle — circular FKs need `DEFERRABLE INITIALLY DEFERRED`, not application-level reordering.
 
-3. A bulk-import job runs slowly and `pg_stat_activity` shows `wait_event = RowExclusiveLock` on a parent table — FK INSERT/UPDATE acquires `ROW SHARE` on the referenced table; one slow validator can serialize the whole import.
+3. A bulk import waits on locks: inspect `pg_stat_activity.wait_event_type`, `wait_event`, and `pg_blocking_pids()` to distinguish a relation-lock conflict from row or transaction waits.
 
 
 ## Mechanics
@@ -204,7 +204,7 @@ Verbatim per-action from `CREATE TABLE` [^pg16-createtable]:
 ### RESTRICT vs NO ACTION
 
 
-The two actions are operationally identical *except* for deferrability. Both raise an integrity-violation error when removing/updating a referenced row would orphan a child.
+Deferrability is not the only difference: `ON UPDATE RESTRICT` also rejects changing a referenced value to a distinct value that compares equal, while `NO ACTION` can allow it if the final state still satisfies the FK.[^pg16-fk]
 
 
 | Property | `RESTRICT` | `NO ACTION` (default) |
@@ -366,7 +366,7 @@ Even with these exceptions, the index almost always pays for itself the first ti
 
 | Operation | Lock on this table | Lock on referenced table | Note |
 |---|---|---|---|
-| `ADD FOREIGN KEY` | `SHARE ROW EXCLUSIVE` | `SHARE ROW EXCLUSIVE` | Both sides locked; reads OK; row-level `FOR UPDATE` blocks [^pg16-altertable] |
+| `ADD FOREIGN KEY` | `SHARE ROW EXCLUSIVE` | `SHARE ROW EXCLUSIVE` | Reads continue; ordinary writes block [^pg16-altertable] |
 | `ADD FOREIGN KEY ... NOT VALID` | `SHARE ROW EXCLUSIVE` | `SHARE ROW EXCLUSIVE` | Skips full table scan |
 | `VALIDATE CONSTRAINT` (FK) | `SHARE UPDATE EXCLUSIVE` | `ROW SHARE` | Far less blocking; reads + writes continue on both sides [^pg16-altertable] |
 | `DROP CONSTRAINT` (FK) | `ACCESS EXCLUSIVE` | none | Standard DDL |
@@ -458,7 +458,7 @@ PostgreSQL has incrementally improved declarative-partitioning FK support across
 **Lock implication.** `ADD FOREIGN KEY` on a partitioned-table parent takes `SHARE ROW EXCLUSIVE` on the parent *and on every partition*. With many partitions, this can briefly contend with concurrent DDL across the partition tree. `NOT VALID` (PG18+) skips the full scan; `VALIDATE CONSTRAINT` then revalidates each partition under `SHARE UPDATE EXCLUSIVE` per partition.
 
 
-Pre-PG18 workaround if you can't declare `NOT VALID`: declare the FK on each leaf partition individually (each leaf is a regular table, supports `NOT VALID`), then attach the parent later — but this is gnarly enough that most teams just take the maintenance window.
+Pre-PG18, creating a parent FK requires validation rather than attaching independently declared leaf FKs as a substitute. Schedule the validation and its write-blocking locks.
 
 
 **Indexing.** A partitioned-table FK requires an index on the referenced side's PK or unique key, which is automatically present (PK creates a UNIQUE index). On the referencing side, you still need an index per partition for parent-DELETE performance (same rule as non-partitioned).
@@ -519,8 +519,8 @@ Worked example: prices with effective-date ranges, referenced by orders that mus
         id              bigserial PRIMARY KEY,
         product_id      bigint,
         period          tstzrange,
-        FOREIGN KEY (product_id, period PERIOD)
-            REFERENCES products (id, valid_at)
+        FOREIGN KEY (product_id, PERIOD period)
+            REFERENCES products (id, PERIOD valid_at)
     );
 
 
@@ -555,7 +555,7 @@ Use cases:
 
 > [!WARNING]
 
-> `NOT ENFORCED` is **not retroactive**. Switching an enforced FK to `NOT ENFORCED` does not delete its history of enforcement; switching from `NOT ENFORCED` back to `ENFORCED` does not retroactively validate the now-old data. Combined with `NOT VALID` + `VALIDATE`, you have four states: enforced+valid (default), enforced+not-valid (write-time only), not-enforced+valid (declarative only), not-enforced+not-valid (decorative).
+> A `NOT ENFORCED` constraint does not check writes. Do not assume existing rows satisfy it when enabling enforcement; consult the target version's `ALTER TABLE` behavior and validate the data before relying on it. See <https://www.postgresql.org/docs/18/sql-altertable.html>.
 
 
     ALTER TABLE orders
@@ -578,11 +578,9 @@ FK enforcement is implemented as a set of internal triggers visible in `pg_trigg
     SELECT t.tgname,
            t.tgtype,
            t.tgenabled,
-           CASE t.tgtype & 66 -- 64 = TRIGGER_TYPE_BEFORE, 2 = TRIGGER_TYPE_AFTER
-               WHEN 2  THEN 'AFTER'
-               WHEN 64 THEN 'BEFORE'
-           END AS timing,
-           t.tgconstraint::regclass::text  AS constraint,
+           CASE WHEN t.tgtype & 2 <> 0 THEN 'BEFORE'
+                WHEN t.tgtype & 64 <> 0 THEN 'INSTEAD OF'
+                ELSE 'AFTER' END AS timing,
            c.conname                       AS constraint_name
     FROM   pg_trigger t
     LEFT   JOIN pg_constraint c ON c.oid = t.tgconstraint
@@ -595,7 +593,7 @@ The triggers themselves call C-level functions (`RI_FKey_check_ins`, `RI_FKey_ch
 
 - **Disable** a constraint trigger to bypass FK enforcement (rare, dangerous): `ALTER TABLE child DISABLE TRIGGER ALL;` (also disables user triggers; prefer `ALTER TABLE child ALTER CONSTRAINT fkname NOT ENFORCED` on PG18+ for the same effect with safer scope).
 
-- **Inspect** for performance tracing: a hot FK shows up as time spent inside its RI trigger when running EXPLAIN ANALYZE with `track_function_call_count` semantics.
+- **Inspect** trigger execution time using `EXPLAIN ANALYZE` on a representative write inside a transaction that is rolled back, taking care with nontransactional side effects. See <https://www.postgresql.org/docs/16/using-explain.html>.
 
 
 ### Catalog introspection
@@ -643,10 +641,9 @@ Logical replication has two FK-specific interactions:
 1. **`REPLICA IDENTITY` is required for `UPDATE`/`DELETE` replication.** Verbatim [^pg16-pub-replica-identity]: *"A published table must have a replica identity configured in order to be able to replicate UPDATE and DELETE operations, so that appropriate rows to update or delete can be identified on the subscriber side ... If a table without a replica identity is added to a publication that replicates UPDATE or DELETE operations then subsequent UPDATE or DELETE operations will cause an error on the publisher. INSERT operations can proceed regardless of any replica identity."*
 
 
-2. **FK columns are not automatically part of replica identity.** The default `REPLICA IDENTITY` is the primary key; if your FK columns are not the PK and not a chosen unique-index identity, replication of an UPDATE on those FK columns transmits only the old-row identity, not the FK values. If you need to replicate FK-column changes, ensure the FK columns are either the PK or part of a `REPLICA IDENTITY USING INDEX` choice.
+2. **FK columns need not be part of replica identity for changes to replicate.** Replica identity identifies the old row; updates also transmit the new row according to the publication's column list. Unchanged TOAST values may be omitted. See <https://www.postgresql.org/docs/16/protocol-logicalrep-message-formats.html>.
 
-
-For FK enforcement on the subscriber side: subscribers enforce FKs the same as the publisher *only if* the FK definition is replicated separately (DDL is not auto-replicated; see [`74-logical-replication.md`](./74-logical-replication.md)). If you replicate data only, ensure FK constraints are created identically on both sides; otherwise the subscriber can accept rows the publisher would reject (or vice versa).
+Logical replication apply uses replica trigger mode by default, so ordinary FK enforcement triggers do not fire on the subscriber. Independently created FK definitions alone do not ensure subscriber enforcement; design and validate replication integrity explicitly. See <https://www.postgresql.org/docs/16/runtime-config-client.html#GUC-SESSION-REPLICATION-ROLE>.
 
 
 ## Per-Version Timeline
@@ -670,7 +667,7 @@ For FK enforcement on the subscriber side: subscribers enforce FKs the same as t
 ### Recipe 1 — Add an indexed FK from scratch
 
 
-Always add the index *first*, then the FK; that way the FK validation can use the index, and the FK is never live without its index.
+Index the referencing columns when parent-key updates or deletes need efficient lookups. PostgreSQL does not create that index automatically.[^pg16-fk]
 
 
     -- Schema
@@ -772,7 +769,7 @@ PostgreSQL's `EXPLAIN ANALYZE` of a DELETE reports per-trigger time at the botto
     -- Index the FK column for delete performance
     CREATE INDEX categories_parent_id_idx ON categories (parent_id);
 
-    -- Optional: enforce exactly one root (parent_id IS NULL)
+    -- Optional: enforce at most one root (parent_id IS NULL)
     CREATE UNIQUE INDEX categories_one_root
         ON categories ((1))
         WHERE parent_id IS NULL;
@@ -980,7 +977,7 @@ For a CHECK with `NO INHERIT`, see [`37-constraints.md`](./37-constraints.md). F
 13. **`pg_get_constraintdef()` reconstructs, not echoes.** Verbatim *"This is a decompiled reconstruction, not the original text of the command"* [^pg16-functions-info]. Comments and exact whitespace are lost; comparison against original CREATE statements must be semantic, not textual.
 
 
-14. **`convalidated = false` (NOT VALID) does not prevent new violations.** It just skips re-checking existing rows. New writes are enforced normally [^pg16-altertable].
+14. **`convalidated = false` skips checking historical rows, not new writes.** An enforced NOT VALID FK still rejects new violations.[^pg16-altertable]
 
 
 15. **`NOT ENFORCED` (PG18+) is the opposite: it disables runtime enforcement.** Even new writes are not checked. Don't confuse with `NOT VALID`. PG18 introduces both as separate features; combining them produces a four-state matrix (enforced+valid, enforced+not-valid, not-enforced+valid, not-enforced+not-valid).

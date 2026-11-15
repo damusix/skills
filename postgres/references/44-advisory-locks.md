@@ -42,7 +42,7 @@ Use this file when you are:
 - Looking at `pg_locks` and trying to decode an `advisory` row back to the application key.
 - Deciding whether advisory locks or `SELECT … FOR UPDATE` is the right pattern for cross-session coordination.
 
-If you need to lock rows in a way the database enforces, advisory locks are the **wrong** tool — use `SELECT … FOR UPDATE` (see [`43-locking.md`](./43-locking.md)). If you need cross-database-cluster coordination, advisory locks are also the wrong tool — they exist only within one cluster, with no cross-cluster propagation.
+Advisory locks are local to a database, not cluster-wide. Sessions connected to different databases do not conflict even with identical keys. They also do not coordinate separate clusters.[^pg-locks-advisory]
 
 
 ## Mental Model
@@ -55,7 +55,7 @@ Five rules that drive almost every advisory-lock decision:
 
 3. **There are two key spaces — a single `bigint` and a pair of `(int4, int4)` — and they do not overlap.** Verbatim: *"these two key spaces do not overlap."*[^key-spaces] A lock on `pg_advisory_lock(1)` is a **different** lock from `pg_advisory_lock(0, 1)`. Pick one form per application and stick with it. The two-int form is the canonical choice when you have two natural identifiers to combine (e.g., tenant_id + operation_id). The single-bigint form is canonical for hashed string identifiers.
 
-4. **Session-level locks stack — N acquires require N releases by the same backend.** Verbatim: *"Multiple session-level lock requests stack, so that if the same resource identifier is locked three times there must then be three unlock requests to release the resource in advance of session end."*[^stacking] Reentrancy by the current holder always succeeds: *"If a session already holds a given advisory lock, additional requests by it will always succeed, even if other sessions are awaiting the lock."*[^reentrancy] This means `pg_advisory_lock` is **not** idempotent — calling it twice in the same backend takes two slots. Use `pg_try_advisory_lock` with a held-already check if you need idempotence.
+4. **Session-level locks stack — N acquires require N releases by the same backend.** Reacquiring a held lock succeeds even when others wait; it increments the session's acquisition count. `pg_try_advisory_lock` also reacquires and is not an idempotent held-already check.[^stacking][^reentrancy]
 
 5. **Advisory locks consume shared memory from the same pool as row/table locks** — sized by `max_locks_per_transaction × (max_connections + max_prepared_transactions)`. Verbatim: *"Both advisory locks and regular locks are stored in a shared memory pool whose size is defined by the configuration variables `max_locks_per_transaction` and `max_connections`. Care must be taken not to exhaust this memory or the server will be unable to grant any locks at all."*[^shared-pool] On a cluster with `max_locks_per_transaction = 64` and `max_connections = 100`, there is a hard ceiling of roughly 6,400 concurrent locks (advisory + relation + tuple combined). Holding tens of thousands of session-level advisory locks across long-lived connections will drive the pool to exhaustion and break **all** locking — including DDL.
 
@@ -168,7 +168,7 @@ And: *"If a session already holds a given advisory lock, additional requests by 
 
 Three operational facts:
 
-1. **Calling `pg_advisory_lock(K)` twice in one backend takes two slots.** You must call `pg_advisory_unlock(K)` twice to actually release.
+1. **Calling `pg_advisory_lock(K)` twice in one backend requires two unlocks.** Repeated acquisitions of the same object and mode do not appear as separate `pg_locks` rows.
 2. **The current holder always succeeds on re-acquire — even if other backends are queued waiting for the lock.** This is the reentrancy guarantee.
 3. **Mixing scopes within one backend reentrantly is legal but confusing.** A backend holding a session-level lock can take a transaction-level lock on the same key (it succeeds because of reentrancy), and the transaction-level lock releases at COMMIT but the session-level one persists. Recipe 11 demonstrates.
 
@@ -301,15 +301,14 @@ SELECT pg_advisory_xact_lock(hashtext('migrations/v42_add_users_email.sql')::big
 
 -- ... DDL runs here ...
 ALTER TABLE users ADD COLUMN email text;
-CREATE UNIQUE INDEX CONCURRENTLY users_email_idx ON users(email);
+CREATE UNIQUE INDEX users_email_idx ON users(email);
 
 COMMIT;
 ```
 
 Why `pg_advisory_xact_lock` not `pg_advisory_lock`: the transaction-level form auto-releases at COMMIT. If the migration fails mid-DDL and rolls back, the lock releases too — the next attempt can retry cleanly. The session-level form would leave the lock held even after rollback (Rule 2), and a redeploy of the migration container would block forever until someone killed the original session.
 
-> [!WARNING]
-> `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block (see [`26-index-maintenance.md`](./26-index-maintenance.md)). Split the migration into separate transactions, taking `pg_advisory_xact_lock` in each, OR take a session-level `pg_advisory_lock` outside any transaction and release explicitly in a `finally` block.
+For `CREATE INDEX CONCURRENTLY`, which cannot run in a transaction block, keep a session-level advisory lock on the same dedicated connection across the entire migration and release it in a `finally` block. Separate transaction locks leave gaps in which another migrator can interleave.
 
 
 ### Recipe 3: Refresh materialized view with skip-if-running
@@ -478,15 +477,12 @@ Run this on any cluster that uses advisory locks at scale. Three-tier interpreta
 When your natural lock key is a string (migration filename, tenant slug, queue name), the canonical pattern is `hashtext(...)::bigint`. `hashtext` is `IMMUTABLE`, returns `int4`, and is stable across PG versions.
 
 ```sql
--- The cast to bigint is mandatory: hashtext returns int4 (32 bits), but
--- pg_advisory_lock with a single int argument would attempt the two-int
--- form. Casting to bigint forces the single-bigint form.
+-- The explicit bigint cast selects the one-key namespace. A single integer
+-- argument is also implicitly promoted to bigint.
 SELECT pg_advisory_xact_lock(hashtext('queue:invoice_emails')::bigint);
 ```
 
-Hash collisions are possible but unlikely in practice (32-bit hash space). If two semantically different lock names happen to hash to the same `int4`, you will get over-serialization — workers on the colliding keys will wait for each other. Mitigation: prefix every key with a namespace string that you keep distinct in your application (`'inv:foo'`, `'usr:foo'` — the prefix prevents most collisions).
-
-Do not use MD5/SHA1 for the hash. Those are slow `text`-returning functions; `hashtext` is the canonical fast PG hash and exactly the right tool here.
+The 32-bit hash can collide; distinct names then unnecessarily serialize. Prefixes organize names but do not prevent hash collisions. All cooperating clients must use the same key mapping; do not assume an internal hash function is stable across major upgrades.
 
 
 ### Recipe 10: Bound wait time with lock_timeout
@@ -503,7 +499,7 @@ COMMIT;
 
 `SET LOCAL` scopes the timeout to the current transaction. The raised SQLSTATE is `55P03 lock_not_available` (the same code as `NOWAIT` on row locks). Catch it in application code if you want graceful degradation.
 
-`lock_timeout` applies to advisory locks inside an explicit transaction. Outside a transaction (autocommit single-statement mode), `lock_timeout` does not apply to advisory-lock waits — use `statement_timeout` or `pg_try_advisory_lock()` in that context. See [`43-locking.md`](./43-locking.md) Gotcha #10 for the scoping rule.
+`lock_timeout` applies to advisory-lock waits in autocommit as well as explicit transactions. `SET LOCAL` requires a transaction; use session-level `SET` for an autocommit command.[^lock-fns]
 
 
 ### Recipe 11: Reentrancy and scope mixing
@@ -520,66 +516,36 @@ SELECT count(*) FROM pg_locks
 WHERE locktype = 'advisory'
   AND pid = pg_backend_pid()
   AND classid = 1 AND objid = 1;
--- Returns 3 (two session + one transaction) — stacked count.
+-- Returns 1: pg_locks reports one row per object, mode, and process.
 
 COMMIT;
--- Transaction-level entry released. Two session-level entries remain.
+-- Transaction-level hold released. The two session-level acquisitions remain.
 
 SELECT pg_advisory_unlock(1, 1);  -- true (one released)
 SELECT pg_advisory_unlock(1, 1);  -- true (second released)
 SELECT pg_advisory_unlock(1, 1);  -- false + WARNING (none left)
 ```
 
-This is the canonical demonstration of stacking (Rule 4). The held-count is observable in `pg_locks` — each acquisition is a separate row.
+The acquisition count is not exposed as separate `pg_locks` rows.[^pg-locks-advisory]
 
 
 ### Recipe 12: Lock-around a batch operation with rollback safety
 
-The full pattern for "do work under a session-level lock with rollback-safe release":
+Prefer transaction-level locks for work contained in one transaction; PostgreSQL releases them on commit or rollback, including cancellation:
 
 ```sql
-DO $$
-DECLARE
-    have_lock boolean;
-BEGIN
-    have_lock := pg_try_advisory_lock(99, 42);
-    IF NOT have_lock THEN
-        RAISE NOTICE 'lock not available, skipping';
-        RETURN;
-    END IF;
-
-    BEGIN
-        -- ... real work ...
-        UPDATE accounts SET balance = balance * 1.01 WHERE active = true;
-        -- (if this raises, the EXCEPTION block below catches it
-        --  and we still release the lock)
-    EXCEPTION WHEN OTHERS THEN
-        PERFORM pg_advisory_unlock(99, 42);
-        RAISE;
-    END;
-
-    PERFORM pg_advisory_unlock(99, 42);
-END $$;
+BEGIN;
+SELECT pg_advisory_xact_lock(99, 42);
+UPDATE accounts SET balance = balance * 1.01 WHERE active = true;
+COMMIT;
 ```
 
-The lock is acquired *outside* the inner BEGIN/EXCEPTION block, and the unlock appears *in two places* — once in the EXCEPTION handler (for failure path) and once after the inner block (for success path). Use `pg_advisory_xact_lock` instead if your work fits in one transaction (Recipe 5) — it releases automatically at COMMIT/ROLLBACK.
+Session locks survive rollback. If one is required across transactions, ensure the application releases it on every exit path or closes the connection; PL/pgSQL `WHEN OTHERS` does not catch every cancellation. See <https://www.postgresql.org/docs/16/plpgsql-control-structures.html>.
 
 
 ### Recipe 13: Audit advisory-lock holders across an HA failover
 
-After a streaming-replication failover (see [`77-standby-failover.md`](./77-standby-failover.md)), the new primary has **no** advisory locks held — slots are local to a postmaster instance and do not propagate via replication. Applications that depended on advisory locks for coordination must:
-
-1. **Reconnect** to the new primary.
-2. **Re-acquire** their locks.
-3. **Reconcile state** that may have been "protected" by an advisory lock that the new primary has never seen.
-
-```sql
--- Run on the new primary after failover. Should always return zero rows
--- immediately after promotion (because slots reset).
-SELECT count(*) FROM pg_locks WHERE locktype = 'advisory';
-```
-
-If the count is non-zero immediately after promotion, you have applications that have already reconnected and re-acquired — verify the operational sequence is correct. The takeaway: advisory locks are **not** durable HA primitives. For coordination that must survive failover, use a row in a table (which is replicated) or an external coordinator.
+Advisory locks are local to a PostgreSQL server and are not replicated. A promoted standby does not inherit the old primary's advisory locks, although existing standby sessions can hold their own locks. Applications must reconnect, re-acquire locks, and reconcile protected state. A replicated row or an external coordinator can provide durable coordination, but its failover and fencing semantics must be designed explicitly.[^advisory-cooperative]
 
 
 ## Gotchas / Anti-patterns
@@ -590,7 +556,7 @@ If the count is non-zero immediately after promotion, you have applications that
 
 3. **The two key spaces do not overlap.** `pg_advisory_lock(1)` and `pg_advisory_lock(0, 1)` are different locks. Workers using different forms will not see each other. Pick one form per application.
 
-4. **Session-level locks stack — N acquires require N releases.** Calling `pg_advisory_lock(K)` twice in one backend takes two slots. Do not assume `pg_advisory_lock` is idempotent.
+4. **Session-level locks stack — N acquires require N releases.** Reacquiring the same key increments its hold count, not a separate visible `pg_locks` row.
 
 5. **Reentrancy succeeds even when other backends are queued.** Verbatim: *"If a session already holds a given advisory lock, additional requests by it will always succeed, even if other sessions are awaiting the lock."*[^reentrancy] A backend that calls `pg_advisory_lock(K)` and waits for a second backend's reply that calls `pg_advisory_lock(K)` will deadlock — but if the same backend recursively re-acquires its own lock, it succeeds, which can mask logic bugs.
 
@@ -606,23 +572,23 @@ If the count is non-zero immediately after promotion, you have applications that
 
 11. **`max_locks_per_transaction` is restart-only.** If you exhaust the pool, raising the GUC requires a server restart. Plan for headroom up-front.
 
-12. **`hashtext(string)::bigint` is the right pattern for string keys; `md5(string)::bigint` is wrong.** `md5` returns text (a hex string); casting hex text to bigint either errors or silently truncates. `hashtext` returns `int4` cleanly.
+12. **Use a consistent key mapping for string identifiers.** `hashtext` returns a 32-bit integer and can collide; prefixing does not eliminate collisions. Coordinate mappings across clients and major upgrades.
 
 13. **Hash collisions are real but rare.** Two semantically distinct lock names hashing to the same `int4` will over-serialize. Mitigate by namespacing keys with a project-distinct prefix.
 
 14. **Cross-cluster coordination via advisory locks does not work.** Locks are postmaster-local. Replicas do not see the primary's advisory locks. After failover, all advisory locks reset.
 
-15. **Reading `pg_locks` to "check if anyone has the lock" is racy.** Between your SELECT and your acquire, another backend may have acquired. The atomic check is `pg_try_advisory_lock` itself.
+15. **Reading `pg_locks` to check availability is racy.** Use `pg_try_advisory_lock` for an atomic attempt, and remember that it succeeds reentrantly if this same session already holds the lock.[^reentrancy]
 
 16. **`pg_advisory_unlock_all()` releases only this session's locks, not the whole cluster's.** The function is implicitly invoked at session end — calling it explicitly is rarely useful and is **never** the right way to "clear stuck locks" in another backend.
 
 17. **No way to release another session's advisory locks.** The only way to force release is to terminate the holder with `pg_terminate_backend` — and that has all the standard caveats (see [`43-locking.md`](./43-locking.md) Recipe 10).
 
-18. **Advisory locks do not participate in `pg_blocking_pids()` output in the way relation locks do.** A backend waiting on an advisory lock will show in `pg_blocking_pids()` as blocked by the holder — but only if both are waiting in the same lock manager structure. `pg_safe_snapshot_blocking_pids` does not cover advisory locks at all.
+18. **`pg_blocking_pids()` includes advisory-lock blockers.** `pg_safe_snapshot_blocking_pids()` serves a different purpose and does not report ordinary advisory lock waits. See <https://www.postgresql.org/docs/16/functions-info.html>.
 
 19. **The wait event is `Lock:advisory`, not `Lock:relation`.** Monitoring dashboards filtering on `wait_event = 'relation'` will miss advisory-lock contention. Filter on `wait_event_type = 'Lock'` to catch all lock waits.
 
-20. **Empty arguments do not exist.** There is no `pg_advisory_lock()` with no arguments. You must supply either one bigint or two ints. Calling with a single int (not bigint) will error unless an int → bigint cast is implicit (it is, but only via promotion — better to be explicit with `::bigint`).
+20. **No zero-argument lock function exists.** Supply either one bigint or two integers; a single integer is implicitly promoted to bigint.[^lock-fns]
 
 21. **PG14, PG15, PG16, PG17, and PG18 have zero advisory-lock release-note items.** If a blog claims a recent PG version improved advisory locks, verify against the per-major release notes directly. The claim is almost certainly wrong, about a different feature, or about a third-party extension.
 

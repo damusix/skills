@@ -38,7 +38,7 @@ Five rules:
 
 3. **Three table classes, choose deliberately per table.** **Distributed** (hash-sharded by a column, lives on workers, N shards spread across them), **reference** (one shard replicated on every worker for joins / lookups), **local** (only on coordinator — small admin tables, sequences, audit). Choice between distributed vs reference vs local dominates query performance more than any tuning knob.[^3][^4]
 
-4. **Distribution-column choice is irreversible (online) and dominates joins.** Tables sharded on the same distribution column with the same shard count + colocation group are **co-located** — joins on the distribution column stay on one worker. Distribution columns that don't match across tables force network shuffles. Pick distribution column to match your dominant join key, not your primary key.[^5]
+4. **Distribution-column choice dominates joins.** Tables in the same colocation group have matching shard placement. Citus supports changing a distribution column with `alter_distributed_table`, but redistribution is an operational migration with locking and compatibility constraints. See <https://docs.citusdata.com/en/v13.0/develop/api_udf.html#alter-distributed-table>.
 
 5. **Schema-based sharding (Citus 12+) trades cross-tenant joins for zero data-model change.** `SELECT citus_schema_distribute('tenant_42')` makes that schema's tables co-located on a single worker, no `distributed_column` needed. Verbatim docs: "Schema-based sharding means that tables from the same schema are placed on the same node, while different schemas may be on different nodes." Limitation: "joins and foreign keys should only involve tables from the same schema."[^11]
 
@@ -151,8 +151,8 @@ Rules:
 
 - Distribution column must be `NOT NULL` and immutable per row (PK or stable identifier).
 - Picked from **dominant join key** + **dominant filter column** + **column with even cardinality** — bias toward join key wins ties.
-- **Cannot change distribution column online.** Requires drop + recreate (or `citus_split_shard_by_split_points` for re-sharding).
-- Hash partitioning: `hash(distribution_column) mod shard_count` chooses shard. Default `citus.shard_count = 32`.
+- **Changing distribution column:** use `alter_distributed_table(..., distribution_column := ...)` after assessing locks, foreign keys and colocation impact.
+- Citus hash distribution maps hashed values into shard ranges. Default `citus.shard_count = 32`.
 - `SELECT alter_distributed_table('events', shard_count => 64)` re-shards online (Citus 11+).
 
 ### Co-location
@@ -256,7 +256,7 @@ Properties:
 
 ```sql
 -- Hybrid: rowstore current + columnar archive
-CREATE TABLE events (id BIGINT, ts TIMESTAMPTZ, payload JSONB) PARTITION BY RANGE (ts);
+CREATE TABLE events (id BIGINT, tenant_id BIGINT NOT NULL, ts TIMESTAMPTZ, payload JSONB) PARTITION BY RANGE (ts);
 CREATE TABLE events_2026_05 PARTITION OF events FOR VALUES FROM ('2026-05-01') TO ('2026-06-01'); -- rowstore
 CREATE TABLE events_2026_04 PARTITION OF events FOR VALUES FROM ('2026-04-01') TO ('2026-05-01') USING columnar; -- columnar
 
@@ -538,15 +538,12 @@ SELECT * FROM pg_dist_node;
 
 ### Recipe 11: Migrate from single-node to Citus (online cutover)
 
-1. Stand up Citus cluster with same PG major.
-2. Use logical replication (cross-ref [74](./74-logical-replication.md)) coordinator side ← single-node source.
-3. After tables sync, on coordinator: `SELECT create_distributed_table('events', 'tenant_id')` for each (Citus allows distributing tables with data).
-4. Cut over connection strings.
+1. Stand up a compatible Citus cluster and rehearse the chosen distribution and logical-replication setup.
+2. Replicate an initial consistent copy while avoiding unreplicated DDL and ensuring compatible target schema.
+3. Fence source writers, wait for a published cutover marker on the target, and synchronize every sequence's value and `is_called` state.
+4. Distribute tables using a tested procedure that respects logical replication and Citus version restrictions; validate data before routing applications.
 
-Caveats:
-
-- `CREATE PUBLICATION ... FOR ALL TABLES` won't replicate sequence values — use `pg_dump --section=pre-data` first to load schema + sequences.
-- Logical replication does not replicate DDL (cross-ref [74](./74-logical-replication.md) gotcha) — pause DDL during cutover window.
+Schema-only dumps define sequences but do not synchronize their current values. See <https://www.postgresql.org/docs/16/logical-replication-restrictions.html>.
 
 ### Recipe 12: Inspect 2PC state after failure
 
@@ -557,8 +554,9 @@ SELECT * FROM pg_dist_transaction;
 -- Pending 2PC across workers
 SELECT gid, prepared, owner, database FROM pg_prepared_xacts;
 
--- Manually resolve a stuck 2PC (last resort, after verifying state on workers)
-ROLLBACK PREPARED 'citus_0_1234_5678_9';  -- or COMMIT PREPARED if all workers ready
+-- Do not resolve an individual participant based only on its local state.
+-- Consult the coordinator's durable outcome and the Citus recovery procedure;
+-- inconsistent manual COMMIT/ROLLBACK PREPARED can split the transaction.
 ```
 
 Cross-ref [41](./41-transactions.md) for PREPARE TRANSACTION mechanics.

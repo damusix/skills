@@ -194,7 +194,7 @@ Three subtle rules from `explicit-locking.html`:
 
 - **`UPDATE` and `DELETE` acquire `FOR UPDATE` automatically.** Any DELETE on a row takes the FOR UPDATE row-level lock; UPDATE takes either `FOR UPDATE` (if it modifies a column with a unique index usable in a foreign key) or `FOR NO KEY UPDATE` (otherwise). Verbatim: *"The `FOR UPDATE` lock mode is also acquired by any `DELETE` on a row, and also by an `UPDATE` that modifies the values of certain columns. Currently, the set of columns considered for the `UPDATE` case are those that have a unique index on them that can be used in a foreign key (so partial indexes and expressional indexes are not considered), but this may change in the future."*[^update-takes-for-update]
 
-- **`FOR KEY SHARE` is the FK-checker's lock.** Internal RI triggers (see [`38-foreign-keys-deep.md`](./38-foreign-keys-deep.md)) take `FOR KEY SHARE` on the referenced row when validating an FK from a child. This is why FK validation does not block normal `UPDATE`s on the parent — only `FOR UPDATE` and `FOR NO KEY UPDATE` (which would change the key) conflict.
+- **`FOR KEY SHARE` is the FK-checker's lock.** It conflicts with `FOR UPDATE`, but not with `FOR NO KEY UPDATE`; ordinary updates that do not change a referenced key can proceed concurrently.[^update-takes-for-update]
 
 - **Repeatable Read / Serializable interaction.** Verbatim: *"Within a `REPEATABLE READ` or `SERIALIZABLE` transaction, however, an error will be thrown if a row to be locked has changed since the transaction started."*[^repeatable-read-lock-fail] This raises `SQLSTATE 40001 serialization_failure` — same retry contract as the `SERIALIZABLE` mechanism (see [`42-isolation-levels.md`](./42-isolation-levels.md)).
 
@@ -279,7 +279,7 @@ Both sessions hold one row's `FOR UPDATE` lock and wait for the other. The deadl
 
 Two columns most readers don't know about:
 
-- **`fastpath`** (verbatim): *"True if lock was taken via fast path, false if taken via main lock table."*[^fastpath] The fast path is a per-backend cache for the four weakest non-conflicting modes (`ACCESS SHARE`, `ROW SHARE`, `ROW EXCLUSIVE`, `SHARE UPDATE EXCLUSIVE`). Fast-path locks are not visible to other backends until promoted, but conflict detection still works. `fastpath = true` does NOT mean the lock is weaker — it means it was tracked efficiently.
+- **`fastpath`** indicates a fast-path lock rather than a main lock-table entry. `pg_locks` gathers and displays fast-path locks; conflict detection still applies.[^fastpath]
 
 - **`waitstart`** (PG14+, verbatim): *"Time when the server process started waiting for this lock, or null if the lock is held. Note that this can be null for a very short period of time after the wait started even though `granted` is `false`."*[^waitstart-rule] Pre-PG14 you had no way to know how long a session had been waiting without manual instrumentation; PG14+ exposes it directly.
 
@@ -626,7 +626,7 @@ When a runaway session is blocking everything else:
     WHERE relation = 'public.orders'::regclass
     ORDER BY granted DESC, waitstart NULLS FIRST;
 
-Rows with `granted = true` are the holders (hard blockers). Rows with `granted = false` are the waiters; among them, the order (oldest `waitstart` first) is the queue order. A waiter is a soft block to all waiters behind it in the queue.
+Rows with `granted = true` hold locks; other rows are waiters. `waitstart` helps identify long waits but does not establish exact queue order or conflict relationships. Use `pg_blocking_pids` to identify hard and soft blockers.[^pg-blocking-pids]
 
 
 ### Recipe 12: Predicate lock visibility under SERIALIZABLE
@@ -680,7 +680,7 @@ The `source` column tells you whether each value is from `postgresql.conf`, `ALT
 
 ## Gotchas / Anti-patterns
 
-1. **`UPDATE`/`DELETE` take `FOR UPDATE` at the row level, automatically.** A naive `SELECT` followed by `UPDATE` is two statements, but the `UPDATE` itself acquires `FOR UPDATE` row-level locks on every row it touches. There is no "write without locking the row" — the UPDATE is the lock.
+1. **Writes acquire row locks automatically.** DELETE and an UPDATE changing certain FK-eligible unique-key values acquire `FOR UPDATE`; other UPDATEs acquire the weaker `FOR NO KEY UPDATE`.[^update-takes-for-update]
 
 2. **The default `LOCK TABLE` mode is `ACCESS EXCLUSIVE`.** Verbatim: *"If no lock mode is specified, then `ACCESS EXCLUSIVE`, the most restrictive mode, is used."*[^lock-default] Always specify the mode explicitly. `LOCK TABLE t` blocks everything including `SELECT`s.
 
@@ -696,9 +696,9 @@ The `source` column tells you whether each value is from `postgresql.conf`, `ALT
 
 8. **A PID of `0` in `pg_blocking_pids` means a prepared transaction blocker.** Find it with `SELECT * FROM pg_prepared_xacts;` and decide whether to `COMMIT PREPARED` or `ROLLBACK PREPARED`. See [`41-transactions.md`](./41-transactions.md).
 
-9. **`deadlock_timeout` is per-session settable (`PGC_SUSET`), not postmaster-only.** `SET deadlock_timeout = '2s'` in a session is valid for users with the `pg_maintain` predefined role or superusers. It controls how long *this* session waits before running the deadlock check — not a cluster-wide detection interval. Lowering it for one session makes that session's deadlock checks more aggressive at the cost of slightly more CPU on its lock waits.
+9. **`deadlock_timeout` is a superuser-context setting, not postmaster-only.** A superuser or role granted `SET` privilege on the parameter can set it for a session. It controls how long that session waits before checking for deadlocks. See <https://www.postgresql.org/docs/16/runtime-config-locks.html>.
 
-10. **`lock_timeout` applies to `pg_advisory_lock()` waits inside an explicit transaction.** Within a `BEGIN … COMMIT` block, `SET LOCAL lock_timeout = '5s'` before `pg_advisory_lock(key)` raises `SQLSTATE 55P03 lock_not_available` if the advisory lock cannot be acquired within the timeout. Outside a transaction (implicit autocommit statement), `lock_timeout` does not apply to advisory-lock waits — use `statement_timeout` or `pg_try_advisory_lock()` instead. See [`44-advisory-locks.md`](./44-advisory-locks.md) Recipe 10 for the full pattern.
+10. **`lock_timeout` applies to advisory-lock waits**, including an autocommit statement. Use `SET` for the session or `SET LOCAL` within an explicit transaction; `pg_try_advisory_lock()` instead returns immediately. See <https://www.postgresql.org/docs/16/runtime-config-client.html>.
 
 11. **`max_locks_per_transaction` is an average, not a hard per-transaction cap.** Verbatim: *"This parameter limits the average number of object locks used by each transaction; individual transactions can lock more objects as long as the locks of all transactions fit in the lock table."*[^max-locks] You hit the "out of shared memory" error only when total across all transactions exceeds the slot pool.
 
@@ -706,7 +706,7 @@ The `source` column tells you whether each value is from `postgresql.conf`, `ALT
 
 13. **A standby must have `max_locks_per_transaction` ≥ primary.** Verbatim: *"When running a standby server, you must set this parameter to have the same or higher value as on the primary server. Otherwise, queries will not be allowed in the standby server."*[^max-locks] Same applies to `max_pred_locks_per_transaction` and similar settings; verify before upgrading either side.
 
-14. **`fastpath = true` does not mean a weaker lock.** It means the lock was tracked in the per-backend fast-path cache, available only for the four weakest modes (`ACCESS SHARE`, `ROW SHARE`, `ROW EXCLUSIVE`, `SHARE UPDATE EXCLUSIVE`). Conflict detection still works correctly; the lock is just cheaper to acquire.
+14. **`fastpath = true` does not mean a weaker lock.** It means the lock was tracked using the fast-path mechanism. Conflict detection still applies. See <https://www.postgresql.org/docs/16/view-pg-locks.html>.
 
 15. **`waitstart` can be null for a granted lock OR briefly null for a wait.** Verbatim PG14+: *"Note that this can be null for a very short period of time after the wait started even though `granted` is `false`."*[^waitstart-rule] Filter on `granted = false` AND `waitstart IS NOT NULL` if you specifically want "waiting AND wait-time known."
 
@@ -716,7 +716,7 @@ The `source` column tells you whether each value is from `postgresql.conf`, `ALT
 
 18. **REPEATABLE READ and SERIALIZABLE turn lock-wait failures into serialization failures.** Verbatim: *"Within a `REPEATABLE READ` or `SERIALIZABLE` transaction, however, an error will be thrown if a row to be locked has changed since the transaction started."*[^repeatable-read-lock-fail] You get `SQLSTATE 40001` instead of waiting — and the retry contract from [`42-isolation-levels.md`](./42-isolation-levels.md) Rule 5 applies.
 
-19. **`pg_locks` does not show wait queue order directly.** The order is implied by `waitstart` (PG14+) — earlier `waitstart` = ahead in the queue. Pre-PG14 you have no way to determine the queue order from the view alone.
+19. **`pg_locks` does not show wait-queue order.** `waitstart` is not a reliable ordering of the current queue; use `pg_blocking_pids` to identify blockers. See <https://www.postgresql.org/docs/16/view-pg-locks.html>.
 
 20. **`CREATE INDEX CONCURRENTLY` takes `SHARE UPDATE EXCLUSIVE`, which is self-conflicting.** You cannot run two `CREATE INDEX CONCURRENTLY` operations on the same table simultaneously — the second waits. Also blocks `VACUUM`, `ANALYZE`, and other concurrent maintenance on the same table for the duration. See [`26-index-maintenance.md`](./26-index-maintenance.md).
 
@@ -730,7 +730,7 @@ The `source` column tells you whether each value is from `postgresql.conf`, `ALT
 ## See Also
 
 - [`27-mvcc-internals.md`](./27-mvcc-internals.md) — the snapshot/xmin/xmax model that determines what row-level locks see.
-- [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md) — VACUUM's `SHARE UPDATE EXCLUSIVE` conflict matrix, the `(to prevent wraparound)` autovacuum that cannot be cancelled.
+- [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md) — VACUUM's `SHARE UPDATE EXCLUSIVE` conflict matrix; anti-wraparound autovacuum is not automatically cancelled by conflicting locks.
 - [`38-foreign-keys-deep.md`](./38-foreign-keys-deep.md) — FK enforcement via internal RI triggers taking `FOR KEY SHARE`.
 - [`41-transactions.md`](./41-transactions.md) — `BEGIN`/`COMMIT`/`ROLLBACK`, savepoints (which acquire row locks via `FOR UPDATE`), `idle_in_transaction_session_timeout`.
 - [`42-isolation-levels.md`](./42-isolation-levels.md) — predicate locks (`SIReadLock`), `40001` serialization failures, the retry contract.

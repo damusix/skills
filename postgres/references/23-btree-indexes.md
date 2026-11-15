@@ -146,7 +146,7 @@ For an index on `(a, b, c)`:
 - `WHERE a = 5 AND b = 42 AND c = 77` — every column used; tight scan
 - `WHERE a = 5 AND b = 42 AND c < 77` — `a`, `b` bound; `c` does a one-sided range
 - `WHERE a = 5 AND b >= 42 AND c < 77` — `a` bound; `b` does a range; `c` is *post-scanned* (entries with `c >= 77` are skipped but the leaf pages still get read)
-- `WHERE a = 5 AND c < 77` — `a` bound; `c` is a filter, not an index condition (pre-PG18)
+- `WHERE a = 5 AND c < 77` — `a` limits the scan; `c` can be checked in the index, but generally does not reduce the scanned portion in PG16.
 - `WHERE c < 77` alone — pre-PG18, this is essentially a full index scan equivalent to a seqscan
 
 For ordering, a query with `ORDER BY a, b, c` can use the index without sort; `ORDER BY a, c` cannot.
@@ -175,7 +175,7 @@ A duplicate is a leaf-page tuple where all indexed key columns match at least on
 
 Docs: *"Deduplication works by periodically merging groups of duplicate tuples together, forming a single posting list tuple for each group. The column key value(s) only appear once in this representation. This is followed by a sorted array of TIDs that point to rows in the table."*[^impl]
 
-Deduplication is **enabled by default** and triggers lazily — verbatim: *"The deduplication process occurs lazily, when a new item is inserted that cannot fit on an existing leaf page, though only when index tuple deletion could not free sufficient space for the new item."*[^impl] It is the page-split-deferral mechanism that runs before bottom-up index deletion does.
+Deduplication is **enabled by default** and triggers lazily when a new item does not fit and index tuple deletion cannot free enough space.[^impl]
 
 Dedup cannot be used in the following cases (the index simply has dedup disabled):
 
@@ -195,7 +195,7 @@ Control:
     ALTER INDEX idx SET (deduplicate_items = off);
     REINDEX INDEX idx;
 
-The `pg_index.indisdeduplicated` (PG13+ equivalent via `bt_metap().allequalimage`) and the `bt_metap()` `allequalimage` field together let you check whether an index is even eligible. `allequalimage = t` means all opclass-equal values are bitwise identical, so dedup can proceed safely; `f` means the opclass disqualifies dedup.
+`bt_metap(...).allequalimage` reports whether the index's operator classes and collations support equal-image deduplication. The index option `deduplicate_items` and `INCLUDE` columns also affect whether deduplication is used.
 
 > [!WARNING] Minor releases 2026-08-13 / 2026-11-12
 > The 2026-11-12 minors (18.7 and the matching older branches) disable btree deduplication for columns declared as `bpchar` (no length, `atttypmod = -1`); `char` and `char(n)` are not affected. Existing entries in such indexes are not repaired, so `REINDEX` indexes on `bpchar` columns.[^minor-18-7] The 2026-08-13 minors fixed an integer overflow in comparisons on btree indexes over `ltree` with more than about 14,653 labels; reindex those indexes too.[^minor-aug-announce] Full CVE list: <https://www.postgresql.org/support/security/>.
@@ -278,7 +278,7 @@ Two requirements:
 1. **The index must store every column the query references** — either as a key column or via `INCLUDE`. *"The index type must support index-only scans. B-tree indexes always do."*[^ios]
 2. **The visibility map must indicate the heap page is all-visible.** Docs: *"Visibility information is not stored in index entries, only in heap entries; so at first glance it would seem that every row retrieval would require a heap access anyway. ... PostgreSQL tracks, for each page in a table's heap, whether all rows stored in that page are old enough to be visible to all current and future transactions. This information is stored in a bit in the table's visibility map. An index-only scan, after finding a candidate index entry, checks the visibility map bit for the corresponding heap page. If it's set, the row is known visible and so the data can be returned with no further work."*[^ios]
 
-`EXPLAIN (ANALYZE, BUFFERS)` shows `Heap Fetches: N` for an index-only scan. `N > 0` means the visibility map was not set on at least N heap pages and the heap was visited anyway. Cause: insufficient autovacuum frequency, or a long-running transaction blocking xmin advance and pinning the visibility map open. See [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md).
+`EXPLAIN (ANALYZE, BUFFERS)` shows `Heap Fetches: N` for an index-only scan. This counts heap fetches, not distinct pages. Recently modified pages and snapshots that delay vacuum can leave all-visible bits unset.[^ios]
 
 Verbatim closing rule: *"In short, while an index-only scan is possible given the two fundamental requirements, it will be a win only if a significant fraction of the table's heap pages have their all-visible map bits set. But tables in which a large fraction of the rows are unchanging are common enough to make this type of scan very useful in practice."*[^ios]
 
@@ -287,11 +287,11 @@ Verbatim closing rule: *"In short, while an index-only scan is possible given th
 > [!NOTE] PostgreSQL 11
 > Docs: *"Allow parallel building of a btree index."*[^pg11-parallel] `CREATE INDEX` (without `CONCURRENTLY`) parallelizes the sort phase across `max_parallel_maintenance_workers` (default 2 since PG11). On a large table, this is a 2–4× build-time reduction.
 
-Parallel build does not apply to `CREATE INDEX CONCURRENTLY`. The CONCURRENTLY variant intentionally does extra scans to avoid blocking writes; parallel workers are not coordinated with that protocol.
+`CREATE INDEX CONCURRENTLY` can parallelize its first table scan; its validation scan is not parallel.[^storage]
 
 Maintenance settings:
 
-    SET maintenance_work_mem = '4GB';     -- per-process sort memory
+    SET maintenance_work_mem = '4GB';     -- total budget for the index build
     SET max_parallel_maintenance_workers = 8;
     CREATE INDEX idx ON huge_table (col); -- parallel sort if planner picks it
 
@@ -304,9 +304,9 @@ A B-tree can index an expression rather than a bare column. The expression must 
     SELECT * FROM users WHERE lower(email) = lower($1);
 
     -- Day-bucket on a timestamptz column for hourly analytics
-    CREATE INDEX events_day_idx ON events (date_trunc('day', occurred_at));
+    CREATE INDEX events_day_idx ON events (date_trunc('day', occurred_at, 'UTC'));
     SELECT count(*) FROM events
-    WHERE date_trunc('day', occurred_at) = '2026-03-01';
+    WHERE date_trunc('day', occurred_at, 'UTC') = '2026-03-01 00:00+00'::timestamptz;
 
 > [!NOTE] PostgreSQL 16
 > The three-argument form `date_trunc(unit, timestamptz, time_zone)` was reclassified as `IMMUTABLE` in PG16, enabling expression indexes on bucketed-with-zone timestamps. See [`19-timestamp-timezones.md`](./19-timestamp-timezones.md).
@@ -315,9 +315,9 @@ The function used in the indexed expression must be `IMMUTABLE`, never `STABLE` 
 
 - `now()` / `current_date` — `STABLE` per-transaction, but mutable across transactions.
 - `to_char(timestamptz, ...)` — `STABLE`, depends on the session's `DateStyle` / `TimeZone`.
-- `lower(text)` — `IMMUTABLE` *only* under a deterministic collation; an `IMMUTABLE` lower on a nondeterministic-collation column will fail at index build.
+- `lower(text)` can be indexed, including with nondeterministic collations; collation behavior and matching query expressions still matter.
 
-Expression indexes don't deduplicate (the expression result is computed and stored, but the opclass may not advertise `equalimage`). Inspect `bt_metap().allequalimage` to confirm.
+Expression indexes can deduplicate when the result's operator class and collation support it and no other restriction applies.
 
 ### Partial B-tree indexes
 
@@ -607,8 +607,8 @@ Index entries over the limit raise `index row size N exceeds btree version 4 max
 17. **B-tree is not a sort substitute for ad-hoc DISTINCT.** An Index Scan does return rows in index order, but `SELECT DISTINCT col FROM big_table` rarely uses an index alone — the planner usually picks HashAggregate or GroupAggregate. A B-tree on `col` becomes useful only when combined with a `LIMIT` for top-N distinct.
 18. **`bt_metap().allequalimage = f` is informational, not an error.** Many legitimate B-trees disable dedup (numeric, jsonb, container). The signal is only worth investigating when the column is `text`, `varchar`, or `char` and the cardinality looks low — that's where dedup should help and the `f` flag indicates a nondeterministic collation or some other disqualifier.
 19. **Index entry > 1/3 page raises at insert time.** Wide indexed text columns work fine for short rows and fail for long rows. The error is `index row size ... exceeds btree version 4 maximum`. Plan ahead with a hash-of-content functional index or a GIN trigram index.
-20. **CONCURRENTLY does not parallelize.** `CREATE INDEX CONCURRENTLY` skips parallel workers by design. Production builds on huge tables take much longer than the non-concurrent equivalent. Plan accordingly. See [`26-index-maintenance.md`](./26-index-maintenance.md).
-21. **The catalog version of `pg_index.indisready` vs `indisvalid`.** A `CREATE INDEX CONCURRENTLY` that fails halfway leaves the index `indisvalid = false` but takes up disk space and slows writes. Always audit and drop invalid indexes:
+20. **Concurrent builds can use parallel workers.** Only the first table scan of `CREATE INDEX CONCURRENTLY` is parallel; validation is serial.[^storage]
+21. **`indisready` and `indisvalid` describe different build states.** Investigate invalid indexes before dropping them; active builds and incomplete partitioned indexes can also appear here:
 
         SELECT n.nspname, c.relname AS table_name, i.relname AS index_name,
                x.indisvalid, x.indisready
@@ -619,7 +619,7 @@ Index entries over the limit raise `index row size N exceeds btree version 4 max
         WHERE NOT x.indisvalid OR NOT x.indisready;
 
 22. **Skip scan is a planner choice, not a query rewrite.** PG18 may or may not pick skip scan depending on the leading column's `n_distinct`. If it doesn't pick it when you expected, run `ANALYZE` (statistics may be stale) and re-check with `EXPLAIN`. A `pg_stats.n_distinct` of `-1` (every row distinct) disqualifies skip scan.
-23. **Parallel build memory is per-worker.** `maintenance_work_mem = '4GB'` with `max_parallel_maintenance_workers = 8` budgets up to 32 GB. Set them deliberately on memory-constrained machines.
+23. **Parallel build memory is a total budget.** `maintenance_work_mem` limits the index build as a whole, including its workers.[^storage]
 
 ## See Also
 

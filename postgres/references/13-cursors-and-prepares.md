@@ -42,7 +42,7 @@ Reach for this file when you need to:
 - Hand a result set across function boundaries (return `refcursor`).
 - Reuse a parsed/planned SQL template many times in one session (`PREPARE` / `EXECUTE`).
 - Debug a "fast on first call, slow on the sixth call" prepared-statement regression — almost always plan-cache flipping.
-- Understand why pgBouncer in transaction-pooling mode broke your prepared statements (and what PG17+ protocol-level support changes).
+- Understand transaction-pooling limitations and PgBouncer's protocol-level prepared-statement support.
 - Decide between in-PL/pgSQL `FOR rec IN query LOOP`, an explicit cursor, and a one-shot `SELECT ... INTO` capture.
 
 PL/pgSQL-level cursor flow is also covered in [`08-plpgsql.md`](./08-plpgsql.md) at the syntax-fluent level. This file covers: the full SQL-level surface (`DECLARE`/`FETCH`/`MOVE`/`CLOSE`/`PREPARE`/`EXECUTE`/`DEALLOCATE`/`DISCARD`), `plan_cache_mode`, the generic-vs-custom-plan decision, and the per-session caches you can inspect.
@@ -80,7 +80,7 @@ Option-by-option semantics, verbatim from `sql-declare.html`[^pg-decl]:
 
 - **`BINARY`** — rows come back in PostgreSQL binary wire format, not text. *"Many applications, including psql, are not prepared to handle binary cursors."* Reserve for native-protocol clients that explicitly opt in.
 
-- **`ASENSITIVE` / `INSENSITIVE`** — *"All cursors are insensitive; so these key words have no effect and are only accepted for compatibility with the SQL standard."* Cannot be combined with `FOR UPDATE`/`FOR SHARE`.
+- **`ASENSITIVE` / `INSENSITIVE`** — PostgreSQL cursors are insensitive. Explicit `INSENSITIVE` cannot be combined with `FOR UPDATE`/`FOR SHARE`.
 
 - **`SCROLL` / `NO SCROLL`** — `SCROLL` permits non-sequential and backward fetches. *"The default is to allow scrolling in some cases; this is not the same as specifying `SCROLL`. PostgreSQL will allow backward fetches without `SCROLL`, if the cursor's query plan is simple enough that no extra overhead is needed to support it."* Treat the default as "forward-only" — explicitly declare `SCROLL` if you ever fetch backward.
 
@@ -176,9 +176,9 @@ COMMIT;
 
 Rules:
 
-- Must declare with `FOR UPDATE` (or `FOR NO KEY UPDATE` / `FOR SHARE` / `FOR KEY SHARE`).
-- The underlying query must be "simply updatable" — single table, no `GROUP BY`, no `ORDER BY`, no aggregates, no joins (or be made so via a `WHERE CURRENT OF`-compatible plan).
-- Cannot combine with `WITH HOLD`, `SCROLL`, or `INSENSITIVE`.
+- `FOR UPDATE` is recommended to lock fetched rows and guarantee updatability; without it, `WHERE CURRENT OF` can still work but concurrent updates and plan shape matter.
+- Without row locking, a simply updatable query references one table and uses neither grouping nor `ORDER BY`; other shapes might work depending on the plan.
+- `FOR UPDATE` cannot be combined with `WITH HOLD`, `SCROLL`, or explicit `INSENSITIVE`.[^pg-decl]
 
 For most use cases prefer keyset-based update (`UPDATE jobs SET ... WHERE id = $1`) — cursor-bound `WHERE CURRENT OF` is largely a legacy SQL-standard interface.
 
@@ -270,10 +270,10 @@ END LOOP;
 A function returning `refcursor` hands a named portal back to the caller, which can then `FETCH` from it client-side:
 
 ```sql
-CREATE FUNCTION jobs_pending(OUT cur refcursor) AS $$
+CREATE FUNCTION jobs_pending(IN cur refcursor) RETURNS refcursor AS $$
 BEGIN
     OPEN cur FOR SELECT id, payload FROM jobs WHERE status = 'pending';
-END;
+    RETURN cur;
 $$ LANGUAGE plpgsql;
 
 BEGIN;
@@ -302,7 +302,7 @@ PREPARE find_user (int) AS
 PREPARE find_logs AS
     SELECT * FROM users u, logs l
     WHERE u.id = $1 AND u.id = l.user_id AND l.created_at = $2;
--- $2 type inferred at first EXECUTE
+-- $2 type is inferred when PREPARE analyzes the statement.
 ```
 
 Key facts:
@@ -377,13 +377,7 @@ The rule, verbatim from `sql-prepare.html`[^pg-prep]:
 
 Translated:
 
-| Execution # | Plan used |
-|---|---|
-| 1 – 5 | Custom plan, planned with current parameter values |
-| 6 | Generic plan created; compared to average of first five custom costs |
-| 7+ | Generic plan if generic_cost ≤ avg(custom_cost) + planning_overhead; otherwise custom plan each time |
-
-The decision is **per-EXECUTE**: once enough custom evidence is gathered the planner can choose generic for some calls and custom for others depending on the parameter values' selectivity estimates.
+The first five executions use custom plans. At the sixth execution PostgreSQL builds and compares a generic plan, then selects generic or custom based on estimated cost including planning overhead. The choice can be reconsidered as cost estimates change; it is not a fresh comparison against each current parameter's selectivity.
 
 This is why a query slows on the sixth call — the planner switched to a generic plan that picked a Seq Scan because the parameter is no longer known to be highly selective.
 
@@ -453,8 +447,8 @@ Most modern PG drivers (libpq, psycopg2/3, pgjdbc, npgsql, node-postgres) issue 
 > INSERT INTO tbl1 VALUES ($1, $2) \bind 'first value' 'second value' \g
 > ```
 
-> [!NOTE] PostgreSQL 17 protocol-prepared support
-> Three new libpq functions land in PG17 for closing portals and prepared statements explicitly: `PQclosePrepared`, `PQclosePortal`, `PQsendClosePrepared`, `PQsendClosePortal`[^pg17-libpq]. Together with pgBouncer 1.21+ this enables transparent **prepared-statement support in transaction-pooling mode** — pgBouncer can now track Parse/Bind/Close per backend and re-prepare across pool members. Previously, prepared statements were a hard-no for pgBouncer's transaction mode. See [`81-pgbouncer.md`](./81-pgbouncer.md) for the pooler-side details.
+> [!NOTE] Protocol prepared statements and pooling
+> PgBouncer 1.21+ supports named protocol-level prepared statements when `max_prepared_statements` is nonzero; this does not require PostgreSQL 17. SQL-level `PREPARE` remains session-scoped. PG17 separately added libpq close APIs.[^pg17-libpq] See [PgBouncer's release notes](https://www.pgbouncer.org/2023/10/pgbouncer-1-21-0).
 
 > [!NOTE] PostgreSQL 18 psql `\parse`/`\bind_named`/`\close_prepared`
 > PG18 adds psql meta-commands for the full protocol-level prepared-statement lifecycle from the shell[^pg18-psql-prep]:
@@ -480,7 +474,7 @@ Most modern PG drivers (libpq, psycopg2/3, pgjdbc, npgsql, node-postgres) issue 
 | Diagnose "fast first time, slow later" | Inspect `pg_prepared_statements.generic_plans` / `custom_plans`; flip `plan_cache_mode = 'force_custom_plan'` | Guessing — measure first |
 | Reset all session state between pool checkouts | `DISCARD ALL` on release | `DEALLOCATE ALL` alone (leaves cursors, advisory locks, temp tables, GUC overrides) |
 | Stream a large `SELECT` in psql | `\set FETCH_COUNT 1000` then run the query | Manual `DECLARE`/`FETCH` if `psql` will do it for you |
-| Use prepared statements behind a connection pooler | Session pooling, or transaction pooling on pgBouncer 1.21+ with PG17 protocol prepare support | Transaction pooling with SQL-level `PREPARE` on PG < 17 / pgBouncer < 1.21 |
+| Use prepared statements behind a connection pooler | Session pooling, or protocol-level prepares with PgBouncer 1.21+ and `max_prepared_statements` enabled | Assuming SQL-level `PREPARE` survives transaction-pool checkout |
 
 ## Examples / Recipes
 
@@ -599,19 +593,19 @@ EXECUTE jobs_by_status('archived');    -- custom: Seq Scan
 ```sql
 PREPARE s1 (int) AS SELECT * FROM users WHERE id = $1;
 
-DO $$
-BEGIN
-    FOR i IN 1..10 LOOP
-        PERFORM (EXECUTE 's1' USING i);   -- via PL — see note below
-    END LOOP;
-END $$;
+EXECUTE s1(1);
+EXECUTE s1(2);
+EXECUTE s1(3);
+EXECUTE s1(4);
+EXECUTE s1(5);
+EXECUTE s1(6);
 
 SELECT name, generic_plans, custom_plans
 FROM pg_prepared_statements
 WHERE name = 's1';
 ```
 
-(For a real session, replace the inner loop with ten `EXECUTE s1(1..10);` lines; the PL `PERFORM` here is illustrative. The `pg_prepared_statements.generic_plans` counter advances starting around execution six on `auto`.)
+The generic counter increases only if the cost comparison favors a generic plan.
 
 ### Recipe 7 — Cursor over a dynamic query
 
@@ -641,39 +635,7 @@ Identifier substitution goes through `format(%s, p_table::text)` (with `regclass
 
 ### Recipe 8 — Holdable cursor for chunked DML across COMMITs
 
-Common in a procedure that wants to commit after each batch:
-
-```sql
-CREATE PROCEDURE archive_old_events() LANGUAGE plpgsql AS $$
-DECLARE
-    cur CURSOR WITH HOLD FOR
-        SELECT id FROM events
-        WHERE created_at < now() - interval '90 days'
-        ORDER BY id
-        LIMIT 1000000;       -- bound the materialization
-    rec record;
-    cnt int := 0;
-BEGIN
-    OPEN cur;
-    COMMIT;                  -- materializes cursor
-
-    LOOP
-        FETCH cur INTO rec;
-        EXIT WHEN NOT FOUND;
-        DELETE FROM events WHERE id = rec.id;
-        cnt := cnt + 1;
-        IF cnt % 1000 = 0 THEN
-            COMMIT;          -- cursor stays open across commits
-        END IF;
-    END LOOP;
-
-    CLOSE cur;
-    COMMIT;
-END;
-$$;
-```
-
-The `LIMIT` on the cursor's query is essential — without it, the `WITH HOLD` materialization at the first `COMMIT` copies the entire archive candidate set into temp storage. See [`07-procedures.md`](./07-procedures.md) for the broader chunked-DML pattern.
+PL/pgSQL cursor declarations do not support `WITH HOLD`. A read-only `FOR ... IN SELECT` loop is converted to a holdable cursor by the first transaction end, which materializes its result. For large workloads, prefer the repeated bounded batch pattern in [`07-procedures.md`](./07-procedures.md#recipe-1--chunked-dml-with-periodic-commit).
 
 ### Recipe 9 — Audit a session for prepared-statement bloat
 
@@ -763,7 +725,7 @@ Without `WITH HOLD`, the volatile-function caveat from `sql-declare.html`[^pg-de
 
 7. **Closure is not transactional.** A `CLOSE` issued inside a savepoint that later rolls back does **not** un-close the cursor[^pg-close]. Treat closure as commit-immediately even mid-transaction.
 
-8. **`PREPARE` is per-session and per-connection.** Behind a connection pooler in transaction mode, every checkout potentially lands on a different backend. SQL-level `PREPARE` does not survive that checkout. Use session pooling, or PG17+ pgBouncer 1.21+ protocol-level prepared-statement support.
+8. **`PREPARE` is per-session and per-connection.** Transaction pooling may select another backend on the next checkout. Use session pooling or enabled PgBouncer 1.21+ protocol-level prepared-statement tracking; it does not make SQL-level `PREPARE` portable across sessions.
 
 9. **Generic-plan regression on the sixth call.** A query that's fast through the first five `EXECUTE`s then slows down has flipped to a generic plan whose selectivity estimate doesn't fit your parameters. Verify with `EXPLAIN EXECUTE`; fix with `plan_cache_mode = 'force_custom_plan'` (or rewrite to use literals).
 
@@ -779,7 +741,7 @@ Without `WITH HOLD`, the volatile-function caveat from `sql-declare.html`[^pg-de
 
 15. **`pg_prepared_statements.generic_plans`/`custom_plans` are PG14+.** Pre-PG14 the only way to see which plan was used is `EXPLAIN EXECUTE` or `auto_explain` with `log_min_duration = 0` and `log_nested_statements = on`. Plan diagnosing on PG13 and older is materially harder.
 
-16. **`force_generic_plan` does not pre-plan eagerly.** From `runtime-config-query.html`[^pg-pcm]: *"This setting is considered when a cached plan is to be executed, not when it is prepared."* The first `EXECUTE` is still custom-planned to seed the cache; from execution two onwards it's generic. Set it before the *executions*, not before the `PREPARE`, if you care.
+16. **`force_generic_plan` is considered at execution.** When selected before the first execution, it selects a generic plan from that execution; it does not require a custom-plan warmup.[^pg-pcm]
 
 17. **`FOR UPDATE` cursor must be inside the same transaction as the `WHERE CURRENT OF`.** Holdable + updatable is forbidden by the grammar; even a non-holdable cursor's row locks are released at `COMMIT`. If you `COMMIT` mid-iteration the `WHERE CURRENT OF` will error.
 
@@ -792,7 +754,7 @@ Without `WITH HOLD`, the volatile-function caveat from `sql-declare.html`[^pg-de
 - [`57-pg-stat-statements.md`](./57-pg-stat-statements.md) — Per-statement timing aggregated across prepared and ad-hoc forms.
 - [`59-planner-tuning.md`](./59-planner-tuning.md) — When parameter-skewed queries warrant `plan_cache_mode` overrides.
 - [`80-connection-pooling.md`](./80-connection-pooling.md) — Session vs transaction pooling and the prepared-statement implications.
-- [`81-pgbouncer.md`](./81-pgbouncer.md) — Transaction-mode prepared-statement support with PG17+ libpq.
+- [`81-pgbouncer.md`](./81-pgbouncer.md) — Transaction-mode prepared-statement support.
 - [`64-system-catalogs.md`](./64-system-catalogs.md) — `pg_cursors` and `pg_prepared_statements` alongside the rest of the catalog exploration surface.
 
 ## Sources

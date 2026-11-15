@@ -53,7 +53,7 @@ Five rules:
 
 2. **Three formats: `text` (default), `csv`, `binary`.** `text` and `csv` are human-readable + portable. `binary` is fastest + smallest but PG-version-specific + endian-specific. Default delimiter for `text` is tab; for `csv` is comma.
 
-3. **`FREEZE` bypasses later autovacuum-freeze pass but has hard restrictions.** Verbatim docs[^copy-freeze]: *"Rows will be frozen only if the table being loaded has been created or truncated in the current subtransaction, there are no cursors open and there are no older snapshots held by this transaction."* Plus: not on partitioned tables (PG16), not on foreign tables (PG18+).
+3. **`FREEZE` can reduce later freezing work but has hard restrictions.** Rows freeze only when the target was created or truncated in the current subtransaction and the stated snapshot and cursor conditions hold. Other sessions can see successfully loaded data immediately, violating normal MVCC visibility rules. It is not supported on partitioned tables in PG16.[^copy-freeze]
 
 4. **`COPY` is single-threaded per process.** Parallelism via multiple concurrent `COPY` commands against same table (one per chunk), not via `PARALLEL N` option. Single `COPY FROM` is the slowest part of large bulk loads.
 
@@ -161,7 +161,7 @@ Performance caveat for `\copy`[^psql-copy]: *"These operations are not as effici
 | `HEADER` | off | PG15+ only | OK | not applicable |
 | `QUOTE` | `"` (csv) | not applicable | OK | not applicable |
 | `ESCAPE` | same as QUOTE (csv) | not applicable | OK | not applicable |
-| `ENCODING` | server encoding | OK | OK | not applicable |
+| `ENCODING` | current client encoding | OK | OK | not applicable |
 
 `text` format escapes embedded delimiters/newlines with backslash sequences (`\t`, `\n`, `\\`, `\N` for NULL).
 
@@ -186,7 +186,7 @@ Restrictions summary:
 | Not allowed on partitioned tables | always |
 | Not allowed on foreign tables | PG18+ (previously silently no-op) |
 
-Effect: saves the `vacuum_freeze_min_age` work that would otherwise happen later. For 100M-row initial loads this is significant — avoids a future anti-wraparound vacuum.
+Effect: eligible inserted rows are frozen during load, reducing subsequent freezing work. Future updates and transaction aging can still require anti-wraparound vacuum.
 
 > [!NOTE] PostgreSQL 14
 > Verbatim[^pg14-rel]: *"Have `COPY FREEZE` appropriately update page visibility bits (Anastasia Lubennikova, Pavan Deolasee, Jeff Janes)."* Pre-PG14 a `COPY FREEZE` left visibility-map bits unset, so the next sequential scan or index-only scan still had to consult heap pages.
@@ -294,14 +294,7 @@ Data streams over the wire on the open psql connection. Slower than server-side 
         (FORMAT csv, HEADER MATCH, FREEZE);
     COMMIT;
 
-Verify tuples actually got frozen:
-
-    SELECT relname,
-           n_live_tup,
-           (pg_stat_get_xact_tuples_inserted(oid)) AS this_xact_inserts
-    FROM pg_stat_user_tables
-    JOIN pg_class ON pg_class.oid = relid
-    WHERE relname = 'events_2026_05';
+The COPY result count confirms the number of rows loaded; it does not prove that tuples are frozen. Use visibility-map inspection when freeze verification is required.
 
 For partitioned target, FREEZE not allowed. Load into a leaf partition created/truncated in same transaction, then ATTACH to parent. See [`35-partitioning.md`](./35-partitioning.md).
 
@@ -325,28 +318,30 @@ Index/FK maintenance dominates load time at scale. Standard pattern:
     COPY events FROM '/srv/data/events.csv' (FORMAT csv, HEADER MATCH);
 
     -- 5. recreate
-    CREATE INDEX CONCURRENTLY idx_events_occurred_at ON events (occurred_at);
-    CREATE INDEX CONCURRENTLY idx_events_user_id     ON events (user_id);
+    CREATE INDEX idx_events_occurred_at ON events (occurred_at);
+    CREATE INDEX idx_events_user_id     ON events (user_id);
     ALTER TABLE events ADD CONSTRAINT events_user_id_fkey
         FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;
     ALTER TABLE events VALIDATE CONSTRAINT events_user_id_fkey;
 
     COMMIT;
 
-`CREATE INDEX CONCURRENTLY` cannot run inside a transaction — break into separate transactions if using CONCURRENTLY. See [`26-index-maintenance.md`](./26-index-maintenance.md). Use `NOT VALID` + `VALIDATE CONSTRAINT` to defer the FK scan and keep the second-phase outside the load window. See [`38-foreign-keys-deep.md`](./38-foreign-keys-deep.md).
+This transaction holds locks during the load and index rebuild. For a live table, plan a separate sequence using `CREATE INDEX CONCURRENTLY` outside transaction blocks; consider the period without the index and constraint. See [`26-index-maintenance.md`](./26-index-maintenance.md) and [`38-foreign-keys-deep.md`](./38-foreign-keys-deep.md).
 
 ### Recipe 5 — Parallel multi-process COPY
 
 Single `COPY` is single-threaded. Throughput-bound? Split input into N chunks, run N concurrent `COPY` sessions:
 
-    # split CSV into 8 chunks
-    split -n l/8 events.csv events_part_
-
-    # run 8 concurrent psql sessions, each loading one chunk
+    # First produce independently valid CSV chunks with a CSV-aware tool.
+    # Load each chunk; fail the run if any client fails.
+    pids=()
     for f in events_part_*; do
-        psql -d appdb -c "\copy events FROM '$f' (FORMAT csv)" &
+        psql -v ON_ERROR_STOP=1 -d appdb -c "\copy events FROM '$f' (FORMAT csv)" &
+        pids+=("$!")
     done
-    wait
+    failed=0
+    for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+    test "$failed" -eq 0
 
 Constraints:
 - All processes write to same heap, so commit-latency contention is real but usually negligible
@@ -355,7 +350,7 @@ Constraints:
 
 ### Recipe 6 — Error-tolerant ingest (PG17+)
 
-Some rows in input have malformed values (NULL where NOT NULL, bad date string, etc.). Skip those rows + log them, instead of aborting whole load.
+Some rows have malformed type values, such as invalid date strings. Skip conversion failures and log them. Constraint violations still abort the load.
 
     COPY events FROM '/srv/data/dirty.csv'
         (FORMAT csv, HEADER MATCH, ON_ERROR ignore, LOG_VERBOSITY verbose);
@@ -462,10 +457,11 @@ Cleaner than two-pass loads where you first load NULLs then UPDATE with defaults
         pg_size_pretty(c.bytes_processed)    AS processed,
         pg_size_pretty(c.bytes_total)        AS total,
         c.tuples_processed,
-        c.tuples_excluded,
-        c.tuples_skipped                     -- PG17+ when ON_ERROR=ignore
+        c.tuples_excluded
     FROM pg_stat_progress_copy c
     JOIN pg_stat_activity a USING (pid);
+
+On PG17+, add `c.tuples_skipped` to report rows skipped by `ON_ERROR ignore`.
 
 Columns:
 - `command` — `COPY FROM` / `COPY TO`
@@ -482,6 +478,7 @@ See [`58-performance-diagnostics.md`](./58-performance-diagnostics.md) for the f
 
 For multi-hour bulk-load events on a quiet cluster, temporarily relax durability and raise maintenance memory:
 
+    BEGIN;
     -- session-level for one load
     SET LOCAL synchronous_commit = off;
     SET LOCAL maintenance_work_mem = '4GB';
@@ -489,7 +486,8 @@ For multi-hour bulk-load events on a quiet cluster, temporarily relax durability
     SET LOCAL max_parallel_maintenance_workers = 8;
 
     -- now run the load
-    COPY ...
+    COPY events FROM '/srv/data/events.csv' (FORMAT csv, HEADER MATCH);
+    COMMIT;
 
 Cluster-level for a planned ingest window:
 
@@ -571,7 +569,7 @@ Run this before any security-review milestone. Membership in `pg_execute_server_
 
 1. **Server-side `COPY 'filename'` requires `pg_read_server_files` or superuser.** Most managed services strip this. Default fallback is client-side `\copy`. Documented permission rule verbatim[^copy-docs].
 2. **`COPY ... PROGRAM` requires `pg_execute_server_program` — separate role.** Not granted by `pg_read_server_files`. Audit grants carefully — gives any-command execution as server OS user.
-3. **`COPY FREEZE` silently no-ops if restrictions violated pre-PG18.** PG18 disallows on foreign tables outright with explicit error — verbatim[^pg18-rel]. Pre-PG18: if table existed before the transaction OR a cursor is open, FREEZE silently does nothing.
+3. **`COPY FREEZE` rejects unmet prerequisites on ordinary tables.** In PG16, prior transaction activity or a table not created or truncated in the current subtransaction raises an error. PG18 also rejects foreign tables, where FREEZE was previously ignored. [PG16 source](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/commands/copyfrom.c)
 4. **`ON_ERROR ignore` skips type-conversion errors only.** UNIQUE / FK / CHECK / NOT NULL violations still abort. Use staging table for those.
 5. **`COPY FROM` runs triggers per row.** A BEFORE INSERT trigger that does a single SELECT per row = N round trips. Drop or DISABLE triggers during bulk load if possible. See [`39-triggers.md`](./39-triggers.md).
 6. **`HEADER` without `MATCH` does not validate column names.** Just skips the first line. Mismatch silently maps by column position. Always use `HEADER MATCH` for production ETL (PG15+).
@@ -581,7 +579,7 @@ Run this before any security-review milestone. Membership in `pg_execute_server_
 10. **`COPY` into a partitioned table routes per row.** Before PG12 was problematic; PG12+ handles natively but per-partition trigger overhead applies. Drop indexes on leaf partitions for speed.
 11. **`binary` format is PG-version-specific.** Test before binary roundtrip between major versions. Composite/multirange/array internal encoding can change.
 12. **`binary` format is endian-specific for some types.** Cross-arch (x86 → arm64) binary transfer requires extra care. Stick to CSV for portable transfers.
-13. **`COPY` does not honor `BEFORE STATEMENT` triggers running before each row.** Triggers fire `BEFORE ROW` per row — slow on million-row loads.
+13. **`COPY FROM` fires statement-level and row-level INSERT triggers.** Statement-level triggers run once per statement, not once per row. [PG16 COPY](https://www.postgresql.org/docs/16/sql-copy.html)
 14. **`COPY FROM STDIN` blocks if the application sends data slowly.** A trickling input holds a transaction open. Combine with `idle_in_transaction_session_timeout` to bound the risk — see [`41-transactions.md`](./41-transactions.md).
 15. **`UNLOGGED` tables are truncated on crash.** Great for staging tables but never for tables holding important data. Verbatim docs warning in CREATE TABLE.
 16. **`maintenance_work_mem` matters for index rebuild after load, not for COPY itself.** COPY's own memory is `work_mem`-bounded for sort/hash side operations only. See [`54-memory-tuning.md`](./54-memory-tuning.md).

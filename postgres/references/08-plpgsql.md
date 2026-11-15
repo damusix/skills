@@ -153,12 +153,11 @@ The four interesting forms beyond plain scalars:
 |---|---|
 | `var tbl.col%TYPE` | Same type as the named column; auto-tracks the column |
 | `rec tbl%ROWTYPE` | Composite of all columns in declaration order |
-| `rec RECORD` | Polymorphic row; shape assigned at first assignment |
-| `var int CONSTANT := 0` | Cannot be reassigned within the block |
+| `rec RECORD` | Polymorphic row; shape changes with each assigned row |
+| `var CONSTANT int := 0` | Cannot be reassigned within the block |
 | `var int NOT NULL := 0` | Rejects null assignment; requires a non-null default |
 
-Defaults are evaluated **at every block entry**, not once per function call. A `now()` default
-will produce the timestamp at which the block was entered.[^decl]
+Defaults are evaluated **at every block entry**, not once per function call. `now()` returns the transaction start time; use `clock_timestamp()` for the actual block-entry time.[^decl]
 
 A bare `ALIAS FOR $1` (or `ALIAS FOR another_name`) creates an alternate name; the canonical
 modern style is to use named parameters in the `CREATE FUNCTION` signature instead. The one
@@ -177,9 +176,7 @@ remaining use case is renaming the magic trigger pseudo-records:
 
 ## Assignment and Expression Evaluation
 
-Three legal assignment operators: `=`, `:=`, and `DEFAULT`. They are interchangeable.
-Idiomatic style uses `:=` for assignment inside the body and `DEFAULT` (or `:=`) for
-initial values in the `DECLARE` section.
+Body assignments use `=` or `:=`. `DEFAULT` is used for initial values in declarations, not as a body assignment operator.
 
 Every PL/pgSQL expression is a *full SQL `SELECT` expression*: `v := upper(name);`
 is internally `SELECT upper(name);` against the current variable bindings. The implication
@@ -266,8 +263,7 @@ condition is a full SQL boolean expression.[^control]
         ELSE             ...
     END CASE;
 
-If no branch matches and no `ELSE` is present, `CASE` raises `CASE_NOT_FOUND` (P0003 in
-the same class as `too_many_rows` — verify with `errcodes-appendix.html`).
+If no branch matches and no `ELSE` is present, `CASE` raises `CASE_NOT_FOUND` (SQLSTATE `20000`).[^errcodes]
 
 ### Loops
 
@@ -655,8 +651,7 @@ No `EXCEPTION` block — `ON CONFLICT` does the work and avoids subtransaction o
     END;
     $$;
 
-A procedure (not function) because of the `COMMIT` calls — see
-[07-procedures.md](./07-procedures.md).
+A procedure (not function) is needed for the `COMMIT` calls — see [07-procedures.md](./07-procedures.md). An empty `SKIP LOCKED` batch may mean remaining rows are locked, not that the job is complete; retry later or perform a final verification.
 
 ### 3. STRICT lookup with friendly errors
 
@@ -681,32 +676,24 @@ The `EXCEPTION` block sits at the function's top level — no per-row subtransac
 ### 4. Build a WHERE clause dynamically without injection
 
     CREATE FUNCTION search_orders(
-        p_user_id int   DEFAULT NULL,
-        p_status  text  DEFAULT NULL,
-        p_since   timestamptz DEFAULT NULL)
+        p_user_id int DEFAULT NULL,
+        p_status text DEFAULT NULL,
+        p_since timestamptz DEFAULT NULL)
     RETURNS SETOF orders
     LANGUAGE plpgsql AS $$
     DECLARE
-        v_sql text := 'SELECT * FROM orders WHERE 1=1';
-        v_args text[] := ARRAY[]::text[];
-        v_idx int := 0;
+        v_sql text := 'SELECT * FROM orders WHERE TRUE';
     BEGIN
         IF p_user_id IS NOT NULL THEN
-            v_idx := v_idx + 1;
-            v_sql := v_sql || format(' AND user_id = $%s', v_idx);
-            v_args := v_args || p_user_id::text;
+            v_sql := v_sql || ' AND user_id = $1';
         END IF;
         IF p_status IS NOT NULL THEN
-            v_idx := v_idx + 1;
-            v_sql := v_sql || format(' AND status = $%s', v_idx);
-            v_args := v_args || p_status;
+            v_sql := v_sql || ' AND status = $2';
         END IF;
         IF p_since IS NOT NULL THEN
-            v_idx := v_idx + 1;
-            v_sql := v_sql || format(' AND placed_at >= $%s', v_idx);
-            v_args := v_args || p_since::text;
+            v_sql := v_sql || ' AND placed_at >= $3';
         END IF;
-        RETURN QUERY EXECUTE v_sql USING VARIADIC v_args;
+        RETURN QUERY EXECUTE v_sql USING p_user_id, p_status, p_since;
     END;
     $$;
 
@@ -833,36 +820,19 @@ a holdable cursor on the first `COMMIT` and materialized — see
 8. **Catching `OTHERS` and swallowing the error.** Almost always wrong. Log it and
    re-raise (`RAISE;`). Use `GET STACKED DIAGNOSTICS` first to capture context.[^errors]
 
-9. **Using a `RECORD` variable across rows of different shapes.** The first assignment
-   fixes the shape; reassignment to a different row layout raises an error. Use
-   distinct `RECORD` variables per query, or use `%ROWTYPE` with a concrete type.[^impl]
+9. **Using a `RECORD` variable across rows of different shapes.** Assignment can change its shape, but cached statements referencing its fields expect consistent field types. Use separate record variables where layouts or field types differ.[^impl]
 
-10. **Variable-name collisions with column names.** Default is to error. Prefix locals
-    with `v_` or qualify both sides — `users.id` vs `myfunc.id` vs `outerblock.id`.[^impl]
+10. **Variable-name collisions with column names.** Default is to error. Prefix locals with `v_` or qualify both sides — `users.id` vs `myfunc.id` vs `outerblock.id`.[^impl]
 
-11. **`PERFORM` confused with `SELECT`.** Inside PL/pgSQL, `SELECT expr;` alone is a
-    syntax error (parser expects an `INTO`); use `PERFORM expr;` to call a function for
-    side effects.[^stmt]
+11. **`PERFORM` confused with `SELECT`.** Inside PL/pgSQL, use `PERFORM expr;` to call a function for side effects when discarding its result.[^stmt]
 
-12. **Mutable defaults in `DECLARE`.** A default expression is re-evaluated at every
-    block entry. `v_started timestamptz DEFAULT now()` is exactly the timestamp at
-    block entry, which usually is what you want — but be aware it is not function-call
-    constant if the variable lives in a nested block re-entered in a loop.[^decl]
+12. **Mutable defaults in `DECLARE`.** A default expression is re-evaluated at every block entry. `now()` remains the transaction start time; use `clock_timestamp()` for the actual block-entry time.[^decl]
 
-13. **`RETURN NEXT` in a loop building a huge tuplestore.** PL/pgSQL materializes the
-    full result before returning. If you can write it as a single `RETURN QUERY` or as a
-    SQL function, do so — the planner can stream and parallelize. See
-    [06-functions.md](./06-functions.md) for SQL-function inlining.
+13. **`RETURN NEXT` in a loop building a huge tuplestore.** PL/pgSQL materializes the full result before returning. Consider a SQL function where appropriate, and check the plan.[^control]
 
-14. **`SET search_path = ...` on a `SECURITY DEFINER` PL/pgSQL function — forgotten.**
-    Without it, the function resolves identifiers against the caller's `search_path`,
-    enabling privilege-escalation attacks. Pin every `SECURITY DEFINER` function:
-    `SET search_path = pg_catalog, public`. See [06-functions.md](./06-functions.md).
+14. **`SECURITY DEFINER` without a safe `search_path`.** Use only schemas that untrusted users cannot write to and put `pg_temp` last. See [06-functions.md](./06-functions.md).
 
-15. **Assuming `CREATE OR REPLACE FUNCTION` invalidates cached plans.** It does not
-    invalidate cached plans across already-connected backends. After a hot rollout call
-    `DISCARD PLANS;` or — better — coordinate with a pool rotation. See
-    [80-connection-pooling.md](./80-connection-pooling.md).
+15. **Function replacement and in-flight calls.** PostgreSQL invalidates dependent cached plans when definitions change. Coordinate any in-flight work that may still be executing the previous body.
 
 
 ## See Also

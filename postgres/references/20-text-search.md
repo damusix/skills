@@ -87,7 +87,7 @@ A `tsvector` is *"a sorted list of distinct lexemes"*[^datatype]. Each lexeme ca
     -- => 'fat' 'rat'
 
     -- Lexemes with positions
-    SELECT 'a fat cat sat on a mat'::tsvector;
+    SELECT to_tsvector('simple', 'a fat cat sat on a mat');
     -- => 'a':1,6 'cat':3 'fat':2 'mat':7 'on':5 'sat':4
 
     -- Lexemes with positions + weights
@@ -179,7 +179,7 @@ Each accepts an optional `config regconfig` first argument; the same configurati
 
 **`plainto_tsquery(querytext)`** — *"transforms the unformatted text querytext to a `tsquery` value. The text is parsed and normalized much as for `to_tsvector`, then the `&` (AND) `tsquery` operator is inserted between surviving words."*[^controls] All terms must appear; stop words are dropped silently. No phrase semantics.
 
-**`phraseto_tsquery(querytext)`** — *"behaves much like `plainto_tsquery`, except that it inserts the `<->` (FOLLOWED BY) operator between surviving words instead of the `&` (AND) operator. Also, stop words are not simply discarded, but are accounted for by inserting `<N>` operators rather than `<->` operators."*[^controls] So `'the quick fox'` becomes `'quick' <2> 'fox'` (one stopword skipped).
+**`phraseto_tsquery(querytext)`** — *"behaves much like `plainto_tsquery`, except that it inserts the `<->` (FOLLOWED BY) operator between surviving words instead of the `&` (AND) operator. Also, stop words are not simply discarded, but are accounted for by inserting `<N>` operators rather than `<->` operators."*[^controls] For example, `'quick and fox'` becomes `'quick' <2> 'fox'`.
 
 **`websearch_to_tsquery(querytext)`** — Google-style. Per the docs: *"Quoted word sequences are converted to phrase tests. The word 'or' is understood as producing an OR operator, and a dash produces a NOT operator; other punctuation is ignored. This approximates the behavior of some common web search tools."*[^functions]
 
@@ -378,7 +378,7 @@ Hyphenated input emits both the whole word and each part as overlapping tokens, 
 | Property | GIN | GiST |
 |---|---|---|
 | Recommended? | **Yes** — *"the preferred text search index type"*[^indexes] | Only for small datasets, or when combining with other GiST-indexable columns |
-| Lossy? | Non-lossy (no recheck of `@@`) | *"A GiST index is lossy, meaning that the index might produce false matches, and it is necessary to check the actual table row to eliminate such false matches."*[^indexes] |
+| Lossy? | Rechecks needed for weight and phrase conditions | *"A GiST index is lossy, meaning that the index might produce false matches, and it is necessary to check the actual table row to eliminate such false matches."*[^indexes] |
 | Stores | lexeme posting lists | signature bitmap (default `siglen = 124`, max `2024`)[^indexes] |
 | Index build | sensitive to `maintenance_work_mem` (helps a lot) | not sensitive |
 | Index size | larger | smaller (signatures) |
@@ -573,7 +573,7 @@ Pre-PG12 code typically maintained the `tsvector` with `tsvector_update_trigger`
 
 > *"The method described in this section has been obsoleted by the use of stored generated columns, as described in Section 12.2.2."*
 
-Migration:
+Adding the stored generated column rewrites the table on PG16 and takes a strong lock. Plan the migration around the rewrite, dependencies, and the index-build window. For large live tables, use an ordinary shadow column maintained by a trigger and backfill before cutover.
 
     -- 1. Add the new generated column with a temporary name
     ALTER TABLE articles
@@ -611,7 +611,7 @@ Query selecting the same config:
 
     SELECT id, body
     FROM   multi_lang_docs
-    WHERE  body_tsv @@ to_tsquery(lang, $1);
+    WHERE  body_tsv @@ websearch_to_tsquery(lang, $1);
 
 
 ### Recipe 10: Indexing JSON fields
@@ -629,9 +629,9 @@ Query selecting the same config:
 The filter argument selects which JSON value types contribute (`"string"`, `"numeric"`, `"boolean"`, `"key"`, `"all"`).[^functions]
 
 
-### Recipe 11: Filter then rank (the only correct pattern)
+### Recipe 11: Filter then rank
 
-The optimizer must use the GIN index for `@@` and only compute `ts_rank` against the *small* matching set. Always have a `WHERE` clause that the index can evaluate; never put `ts_rank > N` in a `WHERE` clause (rank cannot be computed before fetching the row):
+Use `@@` to restrict candidates before ranking. The planner chooses the scan; `LIMIT` does not guarantee that only that many matching rows are ranked.
 
     -- CORRECT: GIN does the filter, rank is per-match
     SELECT id, title, ts_rank(doc_tsv, q) AS rank
@@ -666,7 +666,7 @@ For programmer-built phrases:
 
 ### Recipe 13: Stop-word-only query short-circuit
 
-A query like `"the of and"` produces an empty `tsquery` (zero nodes) and matches **every** indexed row in a scan-the-world disaster. Short-circuit on `numnode = 0`:
+A query like `"the of and"` produces an empty `tsquery`, which does not match documents. Short-circuit on `numnode = 0` to avoid issuing a useless search:
 
     WITH q AS (SELECT websearch_to_tsquery('english', $1) AS tq)
     SELECT id, title
@@ -677,7 +677,7 @@ A query like `"the of and"` produces an empty `tsquery` (zero nodes) and matches
 
 Or use `querytree` and check for `''` / `'T'`:[^features]
 
-    SELECT querytree('the & of'::tsquery);   -- => ''       (non-indexable)
+    SELECT querytree('!foo'::tsquery);   -- => 'T' (no indexable positive term)
 
 
 ### Recipe 14: Custom configuration that preserves URLs
@@ -707,7 +707,7 @@ Test a single token through a single dictionary:
 
     SELECT ts_lexize('english_stem', 'running');   -- => {run}
     SELECT ts_lexize('english_stem', 'the');       -- => {}     (stop word)
-    SELECT ts_lexize('english_stem', 'xyzqq');     -- => NULL   (unknown)
+    SELECT ts_lexize('english_stem', 'xyzqq');     -- Snowball recognizes even unknown words
 
 
 ### Recipe 16: Decision wrapper — FTS vs pg_trgm vs pgvector
@@ -734,7 +734,7 @@ Pick at the application layer — there's no single in-DB query that does all th
 
 4. **`text @@ tsquery` defeats the index.** The convenience operator runs `to_tsvector(default_text_search_config, text)` per row. Always write `doc_tsv @@ q` against the same expression as your index.
 
-5. **`ts_rank(...) > X` in `WHERE` forces a full scan.** Rank cannot be evaluated before the row is fetched. Apply `@@` in `WHERE`, then `ORDER BY rank DESC LIMIT N`. (Recipe 11.)
+5. **Ranking every row can be expensive.** Add an `@@` predicate when it matches the search semantics; a rank predicate alone cannot use a GIN index to find candidates.
 
 6. **`tsvector` is duplicate-eliminated; `tsvector` is *order-independent*.** `'foo bar'::tsvector` and `'bar foo'::tsvector` are equal. Phrase order is reconstructed from positions, not from input order — strip them with `strip()` and `<->` matching breaks.[^features]
 
@@ -744,7 +744,7 @@ Pick at the application layer — there's no single in-DB query that does all th
 
 9. **256 positions per lexeme.** A word appearing 1,000 times in a document keeps only the first 256 positions for phrase matching.[^limits]
 
-10. **Stop-word-only queries return zero matches in fault-tolerant variants — but match every row in `to_tsquery`'s strict variant.** `websearch_to_tsquery('the and')` yields an empty tsquery; `doc_tsv @@ q` is then always false for vectors, true on every match for some implementations of optimizer rewriting. Short-circuit with `numnode(q) > 0` (Recipe 13).
+10. **Stop-word-only queries produce an empty `tsquery`.** Empty queries do not match vectors. Detect them with `numnode(q) = 0` if the UI should report an empty search.
 
 11. **GIN index does not store weight labels.** Queries that filter by lexeme weight (`'fat:A'::tsquery`) must recheck the heap for every candidate row. The GIN docs:[^indexes] this is intentional but limits the speedup.
 

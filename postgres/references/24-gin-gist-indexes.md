@@ -62,7 +62,7 @@ Five rules drive every decision in this file.
 
 2. **GIN is the default for set-membership / containment workloads.** For arrays (`@>`, `<@`, `&&`, `=`), JSONB (`@>`, `?`, `?|`, `?&`), and full-text search (`@@`), GIN is the right call. Docs: *"GIN indexes are the preferred text search index type."*[^gin-fts-preferred] Pick GiST for FTS only when the dataset is small and updates dominate reads.
 
-3. **GIN is lossless; GiST is lossy.** GIN returns exact TIDs; queries do not need to recheck rows for the indexed predicate (though the *outer* query may still recheck for non-indexed predicates). GiST stores a fixed-length *signature* — a lossy summary — and every match must be rechecked against the heap to eliminate false positives.[^textsearch-indexes]
+3. **Rechecks depend on the operator class.** GIN stores extracted keys, not necessarily enough information to prove the full predicate; JSONB containment and weighted or phrase text searches can require heap rechecks. GiST lossiness likewise depends on its operator class.[^textsearch-indexes]
 
 4. **GiST is the only choice for KNN ordering and EXCLUDE constraints.** The `<->` distance operator and the `EXCLUDE USING gist (... WITH &&)` exclusion-constraint pattern are GiST-only (and SP-GiST in some cases — see [`25-brin-hash-spgist-bloom-indexes.md`](./25-brin-hash-spgist-bloom-indexes.md)). GIN cannot do either.
 
@@ -196,7 +196,7 @@ SELECT gin_clean_pending_list('events_payload_gin'::regclass);
 
 
 > [!NOTE] PostgreSQL 18
-> GIN index builds can now run in parallel with `max_parallel_maintenance_workers > 0`. For large GIN builds (e.g., FTS over a multi-million-row corpus), this can cut wall-clock time substantially. Verbatim release-note quote: *"Allow GIN indexes to be created in parallel."*[^pg18-gin-parallel] `CREATE INDEX CONCURRENTLY` does **not** parallelize — same restriction as B-tree (cross-reference [`23-btree-indexes.md`](./23-btree-indexes.md) and [`26-index-maintenance.md`](./26-index-maintenance.md)).
+> GIN index builds can use parallel workers in PG18. Concurrent builds can parallelize their first table scan; validation is not parallel.[^pg18-gin-parallel]
 
 
 ### GIN extensibility (writing your own opclass)
@@ -229,7 +229,7 @@ GiST is a balanced tree where each internal node carries a *predicate* (typicall
 
 Two consequences fall out of this design:
 
-- **GiST is lossy by construction** — the bounding predicate is a summary, so the access method must recheck the heap row for every matching entry. PostGIS, range types, and pg_trgm `gist_trgm_ops` all live with this.
+- **GiST lossiness depends on the opclass.** Some opclasses store approximations and request heap rechecks; others can return exact matches.
 - **GiST supports ordering operators** — because the access method's `distance` support function can be ordered ascending, GiST natively supports `ORDER BY col <-> constant LIMIT N` (KNN) without a separate sort node. GIN cannot do this.
 
 
@@ -334,7 +334,7 @@ CREATE INDEX trips_route_gist
   WITH (buffering = on);     -- force buffering build, useful for very large geometric indexes
 ```
 
-Valid `buffering` values: `auto` (default), `on`, `off`. Setting `buffering = off` forces the insert-each-row path even on a large index — useful only for testing.
+Valid `buffering` values are `auto` (default), `on`, and `off`. `on` forces buffering. With `off`, a sorted build can still be used if the opclasses support it.[^gist-implementation]
 
 
 ## EXCLUDE constraints with GiST
@@ -360,7 +360,7 @@ CREATE TABLE reservation (
 Two notes that bite real teams:
 
 1. **`btree_gist` is required only when you mix B-tree-only operators (like `=`) with range/geometric operators in the same `EXCLUDE` clause.** A pure range-only EXCLUDE (`EXCLUDE USING gist (period WITH &&)`) needs no extension. The example above needs `btree_gist` because `room WITH =` uses B-tree-style equality.
-2. **The constraint is enforced via a GiST index, with all of GiST's lossiness costs.** Inserting into a non-overlapping table with millions of rows pays per-insert log-N cost just like an index. Use partitioning by tenant or time bucket for very large datasets — see [`35-partitioning.md`](./35-partitioning.md).
+2. **The constraint is enforced via a GiST index.** Inserts must check for conflicts. Partitioning requires a design that places every potentially conflicting pair in the same partition; per-partition exclusion constraints alone do not prevent cross-partition conflicts.
 
 
 ## pg_trgm: GIN vs GiST trigram opclasses
@@ -423,7 +423,7 @@ Both contrib extensions exist for the **same** narrow purpose: they let GIN or G
 | PG14 | SP-GiST gains `INCLUDE` columns | [^pg14-spgist-include] |
 | PG14 | pg_trgm GIN/GiST opclasses gain equality (`=`) operator support | [^pg14-trgm-eq] |
 | PG14 | pageinspect gains GiST inspection functions | [^pg14-pageinspect-gist] |
-| PG14 | intarray containment (`@>`, `<@`) **no longer uses GiST** — heap scan is faster, drop those indexes | [^pg14-intarray] |
+| PG14 | intarray containment (`@>`, `<@`) no longer uses GiST indexes | [^pg14-intarray] |
 | PG14 | `compress`/`decompress` GiST support functions become optional | [^gist-extensibility] |
 | PG15 | GiST sorted-build lookup performance improvement | [^pg15-gist-sort] |
 | PG16 | GIN cost-accuracy improvement in the planner | [^pg16-gin-cost] |
@@ -719,7 +719,7 @@ ALTER INDEX events_payload_gin SET (fastupdate = off);  -- read-uniform
 ### Recipe 10: Enable parallel GIN build for large initial loads (PG18+)
 
 ```sql
--- PG18+ — parallel GIN builds (CONCURRENTLY still serial)
+-- PG18+ — parallel GIN builds (the first concurrent scan can also use workers)
 SET max_parallel_maintenance_workers = 4;
 SET maintenance_work_mem = '2GB';
 CREATE INDEX docs_body_gin ON docs USING gin (body_tsv);
@@ -780,13 +780,13 @@ Typical outcome: `jsonb_path_ops` is 25–50% smaller, scans 30–60% faster on 
 
 1. **GIN for low-cardinality scalar equality is overhead, not speedup.** A B-tree on `status text` will outperform a GIN with `btree_gin`'s `text_ops` for `WHERE status = 'pending'`. `btree_gin` exists to mix scalars into a *multicolumn* GIN where the leading column is GIN-native — not as a single-column scalar index.
 
-2. **GiST is lossy and must recheck the heap.** Every match returned from a GiST scan is rechecked against the heap row, even when the predicate is exact for the data type. This is structural — the access method's `consistent` function returns `recheck=true` whenever the bounding predicate cannot guarantee an exact match. Long index scans on highly-selective predicates can pay surprising heap-fetch overhead.
+2. **GiST rechecks depend on the opclass.** Signature-based opclasses are lossy; an exact opclass may not need a predicate recheck.
 
 3. **`fastupdate=on` causes search-latency variance.** Reads scan the pending list synchronously; periodic flushes cause latency spikes. See §fastupdate and the pending list above. Set `fastupdate=off` for tight latency SLOs.
 
 4. **`gin_clean_pending_list()` requires `MAINTAIN` (PG17+) or table-owner privileges.** Cannot be called by a regular user. If you need it as part of a scheduled job, either run as a privileged role or grant `MAINTAIN` on the index's table to the job role.
 
-5. **`jsonb_path_ops` is silently empty for `{}` and `[]`.** Already covered in [`17-json-jsonb.md`](./17-json-jsonb.md) gotcha #12. The opclass produces no index entries for empty containers, so a `WHERE payload @> '{}'` (which matches everything) returns from the index but rows with empty payloads are missed.
+5. **`jsonb_path_ops` creates no entries for empty structures.** Searches for them may require a full-index scan, not incorrect results.[^gin-implementation]
 
 6. **`inet_ops` is not the default on PG14–18.** A bare `CREATE INDEX ON tbl USING gist (ip);` produces an empty opclass list and fails. You must say `gist (ip inet_ops)` to get the network-containment index.[^gist-inet]
 
@@ -808,7 +808,7 @@ Typical outcome: `jsonb_path_ops` is 25–50% smaller, scans 30–60% faster on 
 
 15. **PG14 removed intarray's GiST containment opclass support.** *"Prevent the containment operators (`<@` and `@>`) for intarray from using GiST indexes."*[^pg14-intarray] Indexes created for that purpose should be dropped — they no longer help and just cost writes.
 
-16. **`CREATE INDEX CONCURRENTLY` does not parallelize even on PG18.** Same restriction as B-tree — the parallel GIN build path requires the non-concurrent form. Plan for a maintenance window when parallel speedup matters.
+16. **Parallel concurrent GIN builds are available in PG18.** The first scan can use parallel workers; concurrent validation is serial.
 
 17. **`pg_trgm` similarity threshold is a session GUC** (`pg_trgm.similarity_threshold`, default 0.3) — not a per-index property. Setting it differently per backend can change which indexes the planner picks.
 

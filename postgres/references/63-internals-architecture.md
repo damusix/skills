@@ -61,7 +61,7 @@ Five rules cover almost every question about the PG process model:
 
 4. **The WAL writer, the background writer, and the checkpointer are three separate processes with three different jobs.** They are commonly conflated because they all write to disk. The WAL writer flushes WAL buffers asynchronously so that committing backends don't have to (this reduces commit latency under `synchronous_commit = off`). The background writer drains dirty *data* buffers from `shared_buffers` to disk during normal operation so clock-sweep doesn't trip over them. The checkpointer does a periodic recovery anchor — it writes a "checkpoint" record to WAL after flushing *all* currently dirty data buffers, so crash recovery doesn't have to replay WAL older than that point.[^wal-writer-cfg] See [33-wal.md](./33-wal.md) and [34-checkpoints-bgwriter.md](./34-checkpoints-bgwriter.md).
 
-5. **Parallel workers are short-lived backends dispatched per-query, drawn from the same pool as background workers.** When a plan with a `Gather` node executes, the leader backend asks postmaster for up to `max_parallel_workers_per_gather` workers; postmaster forks them, they attach to the same DSM segment as the leader, do their part of the plan, exit. They share the `max_worker_processes` global slot pool with extension-supplied background workers, autovacuum workers, and logical replication workers — so over-committing `max_parallel_workers` against `max_worker_processes` silently starves parallel queries.[^how-parallel-query]
+5. **Parallel workers are short-lived backends dispatched per-query, drawn from the same pool as background workers.** When a plan with a `Gather` node executes, the leader backend asks postmaster for up to `max_parallel_workers_per_gather` workers; postmaster forks them, they attach to the same DSM segment as the leader, do their part of the plan, exit. They share the `max_worker_processes` pool with extension-supplied background workers and logical replication workers. Autovacuum workers have a separate allocation.[^how-parallel-query]
 
 ## Process Inventory
 
@@ -82,7 +82,7 @@ The full PG16 catalog (14 base types plus extension-registered):
 | `walsender` | Per-replication-connection | postmaster (on inbound replication request) | Streams WAL to one standby or logical subscriber | Primary (also on standby for cascading) |
 | `walreceiver` | One per standby | postmaster (on standby) | Connects to upstream, receives WAL, writes to local `pg_wal/` | Standby only |
 | `startup` | Standby/recovery only | postmaster | Replays WAL during crash recovery or hot-standby; exits when caught up (on primary) | Both, briefly on primary at start |
-| `standalone backend` | Special-mode | invoked via `postgres --single` | Single-user mode for recovery / wraparound emergencies | Not present in normal operation |
+| `standalone backend` | Special-mode | invoked via `postgres --single` | Single-user maintenance; not the routine path for wraparound recovery | Not present in normal operation |
 | `logical replication launcher` | One per cluster | postmaster | Manages logical-replication subscription workers | Subscriber only |
 | `logical replication worker` | One per subscription/table | logical replication launcher | Applies logical-replication changes | Subscriber only |
 | (extension bgworker) | Configured | postmaster | Whatever the extension does (`pg_cron`, TimescaleDB workers, etc.) | Whatever the extension configures |
@@ -91,7 +91,7 @@ The full PG16 catalog (14 base types plus extension-registered):
 > The `stats collector` process (a 14-type list before PG15) was removed; cumulative statistics now live in shared memory. The `pg_stat_activity.backend_type` enum dropped the `stats collector` value in PG15.[^pg15-stats]
 
 > [!NOTE] PostgreSQL 18
-> `io_method = worker` introduces a new pool of **I/O worker processes** (`io_workers` GUC, default 3) that run asynchronous I/O on behalf of regular backends. These workers do not appear as a new `backend_type` value — they are auxiliary processes the same way the WAL writer and checkpointer are.[^pg18-io-workers] PG18 also added `autovacuum_worker_slots` (typically 16) as the explicit cap on autovacuum worker slots, decoupled from `max_worker_processes`.[^pg18-av-slots] See [Per-version Timeline](#per-version-timeline) for the full list of PG18 process-model changes.
+> `io_method = worker` introduces a new pool of **I/O worker processes** (`io_workers` GUC, default 3) that run asynchronous I/O on behalf of regular backends.[^pg18-io-workers] PG18 also added `autovacuum_worker_slots` (typically 16) as the explicit cap on autovacuum worker slots.[^pg18-av-slots] Autovacuum workers already had a separate allocation from `max_worker_processes` in PG16.
 
 > [!WARNING] PostgreSQL 19
 > PostgreSQL 19 removes the server variable `io_workers`. It is replaced by `io_min_workers` (default 2), `io_max_workers` (default 8), `io_worker_idle_timeout` (default 1 minute), and `io_worker_launch_interval` (default 100ms). Every mention of `io_workers` in this file describes PG18.[^pg19-io-workers-63]
@@ -106,7 +106,7 @@ postmaster (the supervisor)
     +---- client backend (one per SQL connection)
     +---- client backend
     +---- client backend
-    |     ... up to max_connections + superuser_reserved_connections
+    |     ... up to max_connections (including reserved connections)
     |
     +---- background writer        (always)
     +---- checkpointer             (always)
@@ -144,7 +144,7 @@ Verbatim from `server-start.html`: *"The bare-bones way to start the server manu
 The postmaster's lifecycle responsibilities:
 
 1. **Listen on the TCP port + Unix socket.** Defaults: TCP port `5432`, Unix socket `/var/run/postgresql/.s.PGSQL.5432` (path varies by distro).
-2. **Accept incoming connection requests, authenticate, and fork.** The postmaster does the initial protocol handshake (startup packet, authentication exchange via `pg_hba.conf`) *before* forking — once the client is authenticated, the postmaster forks a backend, hands off the socket, and goes back to listening.
+2. **Accept incoming connection requests and fork.** The child processes the startup packet and performs the authentication exchange according to `pg_hba.conf`; it becomes a backend if authentication succeeds. The postmaster returns to listening. [PostgreSQL 16 source](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/postmaster/postmaster.c)
 3. **Spawn and supervise auxiliary processes.** Background writer, checkpointer, walwriter, autovacuum launcher, archiver (if archiving), logical replication launcher, IO workers (PG18+) are all postmaster-spawned at startup and respawned if they die.
 4. **Detect dead children and restart the cluster if necessary.** If a *backend* dies abnormally (segfault, OOM kill), the postmaster initiates an emergency restart: all backends are signaled to exit, shared memory is reset, the checkpointer triggers a crash recovery from the most recent checkpoint. This is the right call — a corrupted shared-memory region could have been left behind. The brief downtime (typically a few seconds) is the price of crash safety.
 5. **Handle signals.** `SIGTERM` = smart shutdown (wait for active connections), `SIGINT` = fast shutdown (cancel running queries, then terminate), `SIGQUIT` = immediate shutdown (force-exit all children, crash recovery on next start), `SIGHUP` = reload `postgresql.conf`.
@@ -179,9 +179,9 @@ When a backend exits, its private memory is released back to the kernel, its slo
 The connection-establishment dance:
 
 1. **Client opens a TCP connection** to the postmaster's listening port.
-2. **Client sends the startup packet** containing the desired database, role, and any GUC overrides.
-3. **postmaster authenticates the client** according to the first matching line in `pg_hba.conf`. Methods range from `trust` (no challenge) to `scram-sha-256` (modern default) to `cert` (TLS client cert) to `peer` / `ident` (OS-level). See [48-authentication-pg-hba.md](./48-authentication-pg-hba.md).
-4. **postmaster forks a new backend.** The forked backend inherits the open socket, the shared-memory mapping, and a few other essentials. The postmaster goes back to listening.
+2. **postmaster forks a new child.** The child inherits the open socket and shared-memory mapping; the postmaster returns to listening.
+3. **The child reads the startup packet**, including the desired database, role, and GUC overrides.
+4. **The child authenticates the client** according to the first matching line in `pg_hba.conf`. See [48-authentication-pg-hba.md](./48-authentication-pg-hba.md).
 5. **The backend completes startup**: attaches to `procarray`, opens its log connection, sends `BackendKeyData` (used later by `pg_cancel_backend()`), then sends `ReadyForQuery`.
 6. **Steady-state**: client sends `Query` / `Parse` / `Bind` / `Execute` messages; backend responds with `RowDescription`, `DataRow`, etc.
 
@@ -197,9 +197,9 @@ The persistent per-cluster processes:
 
 **`walwriter`** — flushes WAL buffers asynchronously. Backends committing with `synchronous_commit = off` rely on this process to eventually fsync their WAL. Wakes every `wal_writer_delay` (default 200 ms) or when `wal_writer_flush_after` (default 1 MB) of WAL accumulates.[^wal-writer-cfg] On a primary, it always runs. On a standby, it does not run (the startup process handles WAL).
 
-**`autovacuum launcher`** — wakes every `autovacuum_naptime` (default 1 min), examines `pg_stat_user_tables` across all databases, picks tables that have exceeded their per-table thresholds, and asks postmaster to fork an `autovacuum worker` to vacuum or analyze each. The launcher itself does not vacuum; it dispatches. See [28-vacuum-autovacuum.md](./28-vacuum-autovacuum.md).
+**`autovacuum launcher`** — schedules databases across `autovacuum_naptime` (default 1 min) and asks postmaster to start workers. Each worker checks tables in its assigned database and vacuums or analyzes those that qualify. Wraparound workers can also run when autovacuum is disabled. See [28-vacuum-autovacuum.md](./28-vacuum-autovacuum.md).
 
-**`archiver`** — only present when `archive_mode = on`. Runs `archive_command` or `archive_library` (PG15+) for each completed WAL segment, then deletes the local copy if the archive call succeeded. See [33-wal.md](./33-wal.md).
+**`archiver`** — runs when archiving is enabled, including on a standby with `archive_mode = always`. It invokes `archive_command` or `archive_library` (PG15+) for completed WAL segments. Successful archiving permits later recycling or removal when other retention requirements allow it; the archiver does not immediately delete the segment. See [33-wal.md](./33-wal.md) and [standby archiving](https://www.postgresql.org/docs/16/warm-standby.html#CONTINUOUS-ARCHIVING-IN-STANDBY).
 
 **`logical replication launcher`** — always present. Idle when no subscriptions exist. When subscriptions are active, the launcher dispatches per-subscription / per-table `logical replication worker` processes. See [74-logical-replication.md](./74-logical-replication.md).
 
@@ -216,7 +216,7 @@ The leader backend coordinates: it asks postmaster for workers (limited by `max_
 Parallel workers come from the shared pool of background workers. Verbatim: *"The number of background workers that the planner will consider using is limited to at most `max_parallel_workers_per_gather`. The total number of background workers that can exist at any one time is limited by both `max_worker_processes` and `max_parallel_workers`."*[^how-parallel-query]
 
 > [!WARNING] The three GUC caps compose, not substitute
-> `max_worker_processes` (default 8) is the cluster-wide hard cap. `max_parallel_workers` (default 8) is the cap on workers used for parallel queries specifically. `max_parallel_workers_per_gather` (default 2) is the per-query cap. *"a setting for `max_parallel_workers` which is higher than `max_worker_processes` will have no effect, since parallel workers are taken from the pool of worker processes established by that setting."*[^pg16-resource] Same for autovacuum and bgworkers — they all draw from `max_worker_processes`.
+> `max_worker_processes` (default 8) caps background workers, including parallel, logical replication, and extension workers. `max_parallel_workers` (default 8) caps parallel workers, and `max_parallel_workers_per_gather` (default 2) caps workers per Gather. Autovacuum workers use separate slots.[^pg16-resource]
 
 See [60-parallel-query.md](./60-parallel-query.md) for the full mechanics.
 
@@ -224,7 +224,7 @@ See [60-parallel-query.md](./60-parallel-query.md) for the full mechanics.
 
 Extensions can register background workers via the `bgworker` API. Verbatim from the docs: *"PostgreSQL can be extended to run user-supplied code in separate processes. Such processes are started, stopped and monitored by `postgres`, which permits them to have a lifetime closely linked to the server's status."*[^bgworker] Examples in the wild: `pg_cron` (the scheduler process), `pg_partman`'s maintenance worker, TimescaleDB's various workers, Citus's distributed query workers.
 
-The total worker budget is `max_worker_processes`. Add bgworkers, autovacuum workers (`autovacuum_max_workers`), parallel workers (`max_parallel_workers`), and logical-replication workers and verify the sum is reasonable.
+The background-worker budget is `max_worker_processes`. Account for extension, parallel, and logical-replication workers. Size `autovacuum_max_workers` separately.
 
 Verbatim from `bgworker.html`: *"There are considerable robustness and security risks in using background worker processes because, being written in the `C` language, they have unrestricted access to data."*[^bgworker] This is the canonical reason managed providers gate which extensions can register bgworkers.
 
@@ -242,7 +242,7 @@ See [73-streaming-replication.md](./73-streaming-replication.md), [74-logical-re
 
 Verbatim from `server-start.html`: *"While the server is running, its PID is stored in the file `postmaster.pid` in the data directory. This is used to prevent multiple server instances from running in the same data directory and can also be used for shutting down the server."*[^server-start]
 
-`$PGDATA/postmaster.pid` is more than a PID file — it is also a sentinel for "this cluster is running." A stale `postmaster.pid` from a crashed server can prevent a clean restart. The file is locked via `flock()` on Linux; only the postmaster holds the lock during normal operation. If the file's lock is held but the named PID doesn't exist, the postmaster on the next startup attempt will recognize the stale state and proceed; if the lock is held by a live PID, startup will refuse with `another server might be running`.
+`$PGDATA/postmaster.pid` prevents competing servers from using the data directory. PostgreSQL creates it atomically and checks the recorded PID and associated shared memory before removing a stale file; it does not use `flock()` for this. Do not delete it while a server or its shared memory may still be active. [PG16 source](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/utils/init/miscinit.c)
 
 Format (each field on its own line):
 
@@ -338,10 +338,10 @@ Sizing the process tree:
 
 | GUC | Default | Restart? | What it bounds |
 |---|---|---|---|
-| `max_connections` | `100` | Yes | Total client backends + walsenders + (in some accounting) replication-related |
+| `max_connections` | `100` | Yes | Client connection slots, including reserved slots; WAL senders have a separate limit |
 | `superuser_reserved_connections` | `3` | Yes | Slots reserved for superuser connections out of `max_connections` |
 | `reserved_connections` (PG16+) | `0` | Yes | Slots reserved for the `pg_use_reserved_connections` role |
-| `max_worker_processes` | `8` | Yes | Cluster-wide hard cap on all background workers: autovacuum + parallel + bgworkers + (PG18+) IO workers + (logical-rep workers on subscriber) |
+| `max_worker_processes` | `8` | Yes | Background workers, including parallel, extension, and logical replication workers |
 | `max_parallel_workers` | `8` | Reload | Cap on workers used for parallel query specifically (within `max_worker_processes`) |
 | `max_parallel_workers_per_gather` | `2` | Reload | Per-query cap on parallel workers |
 | `max_parallel_maintenance_workers` | `2` | Reload | Per-query cap for parallel `CREATE INDEX`, `VACUUM`, etc. |
@@ -355,13 +355,11 @@ Sizing the process tree:
 
 The combined worker budget formula (good back-of-envelope sanity check):
 
-    max_worker_processes  ≥  autovacuum_max_workers
-                            + max_parallel_workers (queries)
+    max_worker_processes  ≥  max_parallel_workers
                             + max_logical_replication_workers (subscriber-side)
-                            + (PG18 only) io_workers (if io_method=worker)
                             + (sum of extension-registered bgworkers, e.g. pg_cron usually 1)
 
-If the sum exceeds `max_worker_processes`, the highest-priority workloads succeed and the others silently get fewer workers than configured.
+This reserves enough capacity for these configured maxima to run concurrently. Size autovacuum separately using `autovacuum_max_workers` and, on PG18+, `autovacuum_worker_slots`. If the background-worker pool is exhausted, parallel queries can run with fewer workers.
 
 The semaphore-and-procarray budget:
 
@@ -532,25 +530,25 @@ SHOW io_workers;
 
 4. **The stats collector is gone in PG15+.** Old tutorials, monitoring tools written before 2022, and Stack Overflow answers from that era describe a process that no longer exists. Verify against the verbatim PG15 release-note quote.[^pg15-stats]
 
-5. **`max_worker_processes` is restart-only.** Raising it requires a server restart, not a reload. The same applies to `max_connections`, `max_wal_senders`, `max_replication_slots`, `superuser_reserved_connections`, and `io_workers` (PG18 only).
+5. **`max_worker_processes` is restart-only.** Raising it requires a server restart, as do `max_connections`, `max_wal_senders`, `max_replication_slots`, and `superuser_reserved_connections`.
 
 6. **Over-committing `max_parallel_workers` against `max_worker_processes` silently fails.** A parallel query that requests workers when the budget is exhausted gets fewer (or zero) workers and the plan degrades to a non-parallel execution silently. There is no error. Check `pg_stat_activity` for `parallel worker` count vs `max_parallel_workers`.
 
-7. **Autovacuum workers share the `max_worker_processes` budget.** A cluster with `max_parallel_workers = 8` and `autovacuum_max_workers = 3` needs `max_worker_processes ≥ 11` (plus headroom for any extension bgworkers). PG18 decoupled autovacuum slots via `autovacuum_worker_slots`.[^pg18-av-slots]
+7. **Autovacuum workers have a separate budget.** `autovacuum_max_workers` limits concurrent workers independently of `max_worker_processes`; PG18 adds `autovacuum_worker_slots` to reserve their slots.[^pg18-av-slots]
 
 8. **`SET max_connections` does nothing; it requires server restart.** Same for every `_SU_BACKEND` or postmaster-context GUC. Reloading the config (SIGHUP) is silently ignored for these; check `pg_settings.context = 'postmaster'`.
 
 9. **`shared_buffers` is the single most-misallocated GUC in the wild.** Default 128 MB is too low for any production workload. The 25% rule with a 40% ceiling is the docs' explicit guidance.[^pg16-resource] See [54-memory-tuning.md](./54-memory-tuning.md).
 
-10. **A walsender on the primary holds a replication slot's WAL retention.** If the standby disconnects and the slot is not invalidated, the primary keeps every WAL segment until the slot is dropped or invalidated by `max_slot_wal_keep_size` (PG13+). The cluster can run out of disk this way. See [75-replication-slots.md](./75-replication-slots.md).
+10. **A replication slot can retain WAL while its consumer is disconnected.** Monitor retained WAL and disk space; other retention requirements can also prevent removal. `max_slot_wal_keep_size` applies at checkpoints and can invalidate a slot. See [75-replication-slots.md](./75-replication-slots.md).
 
 11. **The archiver is per-cluster, not per-WAL-stream.** If `archive_command` is slow, archives back up, `pg_wal/` grows, and eventually the cluster halts. `archive_library` (PG15+) is the preferred mechanism for production. See [33-wal.md](./33-wal.md).
 
-12. **A long-running `client backend` with an open transaction blocks autovacuum on every table it has touched.** The xmin horizon (visible in `pg_stat_activity.backend_xmin`) is held back by the oldest active transaction. See [27-mvcc-internals.md](./27-mvcc-internals.md) and [28-vacuum-autovacuum.md](./28-vacuum-autovacuum.md).
+12. **Old transactions and snapshots can delay cleanup.** Inspect `backend_xmin`, `backend_xid`, prepared transactions and replication-slot horizons; an open transaction does not necessarily block every table it touched. See [PG16 routine vacuuming](https://www.postgresql.org/docs/16/routine-vacuuming.html).
 
 13. **`leader_pid` is NULL for client backends.** Filter parallel workers via `leader_pid IS NOT NULL` if you want to exclude them from session counts. The opposite trap (counting parallel workers as separate "connections") shows up in dashboard metrics.
 
-14. **A `walreceiver` process on a standby that disconnects from the primary will retry forever until `wal_retrieve_retry_interval` (default 5s) gives up.** Failed reconnects show in the standby's logs as `could not connect to the primary server`. The standby is otherwise functional but will fall further behind. Monitor `pg_stat_wal_receiver` on standbys.
+14. **`wal_retrieve_retry_interval` controls the wait between failed WAL retrieval attempts, not a retry limit.** Monitor `pg_stat_wal_receiver` and standby logs for persistent disconnects. [PG16 standby settings](https://www.postgresql.org/docs/16/runtime-config-replication.html)
 
 15. **`pg_stat_replication.replay_lag = NULL` on idle standby is healthy, not a problem.** A standby that has caught up and has no WAL to apply reports NULL for replay lag. The trap is interpreting NULL as "the replica is broken." See [58-performance-diagnostics.md](./58-performance-diagnostics.md) gotcha #14.
 
@@ -562,9 +560,9 @@ SHOW io_workers;
 
 19. **PG18 `io_workers` are extra processes, not threads.** Setting `io_method = worker` and `io_workers = 8` adds 8 new OS processes to the cluster. Each has its own ~10 MB RSS. Verify against your memory budget.
 
-20. **Standalone backend mode (`postgres --single`) bypasses every safety net.** No connection limits, no auth, no autovacuum, no replication. It exists for wraparound recovery and emergency catalog surgery — see [29-transaction-id-wraparound.md](./29-transaction-id-wraparound.md) gotcha #11. Do not use it for routine work.
+20. **Standalone backend mode (`postgres --single`) disables normal safeguards.** For XID exhaustion, resolve horizon blockers and run database-wide `VACUUM` online first. Single-user mode is a last resort, not the routine recovery path; see [PG16 wraparound recovery](https://www.postgresql.org/docs/16/routine-vacuuming.html#VACUUM-FOR-WRAPAROUND).
 
-21. **PG15 `pg_stat_*` shared-memory backing means stats persist across crashes** but are reset on `pg_stat_reset()` calls and on cluster start (the on-disk file `pg_stat/pgstat.stat` is read at startup and discarded if shutdown was unclean). Long-history stats analysis still requires an external sampler like `pganalyze` or scheduled snapshots.
+21. **Cumulative statistics reset after an unclean shutdown.** PG15+ saves them on clean shutdown and reloads them at start; use an external sampler for long history. [PG16 statistics](https://www.postgresql.org/docs/16/monitoring-stats.html)
 
 22. **The postmaster's PID changes on every restart**, so `postmaster.pid` is a poor signal for "is this the same cluster instance." Use the `start_time` line in `postmaster.pid` or the `pg_postmaster_start_time()` function to detect restarts.
 
@@ -580,7 +578,7 @@ SHOW io_workers;
 - [41-transactions.md](./41-transactions.md) — idle-in-transaction backends, `idle_session_timeout`
 - [43-locking.md](./43-locking.md) — shared lock table, predicate locks, advisory locks
 - [44-advisory-locks.md](./44-advisory-locks.md)
-- [48-authentication-pg-hba.md](./48-authentication-pg-hba.md) — auth happens in the postmaster, before fork
+- [48-authentication-pg-hba.md](./48-authentication-pg-hba.md) — client authentication in the forked child
 - [53-server-configuration.md](./53-server-configuration.md) — postmaster-context GUCs require restart
 - [54-memory-tuning.md](./54-memory-tuning.md) — `shared_buffers` and the per-backend memory budget
 - [58-performance-diagnostics.md](./58-performance-diagnostics.md) — `pg_stat_activity` deep dive
@@ -589,7 +587,7 @@ SHOW io_workers;
 - [74-logical-replication.md](./74-logical-replication.md) — logical replication launcher + workers
 - [75-replication-slots.md](./75-replication-slots.md) — slots hold WAL retention
 - [76-logical-decoding.md](./76-logical-decoding.md) — logical decoding processes and walsender interaction
-- [29-transaction-id-wraparound.md](./29-transaction-id-wraparound.md) — standalone backend mode for emergency wraparound recovery
+- [29-transaction-id-wraparound.md](./29-transaction-id-wraparound.md) — online wraparound recovery and single-user caveats
 - [80-connection-pooling.md](./80-connection-pooling.md) — why the process-per-connection model needs pooling
 - [81-pgbouncer.md](./81-pgbouncer.md) — pooler mechanics
 

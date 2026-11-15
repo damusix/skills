@@ -1,9 +1,8 @@
 # Checkpoints & Background Writer
 
-A checkpoint is a recovery anchor: the WAL records written before the
-checkpoint are no longer required for crash recovery once the checkpoint
-has flushed and `fsync`'d every dirty page to permanent storage. The
-**checkpointer** process runs them on a schedule; the **background
+A checkpoint is a recovery anchor: WAL before its redo pointer is no
+longer required for crash recovery once the checkpoint completes.
+The **checkpointer** process runs them on a schedule; the **background
 writer** (bgwriter) is a separate, lower-volume process that flushes
 dirty buffers ahead of the clock-sweep replacement code so that
 foreground backends do not have to. These two processes share a name in
@@ -65,7 +64,7 @@ checkpointer and to read the post-PG17 monitoring views correctly.
 
 3. **Spread checkpoints are the default on PG14+.** `checkpoint_completion_target = 0.9` means the checkpointer paces itself to finish writing dirty pages at 90% of the way through the interval, then `fsync`'s. *Reducing this value is not recommended* (verbatim docs guidance) — a low target trades steady I/O for a sharper burst.
 
-4. **The bgwriter does NOT prepare for checkpoints.** It writes dirty buffers ahead of the clock-sweep eviction code so backends find clean pages when they need a victim buffer. Checkpoint writes and bgwriter writes are tracked in separate counters and have different rate limits. Tuning the bgwriter does not reduce checkpoint I/O.
+4. **The bgwriter and checkpointer have different goals.** The bgwriter writes dirty buffers ahead of clock-sweep eviction. Those writes can also reduce the work remaining for a checkpoint, although pages dirtied again still need writing.
 
 5. **Frequent checkpoints multiply WAL volume.** Every page modified for the first time after a checkpoint becomes a full-page image (FPI) in the WAL by default (`full_page_writes = on`). Doubling `checkpoint_timeout` does *not* double WAL volume — it *cuts* it because FPI cost is amortized over a longer window. This is the highest-leverage tuning insight in the file. Cross-reference [`33-wal.md`](./33-wal.md) Rule 5.
 
@@ -77,7 +76,7 @@ checkpointer and to read the post-PG17 monitoring views correctly.
 | pg_wal disk grows without bound | First check replication slots; then check archive failure; only then raise `min_wal_size` | Setting `max_wal_size` below current WAL volume | `max_wal_size` is a soft limit; slots/archive issues bypass it |
 | Crash recovery time is unacceptably long | Lower `checkpoint_timeout` and/or `max_wal_size` | Setting `checkpoint_timeout` below 5 min on an OLTP cluster | Trades faster recovery for higher steady-state I/O and WAL volume |
 | Spiky I/O at end of checkpoint interval | Raise `checkpoint_flush_after` (Linux only); confirm `checkpoint_completion_target=0.9` | Lowering completion target | Forced writeback during the write phase reduces the final fsync stall |
-| Need to verify a backup is complete | Issue `pg_backup_start()` / `pg_backup_stop()` — they trigger their own checkpoints | Manual `CHECKPOINT` | Manual checkpoint is not the right tool; see Recipe 12 |
+| Taking an online physical backup | Follow the complete `pg_backup_start()` / `pg_backup_stop()` procedure or use `pg_basebackup` | Manual `CHECKPOINT` as a backup | Backup start establishes a checkpoint; backup stop and required WAL complete the backup |
 | Standby is lagging on apply | Inspect restartpoint stats; raise `max_wal_size` on standby | Forcing `CHECKPOINT` on standby (becomes restartpoint) | Restartpoint follows the same scheduling rules as primary checkpoints |
 | Reading checkpoint stats on PG≤16 | Query `pg_stat_bgwriter` (11 columns) | `pg_stat_checkpointer` (doesn't exist) | View was added in PG17 |
 | Reading checkpoint stats on PG17+ | Query `pg_stat_checkpointer` (9 cols PG17, 11 cols PG18) | Querying old columns from `pg_stat_bgwriter` (removed) | Five columns moved in PG17; two added in PG18 |
@@ -99,13 +98,7 @@ The verbatim definition from `sql-checkpoint.html`:
 
 > "A checkpoint is a point in the write-ahead log sequence at which all data files have been updated to reflect the information in the log. All data files will be flushed to disk."[^checkpoint-def]
 
-The checkpointer's five steps, in order:
-
-1. **Write a `XLOG_CHECKPOINT_ONLINE` WAL record** with the redo pointer (the LSN at which the checkpoint started — recovery will replay from here on crash).
-2. **Scan `shared_buffers` for dirty pages** and write each to disk (still page-cache-resident, not yet fsync'd).
-3. **Pace the writes** across `checkpoint_completion_target × checkpoint_timeout` seconds. Optionally forced-writeback (`checkpoint_flush_after`).
-4. **`fsync` every file touched** to make the writes durable.
-5. **Update `pg_control`** with the new checkpoint location and update `min_recovery_point` for the WAL recycler.
+The checkpointer establishes a redo point, writes dirty data pages while pacing the work, and synchronizes the affected files. It then writes and flushes the checkpoint record and updates `pg_control` with its location. Recovery reads that record and replays WAL from its redo pointer.[^wal-config][^wal-internals]
 
 The verbatim from `wal-internals.html`:
 
@@ -204,7 +197,7 @@ Verbatim from `sql-checkpoint.html`:
 > "The `CHECKPOINT` command forces an immediate checkpoint when the command is issued, without waiting for a regular checkpoint scheduled by the system"[^checkpoint-cmd]
 
 > [!WARNING] Almost never use `CHECKPOINT` in production
-> The docs are explicit:[^checkpoint-not-routine] *"`CHECKPOINT` is not intended for use during normal operation."* The legitimate use cases are: (a) explicitly testing crash recovery, (b) running a base backup using `pg_dump --no-acl --no-owner` on a stable snapshot, (c) part of a known-good runbook (e.g., before powering off a host). Most operators reach for `CHECKPOINT` for the wrong reasons; the right answer is usually to wait for the next scheduled checkpoint or to raise `max_wal_size`.
+> The docs are explicit:[^checkpoint-not-routine] *"`CHECKPOINT` is not intended for use during normal operation."* A manual checkpoint may be appropriate before a deliberately immediate shutdown or for recovery testing. A clean shutdown and `pg_basebackup` perform the required checkpoints themselves.
 
 > [!NOTE] PostgreSQL 15
 > Pre-PG15, `CHECKPOINT` required superuser. PG15 added the `pg_checkpoint` predefined role:[^pg15-role] *"Only superusers or users with the privileges of the `pg_checkpoint` role can call `CHECKPOINT`."*
@@ -246,7 +239,7 @@ Note that bgwriter writes and checkpointer writes are **disjoint counters**:
 | Checkpointer (interval-driven) | `pg_stat_bgwriter.buffers_checkpoint` | `pg_stat_checkpointer.buffers_written` |
 | Backends (write-when-victim) | `pg_stat_bgwriter.buffers_backend` | **Removed** — use `pg_stat_io` |
 
-Tuning bgwriter reduces backend writes but does **not** reduce checkpoint writes.
+Tuning bgwriter can reduce the dirty buffers left for a checkpoint.
 For the bgwriter deep dive (per-second-write-ceiling math, sizing, the
 `bgwriter_lru_maxpages = 0` "disable" mode), see
 [`32-buffer-manager.md`](./32-buffer-manager.md#background-writer).
@@ -259,11 +252,7 @@ For the bgwriter deep dive (per-second-write-ceiling math, sizing, the
 >
 > *"Create system view `pg_stat_checkpointer` (Bharath Rupireddy, Anton A. Melnikov, Alexander Korotkov). Relevant columns have been removed from `pg_stat_bgwriter` and added to this new system view."*
 >
-> Every monitoring query written against `pg_stat_bgwriter` for
-> `checkpoints_timed`, `checkpoints_req`, `checkpoint_write_time`,
-> `checkpoint_sync_time`, `buffers_checkpoint`, `buffers_backend`, or
-> `buffers_backend_fsync` will silently return zero rows on PG17+ because
-> the columns are gone (the view exists but is empty of those columns).
+> Monitoring queries that refer to removed columns fail with a column-not-found error on PG17+; they do not silently return zero rows.
 > Two columns — `buffers_backend` and `buffers_backend_fsync` — were
 > **removed outright** (not moved to `pg_stat_checkpointer`); the docs say:[^pg17-buffers-backend] *"These fields are considered redundant to similar columns in `pg_stat_io`."*
 
@@ -381,17 +370,17 @@ Interpretation:
 - `req_fraction ≈ 0` and `num_timed` rising steadily: healthy. Checkpoints are
   scheduled, not forced.
 
-### Recipe 3 — Compute actual checkpoint interval
+### Recipe 3 — Compute checkpoint request interval
 
-Measure the elapsed time since `stats_reset` and divide.
+PG17 counters include skipped requests, so this estimates the interval between requests, not completed checkpoints.
 
 ```sql
 -- PG17+
 SELECT
     now() - stats_reset AS observation_window,
-    num_timed + num_requested AS total_checkpoints,
+    num_timed + num_requested AS total_requests,
     (extract(epoch from (now() - stats_reset)) /
-     GREATEST(num_timed + num_requested, 1))::int AS avg_interval_sec
+     NULLIF(num_timed + num_requested, 0))::int AS avg_request_interval_sec
 FROM pg_stat_checkpointer;
 ```
 
@@ -404,10 +393,9 @@ is materially smaller, you are checkpoint-volume-driven (raise `max_wal_size`).
 -- PG18+
 SELECT
     num_done,
-    num_timed - num_done AS skipped_timed,
-    num_requested - (num_done - (num_timed - num_done)) AS computed_done_requested,
+    num_timed + num_requested - num_done AS skipped_requests,
     extract(epoch from (now() - stats_reset)) /
-        GREATEST(num_done, 1) AS sec_per_completed_checkpoint
+        NULLIF(num_done, 0) AS sec_per_completed_checkpoint
 FROM pg_stat_checkpointer;
 ```
 
@@ -478,14 +466,7 @@ SELECT wal_records, wal_fpi, wal_bytes, stats_reset FROM pg_stat_wal;
 
 Compute the FPI fraction:
 
-```
-fpi_fraction = wal_fpi_delta / wal_records_delta
-fpi_bytes_fraction = (wal_fpi_delta * 8KB) / wal_bytes_delta
-```
-
-A healthy OLTP cluster sees FPI by bytes 30–70% of WAL volume. >70%
-means your checkpoint interval is too short for the workload's working
-set. Cross-reference [`33-wal.md`](./33-wal.md) Recipe 6.
+Use `wal_fpi_delta / wal_records_delta` as a count-based indicator. It is not an FPI byte fraction: images can omit page holes or be compressed. Measure representative WAL with `pg_waldump --stats` when byte attribution is needed.
 
 > [!NOTE] PostgreSQL 18
 > `pg_stat_wal` lost its `wal_write` / `wal_sync` / `wal_write_time` / `wal_sync_time` columns in PG18 — those moved to `pg_stat_io`. The `wal_records` / `wal_fpi` / `wal_bytes` columns remain.
@@ -516,28 +497,7 @@ shared/SLRU buffer counts.[^pg18-slru]
 
 ### Recipe 9 — Compute starting `max_wal_size` from observed write rate
 
-If you don't know the right `max_wal_size`, measure the write rate and
-size to keep `req_fraction < 0.1`.
-
-```sql
--- PG17+
-WITH s AS (
-    SELECT
-        pg_current_wal_lsn() AS lsn_now,
-        now() AS t_now
-), prev AS (
-    SELECT
-        lsn AS lsn_prev,
-        t AS t_prev
-    FROM (VALUES (pg_current_wal_lsn(), now())) AS x(lsn, t)
-)
-SELECT 'measure twice 10 min apart, then compute MB/min from lsn diff';
-```
-
-The simpler approach: log `pg_current_wal_lsn()` from `cron` at a
-fixed cadence and graph the rate. Right-size `max_wal_size` to
-`5 × write_rate_per_minute × checkpoint_timeout_minutes` so a
-five-minute burst doesn't trip a requested checkpoint.
+Sample `pg_current_wal_lsn()` and the wall-clock time twice, at least ten minutes apart, and compute `pg_wal_lsn_diff(second_lsn, first_lsn) / elapsed_minutes`. Use the observed rate, desired checkpoint interval, and burst headroom to choose a starting `max_wal_size`, then monitor requested checkpoint frequency. `max_wal_size` is a soft limit, and retention requirements can make actual WAL usage higher.[^max-wal-size]
 
 ### Recipe 10 — Identify standbys with restartpoint problems
 
@@ -553,10 +513,7 @@ SELECT
 FROM pg_stat_checkpointer;
 ```
 
-If `restartpoints_done` is much smaller than `restartpoints_timed +
-restartpoints_req`, many restartpoints are being skipped because the
-standby has nothing new to flush — this is healthy on a streaming standby
-with low write volume.
+Compare completed and requested restartpoints with workload and server logs. A restartpoint can occur only at a checkpoint record replayed from the primary, so skipped restartpoints do not by themselves prove the standby had nothing to flush. See <https://www.postgresql.org/docs/16/wal-configuration.html>.
 
 ### Recipe 11 — Schedule `log_checkpoints` review with pg_cron
 
@@ -565,14 +522,7 @@ with low write volume.
 
 ### Recipe 12 — Verify the `CHECKPOINT` SQL command is justified
 
-Before issuing `CHECKPOINT` in production, ask:
-
-1. Is the cluster about to be cleanly stopped? — `pg_ctl stop -m fast` already triggers a final checkpoint. Skip the manual one.
-2. Is the cluster about to be `kill -9`'d or hardware-power-cycled? — Yes, `CHECKPOINT` first.
-3. Are you taking a base backup with `pg_basebackup`? — `pg_basebackup` triggers its own checkpoint (configurable as `--checkpoint=spread` or `--checkpoint=fast`). Skip the manual one.
-4. Are you doing exotic recovery work? — Read the runbook again.
-
-Run `CHECKPOINT` only for case (2).
+`CHECKPOINT` is not intended for routine operation. Normal shutdown and backup tools already request the checkpoints they need. Consult the recovery procedure before using a manual checkpoint; it does not make an arbitrary forced shutdown risk-free. See <https://www.postgresql.org/docs/16/sql-checkpoint.html>.
 
 ### Recipe 13 — Reset checkpoint stats for clean measurement
 
@@ -598,7 +548,7 @@ Wait at least `2 × checkpoint_timeout` to get a meaningful sample.
 6. **`checkpoint_timeout = 30s` is not a tuning option.** The valid range is 30s to 1 day, but values below ~5 minutes are pathological for OLTP — every modified page becomes FPI within seconds.[^checkpoint-timeout]
 7. **`CHECKPOINT` is not idempotent.** It always does the work even if a scheduled checkpoint just completed. The verbatim docs:[^checkpoint-not-routine] *"`CHECKPOINT` is not intended for use during normal operation."*
 8. **`log_checkpoints = off` on PG15+ requires explicit configuration.** The default is `on` since PG15.[^pg15-logchk] If you don't see checkpoint log lines on a PG15+ cluster, something has explicitly disabled them.
-9. **The bgwriter cannot make a checkpoint go faster.** Tuning `bgwriter_*` parameters changes how backends get clean buffers but has no effect on checkpoint I/O volume or pacing. Different processes.
+9. **The bgwriter can affect checkpoint I/O.** By cleaning dirty buffers before checkpoint, it can reduce work left for the checkpointer; repeated dirtying can also increase total I/O. It does not control checkpoint scheduling or pacing. See <https://www.postgresql.org/docs/16/runtime-config-resource.html>.
 10. **`buffers_alloc` is demand, not supply.** A reader who confuses `pg_stat_bgwriter.buffers_alloc` (allocations requested) with `pg_stat_checkpointer.buffers_written` (checkpoint output) will misdiagnose every bottleneck. See [`32-buffer-manager.md`](./32-buffer-manager.md) gotcha #8.
 11. **Pre-PG14 `checkpoint_completion_target = 0.5` carried forward in configs.** If your `postgresql.conf` was last tuned on PG≤13 and contains an explicit `checkpoint_completion_target = 0.5`, that value is now ~2× the burst it was on PG13. Remove the line to use the PG14+ default 0.9.[^pg14-cct]
 12. **`min_wal_size` does not guarantee that many segments will be retained.** It's a recycling threshold: WAL files below this size are recycled rather than deleted at checkpoint. Replication slots, archiving, and `wal_keep_size` interact independently.[^min-wal-size]
@@ -609,7 +559,7 @@ Wait at least `2 × checkpoint_timeout` to get a meaningful sample.
 17. **The `CHECKPOINT` permission predates `pg_checkpoint`.** Pre-PG15, only superusers could issue `CHECKPOINT`. PG15 added the `pg_checkpoint` predefined role; granting that role to a monitoring user is preferable to granting superuser.[^pg15-role]
 18. **`pg_stat_checkpointer.write_time` and `sync_time` include restartpoint work on a standby.** On a primary they are checkpoint-only. The column descriptions are clear but readers often assume they are per-checkpoint.[^pg17-cp-view]
 19. **`pg_stat_checkpointer.buffers_written` on PG17 does not break out SLRU buffers.** On PG18+ the new `slru_written` column splits SLRU from shared-buffer writes.[^pg18-slru]
-20. **Crash-recovery time scales with `checkpoint_timeout`, not `max_wal_size`.** The verbatim from the `checkpoint_timeout` docs:[^checkpoint-timeout] *"Increasing this parameter can increase the amount of time needed for crash recovery."* — and similarly for `max_wal_size`. The dominant factor in practice is *time since last checkpoint × per-second write rate*, which the timeout caps.
+20. **Crash-recovery time depends on WAL requiring replay.** Both `checkpoint_timeout` and `max_wal_size`, workload, and storage performance can influence it; neither is a strict upper bound.[^checkpoint-timeout][^max-wal-size]
 21. **The PG18 server-log checkpoint message changed format.** Tooling that parses checkpoint log lines (Datadog, Prometheus exporters, custom scripts) must be updated for the shared-vs-SLRU split.[^pg18-slru]
 22. **`pg_backup_start()` triggers its own checkpoint.** Manually issuing `CHECKPOINT` immediately before `pg_backup_start()` is redundant work and adds I/O spike for no benefit.
 23. **The bgwriter does not write back the WAL itself.** WAL writeback is done by the WAL writer (`wal_writer_*` GUCs) and per-commit `fsync`. Conflating bgwriter and WAL writer is a frequent confusion.

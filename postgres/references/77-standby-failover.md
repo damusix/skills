@@ -52,7 +52,7 @@ This file owns: hot standby query rules, the promotion API surface, the controll
 
 4. **`hot_standby_feedback` is a bidirectional trade-off.** Set `on` → standby xmin propagates to primary's autovacuum → primary keeps dead tuples longer → less query-cancel on standby BUT more primary bloat. Set `off` (default) → no propagation → autovacuum cleans aggressively on primary BUT standby queries get cancelled on UPDATE-heavy workloads. Cross-reference [`73-streaming-replication.md`](./73-streaming-replication.md) for the full trade-off table.
 
-5. **After failover, the old primary's timeline diverges from the new primary's.** `pg_rewind` rewinds the old primary back to the divergence point + applies WAL from the new primary, avoiding a fresh base backup. Requirements: `wal_log_hints = on` OR `data_checksums` enabled at `initdb` AND `full_page_writes = on` AND both nodes cleanly shut down before `pg_rewind` runs.[^pg-rewind]
+5. **After failover, the old primary's timeline diverges from the new primary's.** `pg_rewind` synchronizes the stopped former primary with the new primary, followed by WAL recovery. The target requires checksums or `wal_log_hints` enabled before divergence, and `full_page_writes = on`; a live source server is supported.[^pg-rewind]
 
 ## Decision Matrix
 
@@ -88,13 +88,12 @@ Hot standby is enabled by default since PG10 (`hot_standby = on`). When the post
 - `BEGIN`/`COMMIT`/`ROLLBACK` (transaction commands)
 - `LOCK TABLE ... IN ACCESS SHARE MODE` (or weaker)
 - `SET`/`RESET` (session GUCs)
-- `LISTEN`/`UNLISTEN` (read-only session commands)
-
-> [!NOTE] `NOTIFY` is NOT allowed on standby — it requires a write. Only `LISTEN` and `UNLISTEN` are permitted; `NOTIFY` is refused.
+- `UNLISTEN`
 - `DECLARE CURSOR FOR SELECT ...`
 - `FETCH`, `MOVE`, `CLOSE`
-- Temp tables (PG14+; pre-PG14 forbidden — cross-reference [`73-streaming-replication.md`](./73-streaming-replication.md) gotcha #14)
-- `DISCARD` (since PG14)
+- `DISCARD`
+
+`LISTEN`, `NOTIFY`, and creation or modification of temporary tables are not allowed during hot standby.[^hot-standby]
 
 **Forbidden on standby:**
 
@@ -102,7 +101,7 @@ Hot standby is enabled by default since PG10 (`hot_standby = on`). When the post
 - DDL of any kind
 - `VACUUM`, `ANALYZE`, `REINDEX`, `CREATE INDEX` (write WAL)
 - `SELECT ... FOR UPDATE/SHARE` (writes row lock to xmax)
-- `SERIALIZABLE` isolation level — verbatim docs quote: *"Transactions started during recovery may issue the LISTEN, UNLISTEN, and NOTIFY commands, but these commands will only be effective on the primary."*[^hot-standby]
+- `SERIALIZABLE` isolation level is unavailable during hot standby.[^hot-standby]
 - Sequences (`nextval()`, `setval()`)
 - 2PC commands (`PREPARE TRANSACTION`, `COMMIT PREPARED`, `ROLLBACK PREPARED`)
 
@@ -234,21 +233,19 @@ Planned switch of primary role with **zero data loss**. Pre-PG18 this is a 7-ste
 
 ```bash
 # === On OLD primary (call it P1) ===
-# 1. Stop new connections via pgBouncer PAUSE or REVOKE CONNECT on all roles
-#    (cross-reference 46-roles-privileges.md Recipe 3 for REVOKE CONNECT)
+# 1. Stop application traffic, background jobs, and every other write path.
+#    REVOKE CONNECT alone does not disconnect existing sessions.
 
 # 2. Wait for all in-flight transactions to finish; verify no idle-in-tx
 psql -c "SELECT pid, state, xact_start, query FROM pg_stat_activity
          WHERE state IN ('active','idle in transaction') AND pid <> pg_backend_pid();"
 
-# 3. Force final WAL switch
-psql -c "SELECT pg_switch_wal();"
+# 3. After all writers finish, capture a durable WAL barrier on P1.
+psql -Atc "SELECT pg_current_wal_flush_lsn();" > /secure/switchover-lsn
 
-# 4. Verify standby caught up (replay_lsn on P2 == current WAL on P1)
-psql -c "SELECT application_name, sent_lsn, write_lsn, flush_lsn, replay_lsn,
-                pg_wal_lsn_diff(sent_lsn, replay_lsn) AS replay_lag_bytes
-         FROM pg_stat_replication;"
-# Expect replay_lag_bytes = 0 for the standby being promoted
+# 4. On P2, wait until pg_last_wal_replay_lsn() >= the saved barrier.
+#    Confirm the intended standby and timeline; do not promote if it cannot catch up.
+psql -h p2-host -c "SELECT pg_last_wal_replay_lsn();"
 
 # 5. Cleanly stop OLD primary
 pg_ctl stop -D $PGDATA -m fast
@@ -277,8 +274,8 @@ pg_ctl start -D $PGDATA
 
 Key invariants:
 
-- Step 4 confirms `replay_lag_bytes = 0` on the standby being promoted. Skip this and lose committed transactions if old primary had outstanding WAL not yet shipped.
-- Step 5 must use `pg_ctl stop` (clean shutdown writes a checkpoint). A `kill -9` or crash bypasses this and forces a `pg_rewind` instead.
+- Step 4 must compare the promoted standby's replay position with the saved primary flush barrier, not merely compare `sent_lsn` with `replay_lsn`. Keep all writers blocked until the old primary is stopped and fenced.
+- Step 5 cleanly stops the old primary; verify it cannot restart as writable before promoting P2.
 - Step 7 (`pg_rewind`) requires `wal_log_hints = on` OR `data_checksums` enabled at initdb time on the OLD primary. Without one of these, `pg_rewind` refuses — fall back to fresh `pg_basebackup`.
 
 ### Timeline IDs
@@ -363,7 +360,7 @@ Cross-reference [`89-pg-rewind.md`](./89-pg-rewind.md) for the full mechanics de
 
 ### pg_createsubscriber — convert physical standby to logical subscriber (PG17+)
 
-Converts a physical streaming standby into a logical replication subscriber without an initial COPY. Useful for cross-version upgrades and selective-table replication of large databases.
+Converts a same-major physical standby into a logical subscriber without an initial COPY. It creates an all-tables publication per selected database; the resulting logical replica can support a separately planned major upgrade.
 
 ```bash
 # On the physical standby (must be cleanly stopped first)
@@ -371,8 +368,7 @@ pg_ctl stop -D /var/lib/postgresql/17/standby -m fast
 
 pg_createsubscriber \
   --pgdata=/var/lib/postgresql/17/standby \
-  --publisher-server="host=primary.example.com user=replication dbname=app" \
-  --subscriber-server="host=localhost user=postgres dbname=app" \
+  --publisher-server="host=primary.example.com user=postgres dbname=app" \
   --database=app \
   --publication=app_pub \
   --subscription=app_sub
@@ -381,10 +377,9 @@ pg_createsubscriber \
 What it does:
 
 1. Stop the standby's recovery at a consistent LSN.
-2. Create the publication on the source (publisher) if it doesn't exist.
-3. Promote the standby to primary.
-4. Create a subscription that picks up where physical replay stopped, with `copy_data = false` (because the data is already there byte-for-byte).
-5. Start the subscriber. Apply continues logically.
+2. Create a publication and logical slot on the publisher.
+3. Promote the target and create a subscription from the synchronized point.
+4. Stop the converted target after updating its system identifier. Start it explicitly and verify apply.
 
 > [!NOTE] PG17 pg_createsubscriber introduction
 > Verbatim: *"Add application pg_createsubscriber to create a logical replica from a physical standby server (Euler Taveira)."*[^pg17-createsubscriber] The PG18 release adds `--enable-two-phase` and `--all` flags.
@@ -561,7 +556,7 @@ SELECT
   pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()) AS delay_bytes;
 ```
 
-To roll back: pause replay, set `recovery_target_time` to just before the accident, restart standby with `recovery_target_action = pause`, query at the rolled-back state, copy out the rows needed, then promote and re-attach the original primary or fail forward.
+Pause replay before the unwanted commit is applied and copy needed data from the standby. For an exact cutoff, restore a separate backup using point-in-time recovery. Promotion replays immediately available WAL and removes the configured delay; it is not a way to discard pending WAL.
 
 ### Recipe 7: Pause replay for forensics
 
@@ -655,98 +650,29 @@ SELECT timeline_id FROM pg_control_checkpoint();
 
 Resolution: `pg_rewind` (if requirements met) or fresh `pg_basebackup`.
 
-### Recipe 10: `pg_createsubscriber` for cross-version upgrade
+### Recipe 10: Convert a physical standby to a logical subscriber
 
-PG16 → PG18 zero-downtime upgrade via physical-standby-to-logical-subscriber conversion. Cross-reference [`87-major-version-upgrade.md`](./87-major-version-upgrade.md).
+PG17 `pg_createsubscriber` requires the source, target, and utility to have the same major version and the target to be a stopped physical standby. It is not a way to run a PG18 physical standby against a PG16 primary. After conversion, plan any major upgrade separately.
 
 ```bash
-# Prerequisites:
-# - PG16 primary (P1) with at least one physical streaming standby (P2) caught up
-# - P2 running PG18 binaries (binary upgrade via pg_upgrade --link, then revert to standby)
-# - wal_level = logical on P1
-# - max_replication_slots and max_wal_senders sufficient
-
-# Stop P2 cleanly
-pg_ctl stop -D /var/lib/postgresql/18/main -m fast
-
-# Convert
+pg_ctl stop -D /var/lib/postgresql/17/standby -m fast
 pg_createsubscriber \
-  --pgdata=/var/lib/postgresql/18/main \
-  --publisher-server="host=p1-host user=replication dbname=app" \
-  --subscriber-server="host=localhost user=postgres dbname=app" \
+  --pgdata=/var/lib/postgresql/17/standby \
+  --publisher-server="host=p1-host user=postgres dbname=app" \
   --database=app \
   --publication=app_pub \
-  --subscription=app_sub \
-  --enable-two-phase
-
-# pg_createsubscriber starts P2 as a logical subscriber automatically
-# Switch traffic from P1 to P2 at convenient time
-# Decommission P1 after verification
+  --subscription=app_sub
 ```
 
-### Recipe 11: Force a WAL switch + verify standby acknowledged
+The utility stops the target after conversion. Start it explicitly, verify the subscription and replication, and preserve the publisher until cutover is verified. If conversion fails after promotion, the target may need a fresh base backup. [PG17 documentation](https://www.postgresql.org/docs/17/app-pgcreatesubscriber.html).
 
-Used during planned switchover to make sure no in-flight WAL is stuck on the primary.
+### Recipe 11: Verify the switchover barrier
 
-```sql
-DO $$
-DECLARE
-  switch_lsn pg_lsn;
-  standby_replay pg_lsn;
-  attempts int := 0;
-BEGIN
-  -- Generate a heartbeat to ensure something to switch
-  CREATE TABLE IF NOT EXISTS _switch_heartbeat (ts timestamptz);
-  INSERT INTO _switch_heartbeat VALUES (now());
-
-  -- Force WAL switch; pg_switch_wal returns the LSN of the switch boundary
-  SELECT pg_switch_wal() INTO switch_lsn;
-
-  RAISE NOTICE 'Switched at LSN %', switch_lsn;
-
-  -- Poll until standby replays past the switch LSN
-  LOOP
-    SELECT replay_lsn INTO standby_replay
-    FROM pg_stat_replication
-    WHERE application_name = 'p2'
-    LIMIT 1;
-
-    EXIT WHEN standby_replay >= switch_lsn;
-    EXIT WHEN attempts >= 30;
-    PERFORM pg_sleep(1);
-    attempts := attempts + 1;
-  END LOOP;
-
-  IF standby_replay < switch_lsn THEN
-    RAISE EXCEPTION 'Standby did not catch up within 30s. Current replay: %, target: %',
-                    standby_replay, switch_lsn;
-  END IF;
-
-  RAISE NOTICE 'Standby caught up to %', standby_replay;
-END $$;
-```
+After stopping every writer and draining transactions, capture `pg_current_wal_flush_lsn()` on the primary. Compare that saved LSN with `pg_last_wal_replay_lsn()` on the intended standby. Keep writers blocked; do not promote until the standby has replayed at least the saved barrier. Follow the [controlled switchover procedure](#controlled-switchover-procedure).
 
 ### Recipe 12: Emergency demotion of a primary (split-brain prevention)
 
-If a network partition has caused a fence event and the old primary needs to be demoted to standby quickly. NOT a substitute for cluster-manager fencing; this is for forensics.
-
-```sql
--- On the suspected old primary
-SELECT pg_wal_replay_pause();  -- harmless; only no-ops if not in recovery
--- Note: pg_wal_replay_pause() only works if the server is in recovery.
--- For a misbehaving primary, you must stop it cleanly first.
-```
-
-Cleaner approach: stop the postmaster, write `standby.signal`, restart pointing at the new primary:
-
-```bash
-pg_ctl stop -D $PGDATA -m fast
-touch $PGDATA/standby.signal
-echo "primary_conninfo = 'host=new-primary user=replication'" >> $PGDATA/postgresql.auto.conf
-# If timelines have diverged, run pg_rewind first
-pg_rewind --target-pgdata=$PGDATA --source-server="host=new-primary user=replication"
-pg_ctl start -D $PGDATA
-```
+Fence the old primary using a tested mechanism that blocks all write paths, then preserve its data for divergence analysis. Do not use `pg_wal_replay_pause()` on a primary: it is a recovery-only function and does not fence writes. Rejoin only after choosing the authoritative timeline and verifying `pg_rewind` prerequisites or taking a fresh base backup.
 
 ### Recipe 13: Audit hot standby query rules with EXPLAIN
 

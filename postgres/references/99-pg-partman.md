@@ -36,8 +36,8 @@ You are operating partitioned tables — time-series, multi-tenant by tenant_id,
 
 If you are still on native inheritance partitioning (pre-PG10), see [36-inheritance.md](./36-inheritance.md). If you have not yet partitioned, see [35-partitioning.md](./35-partitioning.md) for declarative syntax first.
 
-> [!WARNING] pg_partman 5.x is a hard break from 4.x — different API, different catalog, no in-place upgrade path
-> pg_partman v5.0.0 (2023-09-28) removed trigger-based partitioning entirely and dropped `time-static` / `time-dynamic` / `id-static` / `id-dynamic` partition types. Only PG declarative partitioning is supported. Many function parameters renamed; `part_config` columns reshuffled. Migration is via `doc/migrate_to_declarative.md` + `doc/pg_partman_5.0.0_upgrade.md` — not `ALTER EXTENSION ... UPDATE`. Any tutorial older than late-2023 likely references v4 syntax that no longer exists.[^1][^2]
+> [!WARNING] pg_partman 5.x changes supported partitioning and upgrade steps
+> Trigger-based sets must be migrated to declarative partitioning first. Review the upstream 5.0.1 upgrade guide for unsupported legacy interval names and possible staged `ALTER EXTENSION` updates in separate transactions. See <https://github.com/pgpartman/pg_partman/blob/v5.5.0/doc/pg_partman_5.0.1_upgrade.md>.
 
 > [!WARNING] pg_partman 5.x requires PostgreSQL >= 14
 > Verbatim README: "Requirement: PostgreSQL >= 14"[^1]. PG12 / PG13 are not supported by v5.x — stay on partman 4.7.x if stuck on those, then migrate Postgres major first.
@@ -54,7 +54,7 @@ Five rules:
 
 4. **Retention is opt-in and asymmetric — drop versus detach versus move-to-schema.** `retention_keep_table = false` drops the table; `true` (default) detaches it leaving it queryable in the same schema. `retention_schema` overrides both — table is reattached-detached-and-moved into named archive schema. No automatic export to object storage.
 
-5. **Template table pattern is one-shot at child creation, not retroactive.** Indexes, constraints, REPLICA IDENTITY, unlogged flag, autovacuum overrides, toast options defined on the template apply to NEW children created after the template was set. Existing children are not back-filled — you ALTER them by hand.
+5. **Template properties apply at child creation, not retroactively.** On PG14+, ordinary indexes are inherited from the partitioned parent, while the template handles properties such as non-partition-key uniqueness and relation-specific options. Per-child unique indexes do not enforce global uniqueness. See <https://github.com/pgpartman/pg_partman/blob/v5.5.0/doc/pg_partman.md#child-table-property-inheritance>.
 
 ## Decision Matrix
 
@@ -75,7 +75,7 @@ Five rules:
 | Move old partitions to archive schema | Set `retention` + `retention_schema = 'archive'` |
 | Schedule maintenance every hour | `cron.schedule('partman', '@hourly', $$CALL partman.run_maintenance_proc()$$)` cross-ref [98](./98-pg-cron.md) |
 | Schedule for a single partition set only | `partman.run_maintenance(p_parent_table := 'public.events')` |
-| Diagnose "why did partman not create the next partition" | Inspect `partman.part_config` + run `run_maintenance(p_jobmon := true)` + read `partman.run_maintenance_jobmon` table |
+| Diagnose "why did partman not create the next partition" | Inspect `partman.part_config`, scheduler logs and optional pg_jobmon records |
 
 Three smell signals:
 
@@ -119,7 +119,7 @@ partman.create_parent(
     p_automatic_maintenance text    DEFAULT 'on',   -- 'on' | 'off' — controls whether run_maintenance() touches this set
     p_constraint_cols       text[]  DEFAULT NULL,   -- columns to apply min/max constraints for constraint-exclusion
     p_template_table        text    DEFAULT NULL,   -- 'schema.template_table'
-    p_jobmon                boolean DEFAULT true,   -- log to partman.run_maintenance_jobmon
+    p_jobmon                boolean DEFAULT true,   -- use pg_jobmon when installed
     p_date_trunc_interval   text    DEFAULT NULL    -- e.g. 'day' to truncate bounds
 ) RETURNS boolean
 ```
@@ -229,12 +229,11 @@ Read this to see what is configured; modify it to change behavior (avoid editing
 | `optimize_constraint` | Number of partitions back to maintain constraint |
 | `infinite_time_partitions` | If true, premake bounded by partition_interval not by data presence |
 | `datetime_string` | Suffix format for child table names (e.g. `YYYY_MM_DD`) |
-| `jobmon` | Log to `partman.run_maintenance_jobmon` |
+| `jobmon` | Enable optional pg_jobmon integration |
 | `sub_partition_set_full` | Used for sub-partitioning |
 | `undo_in_progress` | Flag set by `undo_partition_proc()` |
 | `inherit_privileges` | Whether new children inherit parent privileges automatically |
 | `constraint_valid` | Whether to mark constraint VALID immediately (vs NOT VALID + later VALIDATE) |
-| `subscription_refresh` | List of subscription names to refresh after partition changes (logical replication) |
 | `ignore_default_data` | If true, do not consider default partition during maintenance |
 | `maintenance_order` (v5.1+) | Ordering priority |
 | `retention_keep_publication` (v5.1+) | Whether to keep publication membership on detached partitions |
@@ -280,7 +279,7 @@ WHERE parent_table = 'public.events';
 
 ## Template table — inherit indexes and constraints
 
-PG declarative partitioning does NOT propagate every property from parent to children. Indexes on parent propagate as INVALID until attached; PRIMARY KEY must include partition key; UNIQUE must include partition key; foreign keys, REPLICA IDENTITY, unlogged flag, autovacuum overrides, toast options — none of these propagate.
+PG declarative partitioning propagates ordinary parent indexes to partitions. A parent PRIMARY KEY or UNIQUE constraint must include the partition key; a template can define per-child uniqueness, but that does not enforce uniqueness across the partition set. Use the upstream property matrix to decide what belongs on the parent or template.[^3]
 
 partman's template-table mechanism fills the gap. You create a separate table (not under the parent) with the desired properties, then register it as `p_template_table` in `create_parent()`. Each NEW child created by partman inherits from the template at creation time.
 
@@ -288,10 +287,12 @@ partman's template-table mechanism fills the gap. You create a separate table (n
 -- Step 1: create the template (NOT a child of events).
 CREATE TABLE partman.events_template (LIKE public.events);
 
--- Step 2: add properties you want propagated to new children.
-ALTER TABLE partman.events_template REPLICA IDENTITY FULL;
-CREATE INDEX events_template_tenant_idx ON partman.events_template(tenant_id);
-CREATE INDEX events_template_payload_gin ON partman.events_template USING GIN (payload);
+-- Step 2: template-managed options apply to new children.
+ALTER TABLE partman.events_template SET (autovacuum_vacuum_scale_factor = 0.02);
+-- Ordinary indexes and replica identity belong on the parent.
+ALTER TABLE public.events REPLICA IDENTITY FULL;
+CREATE INDEX events_tenant_idx ON public.events(tenant_id);
+CREATE INDEX events_payload_gin ON public.events USING GIN (payload);
 
 -- Step 3: register with partman.
 SELECT partman.create_parent(
@@ -313,7 +314,7 @@ WHERE parent_table = 'public.events';
 
 ## Sub-partitioning
 
-`partman.create_sub_parent()` (v5.4.0 alias `create_sub_partition()`) registers a sub-level. Useful for year-then-month or tenant-then-month patterns. Same parameter shape as `create_parent()` with the top-parent as first arg.
+`partman.create_sub_parent()` (v5.4.0 alias `create_sub_partition()`) registers a sub-level. **This drops and recreates existing child tables and destroys their data.** Back up and migrate data separately; the required `p_declarative_check := 'yes'` acknowledges that loss. See <https://github.com/pgpartman/pg_partman/blob/v5.5.0/doc/pg_partman.md#create_sub_partition>.
 
 ```sql
 -- Year-level parent.
@@ -328,11 +329,12 @@ SELECT partman.create_parent(
     p_interval     := '1 year'
 );
 
--- Sub-partition each year by month.
+-- Only on a disposable/empty set: existing children are dropped and recreated.
 SELECT partman.create_sub_parent(
     p_top_parent    := 'public.events',
     p_control       := 'occurred_at',
-    p_interval      := '1 month'
+    p_interval      := '1 month',
+    p_declarative_check := 'yes'
 );
 ```
 
@@ -397,7 +399,7 @@ pg_partman is wholly external. **All five PG major release notes (PG14 / PG15 / 
 | Version | Released | Highlights |
 |---|---|---|
 | 4.7.x | 2021–2023 | Last v4 series. Supported trigger-based + declarative partitioning. `time-static` / `time-dynamic` / `id-static` / `id-dynamic` types. Stay on this branch if on PG12 / PG13. |
-| **5.0.0** | 2023-09-28 | **Major break.** Removed trigger-based partitioning entirely. Only declarative supported. Dropped `time-*` and `id-*` types — only `range`. Parameters renamed; `part_config` columns reshuffled. Migration via `doc/migrate_to_declarative.md` + `doc/pg_partman_5.0.0_upgrade.md`. **Privileges NOT preserved across upgrade — re-grant.** |
+| **5.0.0** | 2023-09-28 | **Major break.** Trigger-based sets require migration to declarative partitioning; review the upstream 5.0.1 upgrade guide before `ALTER EXTENSION`. |
 | 5.1.0 | 2024-04-02 | LIST partitioning for single-value integers. `maintenance_order` + `maintenance_last_run` columns added to `part_config`. REPLICA IDENTITY auto-inherits from template. Experimental numeric-column range partitioning. |
 | 5.2.0 | 2024-11-22 | UUIDv7 + custom-encoded methods for time-based partitioning. Microsecond epoch precision. **Superuser requirement removed.** `default_table` column removed from `part_config` (kept as `create_parent()` arg). Control column may be NULL (with care). |
 | 5.3.0 | 2025-10-09 | New `partition_data_async()` for smaller batched moves out of default partition (time-based only). `p_ignored_columns` support. UUID partitioning support in `partition_data_time()` / `_proc()`. |
@@ -429,10 +431,12 @@ CREATE TABLE public.events (
     PRIMARY KEY (event_id, occurred_at)
 ) PARTITION BY RANGE (occurred_at);
 
--- Template for indexes that should apply to every new partition.
+-- Ordinary indexes belong on the parent and propagate to partitions.
+CREATE INDEX events_tenant_idx ON public.events (tenant_id);
+CREATE INDEX events_payload_gin ON public.events USING GIN (payload);
+-- Use a template for properties managed by pg_partman, such as reloptions.
 CREATE TABLE partman.events_template (LIKE public.events);
-CREATE INDEX events_template_tenant_idx ON partman.events_template (tenant_id);
-CREATE INDEX events_template_payload_gin ON partman.events_template USING GIN (payload);
+ALTER TABLE partman.events_template SET (autovacuum_vacuum_scale_factor = 0.02);
 
 -- Register with partman.
 SELECT partman.create_parent(
@@ -479,58 +483,33 @@ CALL partman.partition_data_proc(
 SELECT pg_size_pretty(pg_relation_size('public.events_default'));
 ```
 
-### 3. Add a new index to every existing partition (template does NOT back-fill)
+### 3. Add a new index to every existing partition
 
-Template registers index on FUTURE partitions. Existing partitions stay un-indexed unless you walk them by hand. Use `CREATE INDEX CONCURRENTLY` then attach to the parent index ([26-index-maintenance.md](./26-index-maintenance.md)).
+For ordinary indexes, define the index on the partitioned parent; new partitions inherit it. Existing leaves can be built concurrently and attached. See <https://www.postgresql.org/docs/16/sql-createindex.html>.
 
 ```sql
--- Step 1: add to template so future children get it.
-CREATE INDEX events_template_event_type_idx
-    ON partman.events_template (event_type);
 
--- Step 2: walk existing leaves with CIC.
-DO $$
-DECLARE
-    leaf regclass;
-BEGIN
-    FOR leaf IN
-        SELECT inhrelid::regclass
-        FROM pg_inherits
-        WHERE inhparent = 'public.events'::regclass
-    LOOP
-        EXECUTE format(
-            'CREATE INDEX CONCURRENTLY IF NOT EXISTS %I ON %s (event_type)',
-            'idx_events_event_type_' || regexp_replace(leaf::text, '^.*_p', ''),
-            leaf
-        );
-    END LOOP;
-END;
-$$;
-
--- Step 3: create the parent-level index referencing leaves.
--- (PG12+ creates parent index INVALID until all leaves attached)
+-- Step 2: create the partitioned parent index without recursing.
 CREATE INDEX events_event_type_idx ON ONLY public.events (event_type);
 
--- Step 4: attach each leaf index to the parent.
-DO $$
-DECLARE
-    leaf regclass;
-    leaf_idx text;
-BEGIN
-    FOR leaf, leaf_idx IN
-        SELECT inhrelid::regclass,
-               'idx_events_event_type_' || regexp_replace(inhrelid::regclass::text, '^.*_p', '')
-        FROM pg_inherits
-        WHERE inhparent = 'public.events'::regclass
-    LOOP
-        EXECUTE format(
-            'ALTER INDEX %I ATTACH PARTITION %I',
-            'events_event_type_idx',
-            leaf_idx
-        );
-    END LOOP;
-END;
-$$;
+-- Step 3: in psql with autocommit enabled, build each direct leaf concurrently.
+-- Pause partition maintenance while building and attaching. For subpartitioned
+-- trees, repeat the procedure at each level.
+SELECT format('CREATE INDEX CONCURRENTLY %I ON %s (event_type);',
+              'events_event_type_' || c.oid, c.oid::regclass)
+FROM pg_inherits i
+JOIN pg_class c ON c.oid = i.inhrelid
+WHERE i.inhparent = 'public.events'::regclass AND c.relkind = 'r'
+\gexec
+
+-- Step 4: attach the corresponding schema-qualified indexes.
+SELECT format('ALTER INDEX public.events_event_type_idx ATTACH PARTITION %I.%I;',
+              n.nspname, 'events_event_type_' || c.oid)
+FROM pg_inherits i
+JOIN pg_class c ON c.oid = i.inhrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE i.inhparent = 'public.events'::regclass AND c.relkind = 'r'
+\gexec
 ```
 
 ### 4. Pause maintenance for one set (planned outage)
@@ -586,12 +565,13 @@ SELECT partman.create_parent(
     p_premake      := 2
 );
 
--- Sub level: monthly under each year.
+-- Only on a disposable/empty set: this drops existing children and their data.
 SELECT partman.create_sub_parent(
     p_top_parent := 'public.events',
     p_control    := 'occurred_at',
     p_interval   := '1 month',
-    p_premake    := 3
+    p_premake    := 3,
+    p_declarative_check := 'yes'
 );
 
 -- Inspect sub-config.
@@ -638,15 +618,12 @@ SELECT partman.run_maintenance(
     p_jobmon       := true
 );
 
--- Step 4: read jobmon table.
-SELECT * FROM partman.run_maintenance_jobmon
-WHERE parent_table = 'public.events'
-ORDER BY started_at DESC LIMIT 10;
+-- Inspect PostgreSQL logs and, if installed, the pg_jobmon extension's records.
 ```
 
 ### 9. Migrate from inheritance-partitioning to declarative-partitioning (pre-v5 → v5)
 
-If still on partman 4.x with trigger-based partitioning, follow the official migration docs: `doc/migrate_to_declarative.md` and `doc/pg_partman_5.0.0_upgrade.md` in the repo. High-level shape:
+If still on partman 4.x with trigger-based partitioning, follow the upstream [`migrate_to_declarative.md`](https://github.com/pgpartman/pg_partman/blob/v5.5.0/doc/migrate_to_declarative.md) and [`pg_partman_5.0.1_upgrade.md`](https://github.com/pgpartman/pg_partman/blob/v5.5.0/doc/pg_partman_5.0.1_upgrade.md). High-level shape:
 
 1. Stop writes (or write-through to a logical replication subscriber).
 2. Create new declarative-partitioned parent.
@@ -657,8 +634,8 @@ If still on partman 4.x with trigger-based partitioning, follow the official mig
 ### 10. UUIDv7 time-based partitioning (v5.2+)
 
 ```sql
--- Requires PG18+ for in-core uuidv7() or pgcrypto for gen_random_uuid().
--- pg_partman v5.2+ recognizes UUIDv7 as time-ordered.
+-- PG18+ provides uuidv7(). Configure pg_partman's timestamp encoder and
+-- decoder functions for UUID control columns; random UUIDv4 is not time ordered.
 
 CREATE TABLE public.events (
     event_id    uuid        NOT NULL DEFAULT uuidv7(),
@@ -672,7 +649,9 @@ SELECT partman.create_parent(
     p_control      := 'event_id',
     p_interval     := '1 day',
     p_premake      := 7,
-    p_type         := 'range'
+    p_type         := 'range',
+    p_time_encoder := 'partman.uuid7_time_encoder',
+    p_time_decoder := 'partman.uuid7_time_decoder'
 );
 ```
 
@@ -691,16 +670,9 @@ CALL partman.undo_partition_proc(
 );
 ```
 
-### 12. Configure partman to refresh logical replication subscription on partition changes
+### 12. Refresh logical replication subscriptions after partition changes
 
-When the partitioned table is published / subscribed, attaching or detaching partitions changes the publication membership. partman can auto-call `ALTER SUBSCRIPTION ... REFRESH PUBLICATION` after maintenance.
-
-```sql
--- On the subscriber side (where partman lives mirroring the publisher's partition structure).
-UPDATE partman.part_config
-SET subscription_refresh = ARRAY['my_subscription']
-WHERE parent_table = 'public.events';
-```
+pg_partman 5 removed automatic subscription refresh. When the publication includes individual partitions and new partitions must be subscribed, run `ALTER SUBSCRIPTION my_subscription REFRESH PUBLICATION` separately on the subscriber, outside a transaction block. See <https://github.com/pgpartman/pg_partman/blob/v5.5.0/CHANGELOG.md> and <https://www.postgresql.org/docs/16/sql-altersubscription.html>.
 
 ### 13. Cleanup partman state without dropping the partitioned table (v5.4+)
 
@@ -714,7 +686,7 @@ SELECT partman.config_cleanup(p_parent_table := 'public.events');
 
 ## Gotchas
 
-1. **v5 is a hard break from v4 — no in-place `ALTER EXTENSION UPDATE` path.** Migration is via `doc/migrate_to_declarative.md` + `doc/pg_partman_5.0.0_upgrade.md`. Most older tutorials reference v4 trigger-based syntax that no longer exists.
+1. **v5 changes partitioning support.** Migrate trigger-based sets first, then follow the upstream extension upgrade instructions; some installations require staged updates in separate transactions.
 
 2. **pg_partman 5.x requires PG14 minimum.** Verbatim README: "Requirement: PostgreSQL >= 14". PG12 / PG13 require staying on partman 4.7.x.
 
@@ -728,7 +700,7 @@ SELECT partman.config_cleanup(p_parent_table := 'public.events');
 
 7. **`automatic_maintenance = 'off'` silently disables maintenance for a set.** Read it explicitly when diagnosing "why aren't future partitions being created."
 
-8. **`maintenance_last_run` only populates if `p_jobmon = true`** (or v5.1+ updates it regardless — verify per version). If maintenance appears to run but `maintenance_last_run` stays NULL, jobmon is likely disabled.
+8. **`maintenance_last_run` is available in v5.1+.** Monitor it for stale or failed maintenance; it is not conditional on installing pg_jobmon. See <https://github.com/pgpartman/pg_partman/blob/v5.5.0/CHANGELOG.md>.
 
 9. **`premake` too low + maintenance not running = writes hit DEFAULT partition.** Default partition should be near-empty in healthy steady state. Investigate if it grows.
 
@@ -756,7 +728,7 @@ SELECT partman.config_cleanup(p_parent_table := 'public.events');
 
 21. **`automatic_maintenance = 'on'` is meaningless without a scheduled call to `run_maintenance_proc()`.** partman does not have its own scheduler — relies on pg_cron, a background worker config, or an external orchestrator.
 
-22. **partman objects (`part_config`, `run_maintenance_jobmon`) live in the schema where the extension was installed.** `CREATE EXTENSION pg_partman WITH SCHEMA partman` is the canonical placement. Querying `part_config` without schema-qualifying requires `partman` in `search_path`.
+22. **partman objects live in the extension's installation schema.** `CREATE EXTENSION pg_partman WITH SCHEMA partman` is a common placement. pg_jobmon is a separate optional extension with its own schema.
 
 23. **PG14 / PG15 / PG16 / PG17 / PG18 release notes contain ZERO pg_partman items.** Verified at planning time. Tutorials claiming "PG N added partman feature X" must be verified against `pg_partman/CHANGELOG.txt` directly — feature timeline belongs to partman, not PG.
 
@@ -769,7 +741,7 @@ SELECT partman.config_cleanup(p_parent_table := 'public.events');
 - [38-foreign-keys-deep.md](./38-foreign-keys-deep.md) — FK indexing requirements per leaf
 - [46-roles-privileges.md](./46-roles-privileges.md) — `ALTER DEFAULT PRIVILEGES IN SCHEMA` for new partitions
 - [73-streaming-replication.md](./73-streaming-replication.md) — physical replication preserves `part_config`
-- [74-logical-replication.md](./74-logical-replication.md) — `subscription_refresh` interaction with partman
+- [74-logical-replication.md](./74-logical-replication.md) — refreshing subscriptions after publication changes
 - [77-standby-failover.md](./77-standby-failover.md) — partman + cron resume on new primary after failover
 - [83-backup-pg-dump.md](./83-backup-pg-dump.md) — `--table` + pattern matching with partitioned tables
 - [86-pg-upgrade.md](./86-pg-upgrade.md) — pg_partman binary must exist on target cluster before pg_upgrade
@@ -787,7 +759,7 @@ SELECT partman.config_cleanup(p_parent_table := 'public.events');
 [^2]: pg_partman CHANGELOG — https://github.com/pgpartman/pg_partman/blob/master/CHANGELOG.md (per-version timeline 4.x → 5.5.0; 5.5.0 security notes checked 2026-11-14)
 [^3]: pg_partman docs — https://github.com/pgpartman/pg_partman/blob/master/doc/pg_partman.md (function signatures, `part_config` columns, parameters)
 [^4]: pg_partman howto — https://github.com/pgpartman/pg_partman/blob/master/doc/pg_partman_howto.md (template-table pattern, sub-partitioning)
-[^5]: pg_partman 5.0.0 upgrade doc — https://github.com/pgpartman/pg_partman/blob/master/doc/pg_partman_5.0.0_upgrade.md (v4 → v5 migration steps)
+[^5]: pg_partman 5.0.1 upgrade guide — https://github.com/pgpartman/pg_partman/blob/v5.5.0/doc/pg_partman_5.0.1_upgrade.md.
 [^6]: pg_partman migrate-to-declarative — https://github.com/pgpartman/pg_partman/blob/master/doc/migrate_to_declarative.md (inheritance → declarative migration)
 [^7]: PG 14 release notes — https://www.postgresql.org/docs/14/release-14.html (verified ZERO pg_partman items)
 [^8]: PG 15 release notes — https://www.postgresql.org/docs/15/release-15.html (verified ZERO pg_partman items)

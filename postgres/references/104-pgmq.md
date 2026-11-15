@@ -406,7 +406,7 @@ pgmq does not prune non-partitioned archives. Schedule it ([`98-pg-cron.md`](./9
 3. **Consumers must be idempotent.** At-least-once delivery means a message can arrive twice.
 4. **Column order changed in 1.10.0.** Select result columns by name.
 5. **Overload ambiguity in `send`.** Use named or typed arguments.
-6. **Queue tables bloat.** Each read is an UPDATE, each ack a DELETE. Upstream gives no tuning guidance; this page derives it from [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md): watch `n_dead_tup` on `pgmq.q_*`, and lower `autovacuum_vacuum_scale_factor` per table for busy queues. A long-running transaction anywhere in the cluster holds back cleanup for every queue.
+6. **Queue tables bloat.** Each read is an UPDATE, each ack a DELETE. Watch `n_dead_tup` on `pgmq.q_*` and tune per-table autovacuum for busy queues. Long-lived snapshots, prepared transactions, and replication slots can hold back cleanup; diagnose the actual horizon. See <https://www.postgresql.org/docs/16/routine-vacuuming.html>.
 7. **Archives grow without limit.** Prune them (Recipe 6) or use partitioned queues.
 8. **Partitioned queues depend on pg_partman maintenance.** If maintenance stops, rows spill into the default partition and retention stops. Alert when `default_partition_length` is above 0.
 9. **The NOTIFY channel needs quoting.** `LISTEN "pgmq.q_jobs.INSERT"`. Before 1.13.1, mixed-case queue names never notified.

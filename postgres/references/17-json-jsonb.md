@@ -48,7 +48,7 @@ Five rules drive every decision in this file:
 1. **`jsonb` is the default.** Use `json` only when you must round-trip the input text byte-perfect — preserving whitespace, key order, and duplicate keys. The docs say so directly: *"In general, most applications should prefer to store JSON data as `jsonb`, unless there are quite specialized needs, such as legacy assumptions about ordering of object keys."*[^json-vs-jsonb]
 2. **`jsonb` is normalized at input.** Whitespace is dropped, key order is not preserved, duplicate keys are collapsed (last write wins), and numbers are reparsed as `numeric` (which preserves trailing zeros: `1.230e-5` round-trips as `0.00001230`).[^jsonb-normalization]
 3. **`->` returns JSON; `->>` returns text.** Use `->>` whenever you want to compare to a SQL value (`WHERE doc->>'email' = $1`). Use `->` only when you need to chain another JSON operator (`doc->'profile'->>'email'`).
-4. **Containment (`@>`) is the GIN-indexable workhorse, but it is type-strict and does not unwrap arrays.** `'{"a": 1}' @> '{"a": 1}'` is true; `'{"a": 1}' @> '{"a": "1"}'` is false. The right side must be a valid JSON document, not a bare scalar.
+4. **Containment (`@>`) is type-strict and usually respects nesting.** `'{"a": 1}' @> '{"a": "1"}'` is false. A primitive is valid JSON, and an array can contain a primitive as a special case: `'[1,2]'::jsonb @> '2'::jsonb` is true.[^json-vs-jsonb]
 5. **Schemaless drift is the primary long-term failure mode.** A `jsonb` column is a temptation to skip schema design. Three years later you have `email` / `Email` / `email_address` / `user_email` and twenty queries that each guess differently. Push values that the application reads with `WHERE` into real columns or generated columns.
 
 ## Decision Matrix: JSONB vs Array vs Composite vs hstore vs Child Table
@@ -105,7 +105,7 @@ JSON primitive types map to PG types as follows:[^json-primitives]
 
 | JSON primitive | PG type | Restrictions |
 |---|---|---|
-| `string` | `text` | ` ` is disallowed; Unicode escapes for characters not in the DB encoding are disallowed |
+| `string` | `text` | `\u0000` is disallowed in `jsonb`; Unicode escapes for characters not in the DB encoding are disallowed |
 | `number` | `numeric` | `NaN` and `infinity` are disallowed |
 | `boolean` | `boolean` | Only lowercase `true` and `false` are accepted |
 | `null` | (none) | JSON null is distinct from SQL `NULL` |
@@ -122,7 +122,7 @@ Casting from text uses the standard `::jsonb` form. The cast is the place input 
     ALTER TABLE webhook_events
       ADD COLUMN payload jsonb GENERATED ALWAYS AS (raw::jsonb) STORED;
 
-`jsonb` will reject numbers outside the range of `numeric`; `json` will not. Trailing zeros are preserved in `jsonb`: `'{"x": 1.230e-5}'::jsonb` prints as `{"x": 0.00001230}` and `'{"x": 1.0}'::jsonb = '{"x": 1}'::jsonb` is **false**.[^jsonb-numbers]
+`jsonb` will reject numbers outside the range of `numeric`; `json` will not. Trailing zeros are preserved in output but insignificant for equality: `'{"x": 1.230e-5}'::jsonb` prints as `{"x": 0.00001230}` and `'{"x": 1.0}'::jsonb = '{"x": 1}'::jsonb` is **true**.[^jsonb-numbers]
 
 ### Extraction Operators: `->`, `->>`, `#>`, `#>>`
 
@@ -163,7 +163,7 @@ All are `jsonb`-only (no `json` variants). All are GIN-indexable under `jsonb_op
 - `'{"a": {"b": 1}}' @> '{"b": 1}'` → `f` (`b` is not at the top level)
 - `'{"a": {"b": 1}}' @> '{"a": {"b": 1}}'` → `t` (full nested path must match)
 - `'[1,2,3]' @> '[2]'` → `t` (array contains element)
-- `'[1,2,3]' @> '[2,1]'` → `t` (order does not matter; arrays are treated as multisets for containment)
+- `'[1,2,3]' @> '[2,1]'` → `t` (order and duplicate elements do not matter)
 - `'[{"a":1},{"b":2}]' @> '[{"a":1}]'` → `t`
 
 The `?` family checks **top-level** keys only. `'{"a": {"b": 1}}' ? 'b'` is `f` because `b` is one level down. Use `@?` / `@@` with a `jsonpath` expression for deep existence checks.
@@ -225,7 +225,7 @@ Subscripting returns `jsonb`, not `text`. To get text use `->>` or cast: `doc['e
 **`jsonb_set_lax` is for the "what if the value is NULL?" case:**
 
 - `'raise_exception'` — error
-- `'use_json_null'` — store JSON null (default; same as `jsonb_set`)
+- `'use_json_null'` — store JSON null (default; unlike strict `jsonb_set` with SQL NULL)
 - `'delete_key'` — remove the key entirely
 - `'return_target'` — leave the document unchanged
 
@@ -435,7 +435,7 @@ The technical difference: *"`jsonb_ops` creates independent index items for each
 - A small number of keys appear in nearly every row (`{"type": "X", ...}`) — `jsonb_path_ops` is better at narrowing through that hot key.
 
 > [!NOTE] PostgreSQL 18
-> *"Allow parallel builds of GIN indexes"*[^pg18-gin-parallel] — both `jsonb_ops` and `jsonb_path_ops` benefit. Builds on multi-million-row tables drop substantially.
+> GIN builds support parallel workers for both `jsonb_ops` and `jsonb_path_ops`.[^pg18-gin-parallel] Runtime benefit depends on available workers, memory, CPU, and I/O; concurrent builds parallelize only their first table scan.
 
 Create either with explicit opclass:
 
@@ -526,15 +526,17 @@ The planner uses `webhook_payload_gin` for this. `EXPLAIN ANALYZE` shows `Bitmap
              doc,
              '{tags}',
              (
-               SELECT jsonb_agg(DISTINCT t)
-                 FROM jsonb_array_elements_text(coalesce(doc->'tags','[]'::jsonb)) AS t
-                UNION
-               SELECT to_jsonb($2::text)
+               SELECT jsonb_agg(DISTINCT t.value)
+                 FROM (
+                   SELECT value FROM jsonb_array_elements(coalesce(doc->'tags','[]'::jsonb))
+                   UNION ALL
+                   SELECT to_jsonb($2::text)
+                 ) AS t(value)
              )
            )
      WHERE id = $1;
 
-For order-preserving append-on-conflict, use a normalized `text[]` column instead — JSONB arrays don't have an "insert without duplicates" operator.
+This assumes `tags` is missing or an array. `jsonb_agg(DISTINCT ...)` does not preserve order. For order-sensitive membership, consider a normalized child table.
 
 ### 7. Deep merge two JSON objects recursively
 
@@ -545,7 +547,7 @@ JSONB `||` is shallow. For deep merge define an SQL function:
       SELECT
         CASE
           WHEN jsonb_typeof(a) = 'object' AND jsonb_typeof(b) = 'object' THEN
-            (SELECT jsonb_object_agg(
+            (SELECT coalesce(jsonb_object_agg(
                       k,
                       CASE
                         WHEN a ? k AND jsonb_typeof(a->k) = 'object'
@@ -553,7 +555,7 @@ JSONB `||` is shallow. For deep merge define an SQL function:
                         THEN jsonb_deep_merge(a->k, b->k)
                         ELSE coalesce(b->k, a->k)
                       END
-                    )
+                    ), '{}'::jsonb)
                FROM (SELECT jsonb_object_keys(a) AS k
                       UNION
                      SELECT jsonb_object_keys(b)) keys)
@@ -660,34 +662,34 @@ The `::jsonb` cast is the normalization step. Run it on a copy first if you depe
       ADD CONSTRAINT payload_valid
       CHECK (payload IS NOT NULL);
 
-    -- PG16+ with IS JSON predicate
+    -- Validate raw text before casting to jsonb, which discards duplicate keys.
     ALTER TABLE webhook_events
-      ADD CONSTRAINT payload_valid_object
-      CHECK (payload IS JSON OBJECT WITH UNIQUE KEYS);
+      ADD CONSTRAINT raw_payload_valid_object
+      CHECK (raw_payload IS JSON OBJECT WITH UNIQUE KEYS);
 
-The `WITH UNIQUE KEYS` form catches input that `jsonb` would have silently collapsed.
+Apply this check to the original text or `json`, not an already-normalized `jsonb` value.
 
 ## Gotchas / Anti-patterns
 
-1. **`->` returns JSON; `->>` returns text.** `WHERE doc->'email' = 'alice@example.com'` is `false` for every row — the LHS is `jsonb` (quoted string) and the RHS is `text`. Use `->>` or `doc->'email' = '"alice@example.com"'::jsonb`.
-2. **`@>` does not unwrap arrays at the top level the way you might guess.** `'{"tags":["a","b"]}' @> '{"tags":["a"]}'` is `t` (array sub-containment), but `'{"tags":["a","b"]}' @> '{"tags":"a"}'` is `f`. The RHS must mirror the LHS shape at the matched path.
+1. **`->` returns JSON; `->>` returns text.** `WHERE doc->'email' = 'alice@example.com'` attempts to parse the untyped literal as JSON and errors because it is not a JSON string literal. Use `->>` or `doc->'email' = '"alice@example.com"'::jsonb`.
+2. **Containment respects nested structure, with a primitive-in-array exception.** An array can contain a primitive; match nested object paths explicitly and test the exact predicate against representative documents.[^jsonb-numbers]
 3. **`@>` is type-strict.** `'{"a":1}' @> '{"a":"1"}'` is `f`. Numbers and strings are different JSON types even when they print identically.
 4. **GIN on the document does NOT accelerate `->>` equality.** `WHERE doc->>'email' = 'x'` is not indexable by `jsonb_ops` or `jsonb_path_ops`. Use a functional B-tree on `(doc->>'email')`, or hoist to a generated column.
 5. **`jsonb_set` returns `target` unchanged when an earlier path step is missing.** *"All earlier steps in the path must exist, or the target is returned unchanged."*[^jsonb-set] Combined with `create_if_missing => true`, this means `jsonb_set('{}', '{a,b}', '1')` returns `{}` — `a` is missing so its child `b` is too. Build intermediate objects first or use subscripting (which builds them for you).
-6. **`jsonb_set` with a NULL `new_value` stores JSON null, not "remove the key."** Use `jsonb_set_lax(..., null_value_treatment => 'delete_key')` or `#-` to remove.
+6. **`jsonb_set` with SQL NULL returns SQL NULL.** Use `jsonb_set_lax(..., null_value_treatment => 'delete_key')` or `#-` to remove a key; pass `'null'::jsonb` to store JSON null.
 7. **`||` is shallow.** Merging two objects with overlapping keys replaces the inner object whole; it does not deep-merge. Write a recursive function (Recipe 7) for true deep merge.
 8. **Schemaless drift.** A `jsonb` column collects `email`, `Email`, and `user_email` over time. Every consumer of the data has to know which is current. Push fields you query into real columns or generated columns; reserve `jsonb` for genuinely variable shapes.
 9. **Duplicate keys silently disappear in `jsonb`.** `'{"a":1,"a":2}'::jsonb` is `{"a":2}`. If duplicate-key detection matters (audit, signature verification), keep the original `text` column too, or use `IS JSON WITH UNIQUE KEYS` to reject at write time.
-10. **`json` numbers preserve their original text; `jsonb` numbers are normalized.** `'{"x":1.0}'::jsonb = '{"x":1}'::jsonb` is `f` because trailing zeros are preserved in `jsonb`. Equality is semantic in shape but byte-exact in numeric representation.
+10. **`jsonb` preserves trailing fractional zeros in output, not in equality semantics.** `'{"x":1.0}'::jsonb = '{"x":1}'::jsonb` is true.[^jsonb-numbers]
 11. **`?` checks top-level keys only.** `'{"a":{"b":1}}' ? 'b'` is `f`. Use `@?` with a jsonpath for nested existence.
 12. **`jsonb_path_ops` doesn't index empty-valued structures.** *"Produces no index entries for JSON structures not containing any values, such as `{"a": {}}`. If a search for documents containing such a structure is requested, it will require a full-index scan."*[^jsonb-path-ops] If you genuinely need to find documents with empty objects, use `jsonb_ops` instead.
 13. **Mixing JSONB and JSON in the same column family is a foot-gun.** `'{"a":1}'::json @> '{"a":1}'::jsonb` won't even parse — `@>` is `jsonb`-only. Pick one type and stick to it.
 14. **`jsonb_array_elements` versus `jsonb_array_elements_text` produce different types.** The first returns `setof jsonb` (quoted strings come through with their quotes); the second returns `setof text` (quotes stripped from scalar strings). If you forget which one you used, `WHERE x = 'foo'` may silently match no rows because `x` is `"foo"`.
 15. **TOAST kicks in around 2KB of JSONB.** Large JSONB values are decompressed on every read of the field, including `->`/`->>` extraction. If you frequently extract a single field from a 50KB document, hoist it to a column. See [`31-toast.md`](./31-toast.md).
 16. **`jsonb_path_query` returns `setof jsonb` — it produces rows.** A `SELECT jsonb_path_query(...) FROM t` produces zero rows for documents with no match (not one NULL row). Use `jsonb_path_query_first` or `JSON_VALUE` (PG17+) for scalar extraction with NULL on miss.
-17. **PG16's `IS JSON` is a parse-only check, not a JSON-Schema validator.** It verifies the value is parseable JSON of the requested kind; it does not check that required fields are present or that scalar types match an expected shape. For that, use a CHECK with `JSON_VALUE` typed defaults or a trigger.
+17. **PG16's `IS JSON` is a parse-only check, not a JSON-Schema validator.** Enforce required fields and types with explicit checks or a trigger; `JSON_VALUE` requires PG17+.
 18. **`JSON_TABLE` context-item parse errors bypass `ON ERROR`.** If `doc::jsonb` fails the implicit cast, the row errors out regardless of `EMPTY ON ERROR` at the top level.[^json-table-cast]
-19. **JSONB does not preserve insertion order of object keys.** *"`jsonb` does not preserve white space, does not preserve the order of object keys, and does not keep duplicate object keys."*[^jsonb-normalization] If a downstream consumer requires a stable key order (signature checks, deterministic hashing), serialize with `jsonb_object_agg(... ORDER BY ...)` or store the raw bytes in `text` / `bytea`.
+19. **JSONB does not preserve insertion order of object keys.** For signature checks retain original bytes or use a separately specified canonical serialization; ordering aggregate inputs does not impose `jsonb` object key order.
 20. **`->>` on a JSON null gives SQL NULL, not the string `"null"`.** `'{"a": null}'::jsonb ->> 'a'` is SQL NULL. So is `'{"a": null}'::jsonb ->> 'b'` (missing key). Use `IS NULL` plus `?` to distinguish "field present with null" from "field absent."
 
 ## See Also

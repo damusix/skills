@@ -20,7 +20,7 @@ This file is meant to be loaded **first** when a user reports a symptom (slow qu
     - [Recipe 8 — Autovacuum Tuning](#recipe-8--autovacuum-tuning)
     - [Recipe 9 — Connection Storm Response](#recipe-9--connection-storm-response)
     - [Recipe 10 — Partition Rotation Automation](#recipe-10--partition-rotation-automation)
-    - [Recipe 11 — Online DDL Without Locking](#recipe-11--online-ddl-without-locking)
+    - [Recipe 11 — DDL with Shorter Blocking Windows](#recipe-11--ddl-with-shorter-blocking-windows)
     - [Recipe 12 — Role Inventory + Cleanup](#recipe-12--role-inventory--cleanup)
 - [Catalog Exploration](#catalog-exploration)
 - [Gotchas / Anti-patterns](#gotchas--anti-patterns)
@@ -87,12 +87,12 @@ Most "should I add an index" questions resolve by walking the predicate shape ag
 | `WHERE col = ?` / `IN (...)` / `<` / `>` / `BETWEEN` / `IS NULL` / `ORDER BY col` / `LIKE 'foo%'` under C locale | B-tree | Default. Always start here. |
 | `LIKE 'foo%'` under non-C locale | B-tree with `text_pattern_ops` opclass | Default opclass uses collation, can't satisfy prefix match |
 | `LIKE '%foo%'` / `ILIKE '%foo%'` / `~ 'regex'` | GIN with `gin_trgm_ops` (pg_trgm extension) | Cross-ref [`93-pg-trgm.md`](./93-pg-trgm.md) |
-| `WHERE jsonb_col @> '{...}'` / `?` / `?&` / `?\|` | GIN with `jsonb_path_ops` (containment-only, smaller) or default `jsonb_ops` | Cross-ref [`17-json-jsonb.md`](./17-json-jsonb.md) |
+| `WHERE jsonb_col @> '{...}'` / `?` / `?&` / `?\|` | GIN `jsonb_ops`; consider `jsonb_path_ops` for supported containment/jsonpath predicates only | `jsonb_path_ops` does not support the key-existence operators |
 | `WHERE array_col @> ARRAY[...]` / `&&` / `<@` | GIN with `array_ops` | Cross-ref [`16-arrays.md`](./16-arrays.md) |
 | Full-text `tsvector @@ tsquery` | GIN with `tsvector_ops` | GiST also possible, slower reads, smaller |
 | `range_col @> point` / `&&` / `<<` | GiST or SP-GiST with `range_ops` | Cross-ref [`15-data-types-custom.md`](./15-data-types-custom.md) |
 | `ORDER BY point <-> ref_point LIMIT N` (KNN nearest-neighbor) | GiST or SP-GiST | Cross-ref [`24-gin-gist-indexes.md`](./24-gin-gist-indexes.md) |
-| `WHERE vec <=> '[...]'` (vector similarity) | HNSW or IVFFLAT (pgvector) | Cross-ref [`94-pgvector.md`](./94-pgvector.md) |
+| `ORDER BY vec <=> '[...]' LIMIT N` (nearest cosine distance) | HNSW or IVFFlat with the matching pgvector operator class | A distance predicate alone does not provide the ordered nearest-neighbor index path |
 | `WHERE created_at >= ?` on append-only correlated time-series | BRIN minmax | Verify `pg_stats.correlation > 0.9` first |
 | Arbitrary AND-of-equalities across many columns | Bloom (contrib extension) | Lossy, equality-only |
 | `EXCLUDE USING gist (room WITH =, period WITH &&)` | GiST exclusion constraint + btree_gist | Cross-ref [`37-constraints.md`](./37-constraints.md) |
@@ -133,20 +133,20 @@ SELECT
   blocked.usename       AS blocked_user,
   age(now(), blocked.xact_start)  AS blocked_xact_age,
   blocked.wait_event_type || '/' || blocked.wait_event AS wait,
-  blocker.pid           AS blocker_pid,
+  blockers.pid          AS blocker_pid,
   blocker.usename       AS blocker_user,
   blocker.state         AS blocker_state,
   age(now(), blocker.xact_start)  AS blocker_xact_age,
   left(blocked.query, 120) AS blocked_query,
   left(blocker.query, 120) AS blocker_query
 FROM pg_stat_activity blocked
-JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS blocker_pid ON true
-JOIN pg_stat_activity blocker ON blocker.pid = blocker_pid
+JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS blockers(pid) ON true
+LEFT JOIN pg_stat_activity blocker ON blocker.pid = blockers.pid
 WHERE blocked.wait_event_type = 'Lock'
 ORDER BY blocked_xact_age DESC;
 ```
 
-`pg_blocking_pids(pid)` may return PID `0` — that means a prepared transaction holds the blocking lock (cross-ref [`41-transactions.md`](./41-transactions.md)). PIDs can repeat when multiple held locks are blocking.
+PID `0` represents a blocking prepared transaction, which has no `pg_stat_activity` row; inspect `pg_prepared_xacts` and `pg_locks` separately. Duplicate client PIDs can arise from parallel workers.[^blocking-pids]
 
 **Step 2 — Which lock modes are involved:**
 
@@ -168,7 +168,7 @@ Lock-mode conflict matrix is the canonical decoder. `ACCESS EXCLUSIVE` (held by 
 | Many backends waiting on `Lock/relation` of one table | One backend holds `ACCESS EXCLUSIVE` (DDL) | Find the DDL backend, finish or cancel |
 | Many backends waiting on `Lock/transactionid` of one txid | Long-running transaction holding row locks | Find the long-running backend, cancel or wait |
 | Recurring `Lock/tuple` waits | UPDATE contention on hot rows | Refactor: queue / advisory locks / `SKIP LOCKED` |
-| `Lock/relation` chain across `ACCESS SHARE` ↔ `SHARE UPDATE EXCLUSIVE` | `CREATE INDEX CONCURRENTLY` + `ANALYZE` self-block | Cross-ref [`26-index-maintenance.md`](./26-index-maintenance.md) gotcha #7 |
+| Lock wait during `CREATE INDEX CONCURRENTLY` and `ANALYZE` | Their `SHARE UPDATE EXCLUSIVE` locks conflict; `ACCESS SHARE` itself does not conflict with that mode | Inspect the actual held and requested locks |
 | Deadlock detected (40P01) | Inconsistent lock-acquisition order across sessions | Order locks deterministically; cross-ref [`43-locking.md`](./43-locking.md) Recipe 7 |
 
 **Step 4 — Kill safely:**
@@ -181,20 +181,20 @@ SELECT pg_cancel_backend(12345);
 SELECT pg_terminate_backend(12345);
 ```
 
-Never terminate walsenders or logical-replication apply workers — you'll break replication. Verify with `SELECT backend_type FROM pg_stat_activity WHERE pid=12345` first.
+Check `backend_type` before signaling a PID. Terminating replication workers interrupts service and can force reconnects; do it only as a deliberate replication intervention, not generic query cleanup.
 
 ### Recipe 3 — VACUUM Bloat Triage
 
 Six-step decision tree when a table looks bloated. Cross-ref [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md), [`27-mvcc-internals.md`](./27-mvcc-internals.md), [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md).
 
-**Step 1 — Confirm the bloat:**
+**Step 1 — Inspect dead-tuple estimates and relation sizes:**
 
 ```sql
 SELECT
   n.nspname AS schema, c.relname AS table,
   c.reltuples::bigint AS live_estimate,
   s.n_dead_tup        AS dead_tuples,
-  round(100.0 * s.n_dead_tup / NULLIF(c.reltuples, 0), 1) AS dead_pct,
+  round(100.0 * s.n_dead_tup / NULLIF(c.reltuples::numeric, 0), 1) AS dead_pct,
   pg_size_pretty(pg_relation_size(c.oid))            AS heap_size,
   pg_size_pretty(pg_total_relation_size(c.oid))      AS total_size,
   s.last_autovacuum,
@@ -206,48 +206,48 @@ WHERE c.relkind IN ('r', 'p') AND c.reltuples > 10000
 ORDER BY dead_pct DESC NULLS LAST LIMIT 20;
 ```
 
-`dead_pct > 20%` is the threshold for investigation. `dead_pct > 50%` is severe.
+`dead_pct` is a ratio of estimated dead tuples to estimated live tuples, not the percentage of wasted bytes. Investigate its trend together with vacuum progress, reuse, and relation growth; no fixed ratio proves severe bloat.
 
-**Step 2 — Is the xmin horizon held back?** (the single biggest cause of "VACUUM ran but bloat didn't go down")
+**Step 2 — Is a retained horizon preventing cleanup?**
 
 ```sql
-SELECT
-  'long_txn' AS source, pid, usename,
-  age(now(), xact_start) AS age,
-  age(backend_xmin)      AS xmin_age,
-  state, left(query, 120) AS query
+SELECT 'backend' AS source, pid, usename::text AS owner,
+       now() - xact_start AS elapsed,
+       greatest(age(backend_xid), age(backend_xmin)) AS xid_age,
+       state, left(query, 120) AS detail
 FROM pg_stat_activity
-WHERE backend_xmin IS NOT NULL
-ORDER BY age(backend_xmin) DESC LIMIT 5
+WHERE backend_xid IS NOT NULL OR backend_xmin IS NOT NULL
 UNION ALL
-SELECT 'slot' AS source, NULL::int, slot_name, NULL,
-  age(xmin), 'active=' || active, slot_name
-FROM pg_replication_slots WHERE xmin IS NOT NULL
-ORDER BY 5 DESC LIMIT 5;
+SELECT 'slot', NULL::int, slot_name::text, NULL::interval,
+       greatest(age(xmin), age(catalog_xmin)),
+       'active=' || active::text, slot_name::text
+FROM pg_replication_slots
+WHERE xmin IS NOT NULL OR catalog_xmin IS NOT NULL
 UNION ALL
-SELECT 'prepared_txn' AS source, NULL::int, owner, age(prepared),
-  age(transaction), gid, gid
-FROM pg_prepared_xacts LIMIT 5;
+SELECT 'prepared', NULL::int, owner::text, now() - prepared,
+       age(transaction), 'prepared', gid
+FROM pg_prepared_xacts
+ORDER BY xid_age DESC NULLS LAST;
 ```
 
-If any row shows `xmin_age > 1_000_000`, VACUUM cannot reclaim those dead tuples regardless of how aggressively you tune it. Fix the horizon-holder first (kill long-running transaction, drop abandoned slot, commit/rollback prepared transaction).
+An old retained XID can prevent cleanup of tuples still needed by that horizon; there is no universal one-million-XID cutoff. Inspect the affected relations and resolve blockers with their owners. Do not decide a prepared transaction's commit/rollback outcome without its coordinator, or drop a live consumer's slot without accepting rebuild consequences.
 
 **Step 3 — Is autovacuum running but slow?**
 
 ```sql
 SELECT
-  pid, datname, relid::regclass AS table, phase,
-  pg_size_pretty(heap_blks_total::bigint * 8192)   AS heap_total,
-  pg_size_pretty(heap_blks_scanned::bigint * 8192) AS heap_scanned,
-  index_vacuum_count,
-  num_dead_item_ids   -- PG17+ (renamed from num_dead_tuples)
-FROM pg_stat_progress_vacuum
-JOIN pg_stat_activity USING (pid);
+  v.pid, a.datname, v.relid::regclass AS table, v.phase,
+  pg_size_pretty(v.heap_blks_total::bigint * current_setting('block_size')::int) AS heap_total,
+  pg_size_pretty(v.heap_blks_scanned::bigint * current_setting('block_size')::int) AS heap_scanned,
+  v.index_vacuum_count,
+  v.num_dead_tuples   -- PG16; use num_dead_item_ids on PG17+
+FROM pg_stat_progress_vacuum v
+JOIN pg_stat_activity a USING (pid);
 ```
 
-`index_vacuum_count > 1` means `maintenance_work_mem` is undersized — VACUUM is making multiple passes over indexes. Raise per-table or session-level (PG17+ removed the 1GB cap, cross-ref [`54-memory-tuning.md`](./54-memory-tuning.md)).
+Repeated index-vacuum cycles can indicate an undersized dead-item store. Budget memory before changing `maintenance_work_mem` (manual VACUUM) or `autovacuum_work_mem` (autovacuum); there is no per-table memory override.
 
-**Step 4 — Is autovacuum being canceled?** Check `log_autovacuum_min_duration = 0` and grep for `canceling autovacuum task`. Lock conflicts (DDL during autovacuum) cancel it; anti-wraparound autovacuum cannot be canceled.
+**Step 4 — Is autovacuum being canceled?** Temporarily enable `log_autovacuum_min_duration = 0` and inspect cancellation logs. Anti-wraparound autovacuum is not automatically canceled by conflicting lock requests, but can still be explicitly canceled.
 
 **Step 5 — Manual VACUUM with diagnostics:**
 
@@ -277,33 +277,31 @@ SELECT
   pg_wal_lsn_diff(write_lsn, flush_lsn)              AS flush_lag_bytes,
   pg_wal_lsn_diff(flush_lsn, replay_lsn)             AS replay_lag_bytes,
   pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) AS total_lag,
-  write_lag, flush_lag, replay_lag                   AS time_lags
+  write_lag, flush_lag, replay_lag
 FROM pg_stat_replication
-ORDER BY total_lag DESC;
+ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) DESC NULLS LAST;
 ```
 
-Four stages — `pending` (primary hasn't sent yet) → `write_lag` (standby received but not written to OS) → `flush_lag` (written but not fsync'd) → `replay_lag` (fsync'd but not applied).
+The byte differences show the current backlog between reported positions. `write_lag`, `flush_lag`, and `replay_lag` instead measure recent commit acknowledgment delays at those stages, not the time needed to clear the current backlog. They can remain nonzero briefly on an idle, caught-up system and then become NULL.
 
 | Stage with the lag | Likely cause |
 |---|---|
-| `pending_bytes` large | Primary network bandwidth bottleneck, or `wal_sender_timeout` issue |
-| `write_lag` large | Standby disk write bottleneck |
-| `flush_lag` large | Standby fsync bottleneck (slow storage) |
-| `replay_lag` large | Standby single-threaded replay can't keep up with primary write rate, often blocked by long-running query on standby (`max_standby_streaming_delay`) |
+| `pending_bytes` large | WAL generation exceeds sender/network throughput, or the receiver is stalled |
+| `write_lag_bytes` large | Network, receiver scheduling, or standby write throughput |
+| `flush_lag_bytes` large | Standby durable-flush throughput |
+| `replay_lag_bytes` large | Replay throughput, recovery conflicts, configured delay, or paused recovery; inspect standby logs and state |
 
 **Step 2 — Replication slots:**
 
 ```sql
 SELECT
   slot_name, slot_type, database, active, wal_status,
-  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal,
-  inactive_since,            -- PG17+
-  invalidation_reason        -- PG17+
+  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
 FROM pg_replication_slots
 ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC NULLS LAST;
 ```
 
-`wal_status = 'lost'` is unrecoverable — slot exceeded `max_slot_wal_keep_size` and standby must be rebuilt. `wal_status = 'unreserved'` means slot WAL is no longer in `pg_wal` but may still be in archive. `wal_status = 'extended'` means WAL is being retained beyond `max_wal_size`.
+On PG17+, optionally add `inactive_since` and `invalidation_reason`. `lost` means the slot is unusable. `unreserved` means needed WAL is no longer protected by that slot and may be removed at the next checkpoint; it does not prove the files are already absent. Check archives and the recovery procedure before rebuilding.
 
 **Step 3 — Replay blocked by standby query?**
 
@@ -327,66 +325,66 @@ If `hot_standby_feedback = on`, long-running standby queries hold xmin back on *
 SELECT pg_is_in_recovery();         -- t = standby, f = primary
 SELECT pg_last_wal_replay_lsn();    -- standby only
 SELECT pg_last_wal_receive_lsn();   -- standby only
-SELECT pg_current_wal_lsn();        -- primary only
+-- On the primary only: SELECT pg_current_wal_lsn();
 ```
 
-A "standby" that returns `f` from `pg_is_in_recovery()` is a promoted primary (split-brain). Cross-ref [`90-disaster-recovery.md`](./90-disaster-recovery.md).
+A node expected to be a standby that returns `false` needs topology investigation. This alone does not prove split brain; split brain requires conflicting writable primaries.
 
 ### Recipe 5 — PITR Recovery Walkthrough
 
 Eight-step recovery to a specific point in time. Cross-ref [`84-backup-physical-pitr.md`](./84-backup-physical-pitr.md), [`85-backup-tools.md`](./85-backup-tools.md), [`90-disaster-recovery.md`](./90-disaster-recovery.md).
 
-**Pre-flight (must be true before disaster):**
+The paths below illustrate a PG18 source backup, not a cross-major restore. Use binaries matching the source major and explicitly target the isolated recovery instance for every command. Prevent application access and production archive writes until recovery is validated.
 
 1. `wal_level = replica` (or `logical`) on the source cluster, NOT `minimal`.
 2. `archive_mode = on` and `archive_command` (or `archive_library`, PG15+) configured.
-3. Recent base backup via `pg_basebackup` (or pgBackRest / Barman / WAL-G).
-4. Continuous WAL archive in object storage.
+3. A completed base backup whose recovery-consistency point precedes the desired target.
+4. An unbroken WAL archive from that backup through the target, plus any required timeline history.
 
 **The eight-step recovery:**
 
 ```bash
-# 1. Stop application traffic. Note the recovery target time (epoch or '2026-05-14 03:42:17+00')
+# 1. Stop application traffic and select the recovery target.
+set -euo pipefail
 RECOVERY_TARGET='2026-05-14 03:42:17+00'
 
 # 2. Provision a fresh host (do NOT recover in place — preserve evidence)
 # 3. Install matching PG major version
-PG_VERSION=18
+# This example uses PostgreSQL 18 binaries and an isolated recovery endpoint.
+RECOVERY_SOCKET=$(mktemp -d /tmp/pg-recovery.XXXXXX)
+RECOVERY_PORT=5433
 
 # 4. Restore base backup
-pgbackrest --stanza=main --type=time --target="$RECOVERY_TARGET" restore
-# (or pg_basebackup output extracted to /var/lib/postgresql/18/data)
+pgbackrest --stanza=main --pg1-path=/var/lib/postgresql/18/data \
+  --type=time --target="$RECOVERY_TARGET" --target-action=pause restore
 
-# 5. Configure recovery
-cat >> /var/lib/postgresql/18/data/postgresql.auto.conf <<EOF
-restore_command = 'pgbackrest --stanza=main archive-get %f "%p"'
-recovery_target_time = '$RECOVERY_TARGET'
-recovery_target_action = 'pause'   # don't promote until verified
-recovery_target_inclusive = on
-EOF
+# 5. Inspect pgBackRest's generated recovery configuration before startup.
+# Confirm restore_command, the time target, target-action=pause, and recovery.signal.
+# Resolve any inherited recovery-target selectors or standby.signal first.
 
-touch /var/lib/postgresql/18/data/recovery.signal
-
-# 6. Start server (will replay WAL up to target, then pause)
-pg_ctl -D /var/lib/postgresql/18/data start
+# 6. Start with no TCP listener and a private Unix socket.
+pg_ctl -D /var/lib/postgresql/18/data \
+  -o "-k $RECOVERY_SOCKET -p $RECOVERY_PORT -c listen_addresses=''" start
 
 # 7. Verify before promoting
-psql -c "SELECT pg_last_wal_replay_lsn(), now(), pg_is_in_recovery();"
-psql -c "SELECT count(*) FROM critical_table WHERE created_at < '$RECOVERY_TARGET';"
-# Inspect critical data; if wrong target, stop server and adjust recovery_target_time
+psql -h "$RECOVERY_SOCKET" -p "$RECOVERY_PORT" -d postgres \
+  -c "SELECT pg_last_wal_replay_lsn(), pg_is_in_recovery(), pg_get_wal_replay_pause_state();"
+psql -h "$RECOVERY_SOCKET" -p "$RECOVERY_PORT" -d mydb \
+  -c "SELECT count(*) FROM critical_table WHERE created_at < '$RECOVERY_TARGET';"
+# If an earlier target is needed, restore the base backup again; replay cannot go backward.
+# A later target can be configured after shutdown and resumed on restart.
 
-# 8. Promote when satisfied
-psql -c "SELECT pg_wal_replay_resume();"
-# After replay catches up to target, server auto-promotes (if recovery_target_action = 'promote')
-# OR explicitly:
-pg_ctl -D /var/lib/postgresql/18/data promote
+# 8. Only after the target is reached, replay is paused, and data is validated:
+psql -h "$RECOVERY_SOCKET" -p "$RECOVERY_PORT" -d postgres \
+  -c "SELECT pg_wal_replay_resume();"
+# At a reached recovery target with action=pause, resume ends recovery.
 ```
 
 **Critical rules:**
 
 - `recovery_target_inclusive = on` (default) stops **after** the target transaction. Set to `off` to stop **before**.
 - `recovery_target_action = 'pause'` (default since PG13) lets you verify. `promote` auto-promotes (risky — you can't go back). `shutdown` lets you inspect offline.
-- Only **one** `recovery_target_*` GUC may be set. Multiple = error.
+- Only one target selector (`recovery_target`, `_time`, `_xid`, `_lsn`, or `_name`) may be set. Modifiers such as `recovery_target_action`, `_inclusive`, and `_timeline` may accompany it.
 - `recovery.conf` was removed in PG12 — use `postgresql.conf` / `postgresql.auto.conf` + `recovery.signal` / `standby.signal`.
 
 Cross-ref [`84-backup-physical-pitr.md`](./84-backup-physical-pitr.md) for full grammar; [`89-pg-rewind.md`](./89-pg-rewind.md) if the old primary needs to rejoin as standby.
@@ -402,7 +400,7 @@ Four strategies, decision-tree first. Cross-ref [`87-major-version-upgrade.md`](
 | Cluster < 100GB, downtime budget > 1 hour | `pg_dump` + `pg_restore` (simplest, cross-version-safe) |
 | Cluster > 100GB, downtime budget ~10-30 min | `pg_upgrade --link` (in-place, near-zero copy) |
 | Downtime budget < 5 min | Logical replication (blue-green via subscriber) |
-| PG17→PG18, downtime budget < 1 min | `pg_createsubscriber` (PG17+) converts physical standby to subscriber |
+| Seed a logical subscriber from an existing physical standby | See `pg_createsubscriber` in reference 87; conversion requires the same major, with any major upgrade as a separate step |
 
 **Pre-upgrade audit (run on source cluster):**
 
@@ -431,6 +429,8 @@ SELECT rolname, rolsuper, rolreplication, rolbypassrls
 FROM pg_roles WHERE NOT rolname LIKE 'pg_%' ORDER BY rolname;
 ```
 
+Initialize the new cluster with compatible locale and checksum settings and install matching extension binaries first. Preserve a tested independent backup. With `--link`, starting the new cluster changes shared files and makes the old cluster unsafe to start; prefer `--clone` where supported if an independent old copy is needed.
+
 **pg_upgrade --link workflow:**
 
 ```bash
@@ -440,23 +440,26 @@ FROM pg_roles WHERE NOT rolname LIKE 'pg_%' ORDER BY rolname;
   --new-datadir=/var/lib/postgresql/18/main \
   --old-bindir=/usr/lib/postgresql/16/bin \
   --new-bindir=/usr/lib/postgresql/18/bin \
-  --check
+  --check --link
 
 # 2. Stop both clusters
 pg_ctlcluster 16 main stop
 pg_ctlcluster 18 main stop
 
 # 3. Actual upgrade
-/usr/lib/postgresql/18/bin/pg_upgrade ...same args... --link
+/usr/lib/postgresql/18/bin/pg_upgrade \
+  --old-datadir=/var/lib/postgresql/16/main \
+  --new-datadir=/var/lib/postgresql/18/main \
+  --old-bindir=/usr/lib/postgresql/16/bin \
+  --new-bindir=/usr/lib/postgresql/18/bin --link
 
 # 4. Start new cluster
 pg_ctlcluster 18 main start
 
-# 5. PG17 and earlier need ANALYZE; PG18+ pg_upgrade preserves planner stats
-# PG≤17:
-vacuumdb --all --analyze-in-stages --jobs=$(nproc)
-# PG18+: skipped, but verify a sample plan
-psql -c "EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM critical_table WHERE indexed_col = ?;"
+# 5. Follow pg_upgrade's post-upgrade instructions.
+# This example upgrades to PG18; transferred planner statistics are not complete.
+vacuumdb --all --analyze-in-stages --missing-stats-only --jobs=4
+vacuumdb --all --analyze-only --jobs=4
 ```
 
 **Post-upgrade checks (cross-ref [`100-pg-versions-features.md`](./100-pg-versions-features.md) for per-version GUC changes):**
@@ -465,7 +468,7 @@ psql -c "EXPLAIN (ANALYZE, BUFFERS) SELECT count(*) FROM critical_table WHERE in
 -- Connection params + auth still working?
 SELECT version(), current_setting('server_version_num');
 
--- Replication slots intact? (preserved by pg_upgrade since PG17)
+-- Inspect replication slots; preservation depends on slot type and upgrade prerequisites.
 SELECT slot_name, slot_type, active FROM pg_replication_slots;
 
 -- Extensions match new cluster?
@@ -499,11 +502,11 @@ If one query dominates, focus there. If many small queries dominate, the issue i
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) <the slow query>;
 ```
 
-For mutating statements, wrap in `BEGIN; ... ; ROLLBACK;` to avoid actually running. PG18+ adds `BUFFERS` by default.
+`EXPLAIN ANALYZE` executes the statement. `BEGIN` followed by `ROLLBACK` can undo transactional table changes, but does not prevent locks, sequence consumption, trigger execution, or external effects. Use a disposable clone for statements with irreversible effects.
 
-**Step 3 — Read bottom-up. Find the misestimate.**
+**Step 3 — Read the plan tree from inputs toward parents.**
 
-For each plan node, look at `(actual rows=N loops=L) (rows=E)` — total actual = `N * L`. If `actual ≠ estimate × 10` at any node, that's a misestimate. Climb the tree from the leaf where misestimate first appears.
+Compare `actual rows` per loop with estimated `rows` per invocation; multiply actual rows by `loops` only when calculating total work. A 10× mismatch is an investigation heuristic, not proof of a root cause. LIMIT, early-stopped join inputs, and unexecuted nodes can produce apparent mismatches without bad estimates. Execution is demand-driven, not a strict deepest-node-first schedule.[^using-explain]
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -515,11 +518,11 @@ For each plan node, look at `(actual rows=N loops=L) (rows=E)` — total actual 
 
 **Step 4 — Buffer reads:**
 
-`Buffers: shared read=N` (cold-cache disk reads) vs `shared hit=N` (warm-cache). High read = working set exceeds `shared_buffers`. High `temp read/written` = `work_mem` too small, query is spilling sorts/hashes to disk.
+`shared read` counts pages read into PostgreSQL buffers; those reads may be served from the OS cache, so they do not prove physical-disk I/O. `shared hit` means a PostgreSQL buffer hit. Temporary reads/writes can indicate spill; confirm the responsible sort or hash before increasing per-operation memory.
 
-**Step 5 — Identify wrong access method:**
+**Step 5 — Check whether the access method fits the workload:**
 
-`Seq Scan` on a table with a usable index = missing-index or stale-stats issue. `Index Scan` followed by `Rows Removed by Filter > 0` = predicate not fully index-supported, consider covering with INCLUDE or partial index.
+A sequential scan can be optimal for a small table or a query returning many rows even when an index exists. A residual filter can suggest a different key or partial predicate; adding an `INCLUDE` column alone does not make that filter an index search condition.[^using-explain]
 
 **Step 6 — Try a fix in a session, verify:**
 
@@ -571,10 +574,11 @@ ALTER TABLE events SET (
   autovacuum_analyze_scale_factor = 0.01,
   autovacuum_analyze_threshold = 500,
   autovacuum_vacuum_cost_delay = 2,         -- ms per cost-cycle (lower = faster)
-  autovacuum_vacuum_cost_limit = 2000,      -- raise from default 200
-  autovacuum_naptime = 30                    -- if launcher needs to revisit fast
+  autovacuum_vacuum_cost_limit = 2000       -- example; budget total I/O first
 );
 ```
+`autovacuum_naptime` is a cluster configuration setting, not a table storage parameter. Tune it separately only when launcher scheduling, rather than worker capacity or blockers, is the limiting factor.
+
 
 Per-table overrides win over cluster GUCs. Verify:
 
@@ -596,13 +600,13 @@ ALTER TABLE events SET (
 
 ```sql
 -- Watch autovacuum activity for 5 minutes
-SELECT pg_stat_reset();  -- baseline
+-- Capture this result, then compare after the observation window; do not reset statistics.
 -- wait 5 minutes under workload
 SELECT relname, autovacuum_count, n_dead_tup, last_autovacuum
 FROM pg_stat_user_tables WHERE relname = 'events';
 ```
 
-If `autovacuum_count = 0` after 5 minutes despite high dead_tup, autovacuum is being canceled (check `log_autovacuum_min_duration = 0` and grep logs for "canceling autovacuum task"). Cross-ref [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md) gotchas.
+No completed autovacuum in five minutes can also mean the trigger was not reached, workers were busy, the relation was blocked, or a scan is still running. Inspect settings, live progress, horizons, and logs before concluding it was canceled.
 
 ### Recipe 9 — Connection Storm Response
 
@@ -649,14 +653,14 @@ appdb = host=primary dbname=appdb
 [pgbouncer]
 listen_port = 6432
 auth_type = scram-sha-256
-auth_query = SELECT usename, passwd FROM pg_shadow WHERE usename=$1
-pool_mode = transaction      # most apps work fine here
-max_client_conn = 5000        # what apps connect to
-default_pool_size = 30        # backends per (user, db)
+auth_file = /etc/pgbouncer/userlist.txt
+pool_mode = transaction
+max_client_conn = 5000
+default_pool_size = 30
 server_idle_timeout = 600
 ```
 
-Apps connect to pgBouncer (port 6432) instead of PG (5432). `5000 client conns × 30 backend pool` collapses to ~30 actual PG backends. Cross-ref [`81-pgbouncer.md`](./81-pgbouncer.md) for transaction-mode caveats (session state, prepared statements, LISTEN).
+Provision the restricted authentication file and server credentials as described in reference 81; SCRAM pass-through requires matching stored secrets and compatible authentication. Configure TLS verification for remote connections. `default_pool_size = 30` is **per database/user pair**, not a global 30-backend cap. Review session-state, prepared-statement, and LISTEN requirements before choosing transaction pooling.[^pgbouncer-config]
 
 **Step 5 — Per-role baseline as defense-in-depth:**
 
@@ -685,6 +689,7 @@ CREATE TABLE events (
 ) PARTITION BY RANGE (occurred_at);
 
 -- 2. Install pg_partman
+CREATE SCHEMA partman;
 CREATE EXTENSION pg_partman WITH SCHEMA partman;
 
 -- 3. Template table for indexes/constraints (applies to NEW partitions only)
@@ -727,42 +732,47 @@ SELECT inhrelid::regclass FROM pg_inherits WHERE inhparent='events'::regclass OR
 SELECT * FROM cron.job WHERE jobname='partman-events';
 
 -- Recent runs successful?
-SELECT * FROM cron.job_run_details WHERE jobname='partman-events' ORDER BY start_time DESC LIMIT 5;
+SELECT d.* FROM cron.job_run_details d
+JOIN cron.job j USING (jobid)
+WHERE j.jobname = 'partman-events'
+ORDER BY d.start_time DESC LIMIT 5;
 ```
 
-**Note on HA failover:** pg_cron jobs run on the **primary only**. After failover, the new primary auto-resumes them (verified by the worker started at promote time). Cross-ref [`77-standby-failover.md`](./77-standby-failover.md) + [`98-pg-cron.md`](./98-pg-cron.md) HA section.
+**Note on HA failover:** pg_cron does not run jobs during hot standby. After promotion, its background worker starts scheduling replicated jobs. Confirm extension setup, job ownership, authentication, and the scheduling database on every candidate primary. Cross-ref [`77-standby-failover.md`](./77-standby-failover.md) + [`98-pg-cron.md`](./98-pg-cron.md).
 
-### Recipe 11 — Online DDL Without Locking
+### Recipe 11 — DDL with Shorter Blocking Windows
 
-Three canonical online patterns. Cross-ref [`26-index-maintenance.md`](./26-index-maintenance.md), [`37-constraints.md`](./37-constraints.md), [`43-locking.md`](./43-locking.md).
+These operations still take locks. Keep the initial and final DDL transactions short, use a bounded `lock_timeout`, and run long validation separately. Cross-reference [`26-index-maintenance.md`](./26-index-maintenance.md), [`37-constraints.md`](./37-constraints.md), and [`43-locking.md`](./43-locking.md).
 
 **Pattern A — Add a NOT NULL constraint without rewriting:**
 
 ```sql
--- 1. Add CHECK as NOT VALID (instant, no scan)
+-- 1. Brief ACCESS EXCLUSIVE lock; NOT VALID skips the initial table scan.
 ALTER TABLE users ADD CONSTRAINT users_email_not_null CHECK (email IS NOT NULL) NOT VALID;
 
--- 2. Backfill if needed
-UPDATE users SET email = 'unknown@example.com' WHERE email IS NULL;
+-- 2. Find existing rows requiring a business-correct backfill; do not invent emails.
+SELECT id FROM users WHERE email IS NULL;
 
 -- 3. Validate (SHARE UPDATE EXCLUSIVE, doesn't block reads/writes)
 ALTER TABLE users VALIDATE CONSTRAINT users_email_not_null;
 
--- 4. PG18+: convert to real NOT NULL via NOT VALID
+-- 4. PG16+: validated CHECK lets SET NOT NULL skip the scan, but a brief strong lock remains.
 ALTER TABLE users ALTER COLUMN email SET NOT NULL;   -- now fast because CHECK guarantees it
 ```
 
 **Pattern B — Add a foreign key without long lock:**
 
 ```sql
--- 1. NOT VALID FK takes brief ACCESS EXCLUSIVE, no scan
+-- 1. NOT VALID skips the scan, but takes SHARE ROW EXCLUSIVE on both tables.
 ALTER TABLE orders ADD CONSTRAINT orders_user_fk
   FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;
 
--- 2. Backfill / fix orphan rows
-DELETE FROM orders WHERE user_id NOT IN (SELECT id FROM users);
+-- 2. Inspect orphans. Reconcile them; do not delete business records automatically.
+SELECT o.* FROM orders o
+WHERE o.user_id IS NOT NULL
+  AND NOT EXISTS (SELECT FROM users u WHERE u.id = o.user_id);
 
--- 3. Validate (SHARE UPDATE EXCLUSIVE on both tables, allows DML)
+-- 3. Validate: SHARE UPDATE EXCLUSIVE on orders, ROW SHARE on users.
 ALTER TABLE orders VALIDATE CONSTRAINT orders_user_fk;
 ```
 
@@ -776,8 +786,9 @@ CREATE INDEX CONCURRENTLY orders_user_id_idx ON orders (user_id);
 SELECT indexrelid::regclass, indisvalid, indisready
 FROM pg_index WHERE indrelid='orders'::regclass AND NOT indisvalid;
 
--- If invalid, drop and retry
-DROP INDEX CONCURRENTLY orders_user_id_idx;
+-- Drop only if inspection confirms this index is invalid and not constraint-owned.
+-- Run separately from the successful build path:
+-- DROP INDEX CONCURRENTLY orders_user_id_idx;
 ```
 
 **Cannot run inside transaction block:**
@@ -841,18 +852,20 @@ WHERE r.rolname = 'soon_to_be_dropped'
 
 **Step 4 — Safe drop:**
 
-```bash
-# Per-database, reassign ownership then drop privileges
-for db in $(psql -tAc "SELECT datname FROM pg_database WHERE NOT datistemplate"); do
-  psql -d "$db" -c "REASSIGN OWNED BY soon_to_be_dropped TO new_owner;"
-  psql -d "$db" -c "DROP OWNED BY soon_to_be_dropped;"
-done
+Before retiring the role, stop its sessions and prevent new work or ownership changes. Repeat the following transaction in **every database containing its objects, grants, or default privileges**, including a modified template database:
 
-# Cluster-wide
-psql -c "DROP ROLE soon_to_be_dropped;"
-```
+    psql -X -v ON_ERROR_STOP=1 -d mydb -c '
+      BEGIN;
+      REASSIGN OWNED BY soon_to_be_dropped TO new_owner;
+      DROP OWNED BY soon_to_be_dropped;
+      COMMIT;
+    '
 
-`REASSIGN OWNED` moves ownership; `DROP OWNED` removes privileges. Tablespace ownership is **not** handled by `REASSIGN OWNED` — `ALTER TABLESPACE ... OWNER TO new_owner` manually.
+Only after each database succeeds:
+
+    psql -X -v ON_ERROR_STOP=1 -d postgres -c 'DROP ROLE soon_to_be_dropped;'
+
+`DROP OWNED` can delete objects still owned by the role, so it must not run after a failed reassignment. `REASSIGN OWNED` also handles shared databases and tablespaces; it does not revoke grants or default privileges, which the later `DROP OWNED` handles.[^reassign-owned]
 
 ## Catalog Exploration
 
@@ -873,7 +886,7 @@ WHERE backend_type = 'client backend' AND state != 'idle'
 ORDER BY xact_start ASC NULLS LAST;
 ```
 
-Read `wait` first. `Lock/*` = blocked on lock (run Recipe 2). `IO/*` = reading/writing storage. `LWLock/*` = shared-memory contention. `Activity/*` = idle (paradoxically — backend is between queries). `state = 'active' AND wait IS NOT NULL` is normal — backend is on-CPU but waiting on a resource.
+`state = 'active'` and a non-null wait event means the query is executing but currently waiting for a resource, not consuming CPU at that instant. `state` and wait events are independent.[^statistics]
 
 ### §2 — What's eating disk
 
@@ -896,7 +909,7 @@ ORDER BY pg_total_relation_size(c.oid) DESC
 LIMIT 20;
 ```
 
-`pg_relation_size` is heap or index only. `pg_total_relation_size` adds TOAST + all indexes. Partitioned-parent tables return 0 from `pg_relation_size` (the partitions hold the data) — use `pg_total_relation_size` for the aggregate.
+`pg_relation_size` measures one relation fork. `pg_total_relation_size` adds the relation's forks, TOAST, and indexes, but does not recursively total a partition hierarchy. For a partitioned parent, sum `pg_total_relation_size(relid)` over leaf rows of `pg_partition_tree(parent)`.
 
 ### §3 — Tables without a primary key
 
@@ -915,7 +928,7 @@ WHERE c.relkind IN ('r', 'p')
 ORDER BY c.reltuples DESC;
 ```
 
-Tables without PK can't be replicated logically (no `REPLICA IDENTITY`), can't use `pg_repack`, and are friction-prone for ORMs.
+Logical replication can publish INSERTs without a primary key. UPDATE/DELETE replication needs a suitable replica identity, which can be a qualifying unique index or `REPLICA IDENTITY FULL`. Full-table `pg_repack` also accepts a qualifying unique index on non-null columns; a PK is not its only option.
 
 ### §4 — Foreign keys missing a covering index
 
@@ -928,12 +941,20 @@ FROM pg_constraint c
 WHERE contype = 'f'
   AND NOT EXISTS (
     SELECT 1 FROM pg_index i
+    JOIN pg_class idx ON idx.oid = i.indexrelid
+    JOIN pg_am am ON am.oid = idx.relam
     WHERE i.indrelid = c.conrelid
-      AND (i.indkey::int[])[0:cardinality(c.conkey)-1] = c.conkey::int[]
+      AND i.indisvalid AND i.indisready AND i.indpred IS NULL
+      AND am.amname = 'btree'
+      AND i.indnkeyatts >= cardinality(c.conkey)
+      AND ARRAY(
+        SELECT k FROM unnest(i.indkey) WITH ORDINALITY AS keys(k, pos)
+        WHERE pos <= cardinality(c.conkey)
+      ) @> c.conkey
   );
 ```
 
-Leading-prefix match: index `(other, fk_col)` does NOT satisfy. The index must lead with the FK column(s) in the FK's declared order. Without a covering index, every parent `DELETE`/`UPDATE` triggers a sequential scan of the child.
+This is a structural candidate check, not a guarantee of a particular plan. The leading B-tree key positions should contain the FK columns; equality checks can use them in a different order. Included columns are not search keys. Confirm operator/collation compatibility and the actual plan before adding an index.
 
 ### §5 — Unused indexes (with caveats)
 
@@ -951,7 +972,8 @@ JOIN pg_class c ON c.oid = s.relid
 JOIN pg_namespace n ON n.oid = c.relnamespace
 JOIN pg_index ix ON ix.indexrelid = i.oid
 WHERE s.idx_scan = 0
-  AND NOT ix.indisunique AND NOT ix.indisprimary
+  AND NOT ix.indisunique AND NOT ix.indisprimary AND NOT ix.indisexclusion
+  AND NOT EXISTS (SELECT FROM pg_constraint con WHERE con.conindid = i.oid)
   AND pg_relation_size(i.oid) > 1024*1024
 ORDER BY pg_relation_size(i.oid) DESC;
 ```
@@ -962,18 +984,18 @@ Three caveats: (a) counters are per-instance — indexes used only on a standby 
 
 ```sql
 SELECT
-  blocked.pid AS blocked_pid, blocker.pid AS blocker_pid,
+  blocked.pid AS blocked_pid, blockers.pid AS blocker_pid,
   age(now(), blocked.xact_start) AS blocked_age,
   blocked.wait_event,
   left(blocked.query, 100) AS blocked_query,
   left(blocker.query, 100) AS blocker_query
 FROM pg_stat_activity blocked
-JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS bp ON true
-JOIN pg_stat_activity blocker ON blocker.pid = bp
+JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS blockers(pid) ON true
+LEFT JOIN pg_stat_activity blocker ON blocker.pid = blockers.pid
 WHERE blocked.wait_event_type = 'Lock';
 ```
 
-PID `0` means a prepared transaction (cross-ref [`41-transactions.md`](./41-transactions.md)). PIDs may repeat (one row per held lock).
+PID `0` represents a blocking prepared transaction; inspect `pg_prepared_xacts` and `pg_locks` because it has no activity row. Parallel workers can produce duplicate client PIDs.[^blocking-pids]
 
 ### §7 — Replication lag per replica + slot retention
 
@@ -987,8 +1009,7 @@ ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) DESC;
 
 -- Slot retention
 SELECT slot_name, slot_type, active, wal_status,
-  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal,
-  inactive_since        -- PG17+
+  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
 FROM pg_replication_slots
 ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC NULLS LAST;
 ```
@@ -1002,14 +1023,15 @@ SELECT
   pid, usename, application_name, state,
   age(now(), xact_start) AS xact_age,
   age(now(), state_change) AS state_age,
-  backend_xmin, age(backend_xmin) AS xmin_age,
+  backend_xid, backend_xmin,
+  greatest(age(backend_xid), age(backend_xmin)) AS oldest_xid_age,
   left(query, 200) AS query
 FROM pg_stat_activity
-WHERE backend_xmin IS NOT NULL
-ORDER BY age(backend_xmin) DESC LIMIT 10;
+WHERE backend_xid IS NOT NULL OR backend_xmin IS NOT NULL
+ORDER BY oldest_xid_age DESC LIMIT 10;
 ```
 
-A row with `xmin_age > 1_000_000` and `state = 'idle in transaction'` is the canonical bloat-builder — its snapshot is preventing VACUUM from reclaiming dead tuples cluster-wide.
+Inspect both `backend_xid` and `backend_xmin`: an idle transaction may retain an XID without an active statement snapshot. Judge urgency from age, XID consumption rate, and evidence of blocked cleanup rather than a universal one-million-XID threshold.
 
 ### §9 — Extension inventory + version status
 
@@ -1086,7 +1108,7 @@ Reveals transitive membership — useful when a user has access they "shouldn't"
 
 1. **Reaching for `VACUUM FULL` when the answer is `pg_repack`.** `VACUUM FULL` takes `ACCESS EXCLUSIVE` for the duration. `pg_repack` rewrites the table online with brief locks at start and swap. Cross-ref [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md).
 
-2. **Killing a walsender or logical-replication apply worker via `pg_terminate_backend`.** Breaks replication. Check `backend_type` first.
+2. **Signaling replication workers as generic query cleanup interrupts replication.** Check `backend_type` and use the replication runbook when intervention is intended.
 
 3. **Running diagnostic queries against `pg_statistic` directly.** Restricted (PG masks by per-table SELECT privilege). Use `pg_stats` view instead.
 
@@ -1094,13 +1116,13 @@ Reveals transitive membership — useful when a user has access they "shouldn't"
 
 5. **Filtering `pg_class` without `relkind`.** You'll mix tables, indexes, sequences, TOAST tables, partitioned tables. Always specify the kinds you want.
 
-6. **`pg_blocking_pids` deduplication assumed but not provided.** Same PID can appear multiple times in the array (one per held lock). De-duplicate downstream if needed.
+6. **`pg_blocking_pids` can repeat client PIDs for parallel workers.** It also represents a blocking prepared transaction as PID 0; an inner join to `pg_stat_activity` would hide that blocker.[^blocking-pids]
 
-7. **Carrying forward `random_page_cost = 4.0` from spinning-rust era onto NVMe.** Costs index scans 4x more than they should. Lower to `1.1` on SSD-class storage. Cross-ref [`59-planner-tuning.md`](./59-planner-tuning.md).
+7. **Planner I/O costs are workload-dependent estimates.** Benchmark changes to `random_page_cost`; NVMe alone does not establish that 1.1 is correct for every query mix.
 
 8. **Running `ANALYZE` on a single table when planner stats look wrong.** If multi-column correlation is the issue, plain `ANALYZE` won't help — create extended statistics via `CREATE STATISTICS`. Cross-ref [`55-statistics-planner.md`](./55-statistics-planner.md).
 
-9. **Trusting `idx_scan = 0` as proof of unused.** Counters reset on cluster restart; replica-side scans don't count; recently-created indexes appear unused. Use PG16+ `last_idx_scan` instead.
+9. **`idx_scan = 0` does not prove an index is unused or safe to drop.** Check constraint dependencies, representative workload coverage, replicas, and statistics resets. Clean PG16 shutdowns preserve cumulative counters; crashes and recovery reset them. `last_idx_scan` also depends on that observation history.[^statistics]
 
 10. **Using `\d` interactively when a recurring catalog query would be faster.** `\set ECHO_HIDDEN on` reveals the catalog query psql is running — copy, paste, automate.
 
@@ -1108,7 +1130,7 @@ Reveals transitive membership — useful when a user has access they "shouldn't"
 
 12. **Treating `pg_stat_*` cumulative counters as instantaneous.** They're since-last-reset (per-collector). For time-series, snapshot and diff.
 
-13. **Forgetting that `pg_cron` jobs run on the primary only.** After failover, the new primary picks them up — but a job's history (`cron.job_run_details`) does not transfer. Cross-ref [`98-pg-cron.md`](./98-pg-cron.md).
+13. **pg_cron jobs resume on a promoted physical standby when configured and available.** Both `cron.job` and `cron.job_run_details` are ordinary tables replicated with the database, subject to replication lag; job execution itself does not run during hot standby.[^pgcron]
 
 14. **Running a `CREATE INDEX CONCURRENTLY` inside a transaction block.** Refused with `25001 active_sql_transaction`. Use the migration framework's escape hatch.
 
@@ -1166,3 +1188,19 @@ This file is a synthesis — primary sources for each fact live in the per-topic
 - PG18 release notes (pg_stat_io.op_bytes removal, planner-stats survive pg_upgrade, BUFFERS auto in EXPLAIN): <https://www.postgresql.org/docs/release/18.0/>
 - pg_partman: <https://github.com/pgpartman/pg_partman>
 - pg_cron: <https://github.com/citusdata/pg_cron>
+- EXPLAIN interpretation and execution: <https://www.postgresql.org/docs/16/using-explain.html>
+- ALTER TABLE locking and validation: <https://www.postgresql.org/docs/16/sql-altertable.html>
+- REASSIGN OWNED: <https://www.postgresql.org/docs/16/sql-reassign-owned.html>
+- PG18 post-upgrade maintenance: <https://www.postgresql.org/docs/18/pgupgrade.html>
+
+[^blocking-pids]: PostgreSQL 16, `pg_blocking_pids` semantics. <https://www.postgresql.org/docs/16/functions-info.html#FUNCTIONS-INFO-SESSION>
+
+[^using-explain]: PostgreSQL 16, EXPLAIN execution, per-loop estimates, buffer counts, and early termination. <https://www.postgresql.org/docs/16/using-explain.html>
+
+[^statistics]: PostgreSQL 16, Cumulative Statistics System: persistence, waits, and reset caveats. <https://www.postgresql.org/docs/16/monitoring-stats.html>
+
+[^reassign-owned]: PostgreSQL 16, REASSIGN OWNED and shared-object ownership. <https://www.postgresql.org/docs/16/sql-reassign-owned.html>
+
+[^pgbouncer-config]: PgBouncer configuration, authentication, TLS, and per-user/database pool limits. <https://www.pgbouncer.org/config.html>
+
+[^pgcron]: pg_cron upstream documentation, configuration, job tables, and standby behavior. <https://github.com/citusdata/pg_cron>

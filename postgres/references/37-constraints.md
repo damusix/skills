@@ -69,9 +69,9 @@ PostgreSQL constraints follow five rules that drive almost every recipe and gotc
 
 3. **`UNIQUE` allows multiple NULLs by default.** The docs put it bluntly: *"By default, two null values are not considered equal in this comparison. That means even in the presence of a unique constraint it is possible to store duplicate rows that contain a null value in at least one of the constrained columns"* [^pg16-unique]. Use `UNIQUE NULLS NOT DISTINCT` (PG15+) to treat NULLs as equal [^pg15-nulls]. Primary keys reject this combination on PG16+ [^pg16-pk-nulls].
 
-4. **Only `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY`, and `EXCLUDE` can be deferrable.** `NOT NULL` and `CHECK` are *always* immediate — `SET CONSTRAINTS` cannot defer them [^pg16-deferrable] [^pg16-setcon]. Deferrable constraints fire at the end of the transaction unless explicitly set otherwise.
+4. **Only `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY`, and `EXCLUDE` can be deferrable.** Their initial mode determines whether checks occur at statement end or transaction end; `SET CONSTRAINTS` can change it.[^pg16-deferrable]
 
-5. **`NOT VALID` + `VALIDATE CONSTRAINT` is the canonical online-migration pattern.** Adding a CHECK or FK constraint normally requires `ACCESS EXCLUSIVE` for a full table scan. `NOT VALID` lets you take a brief lock to install the constraint (future writes are enforced), then `VALIDATE CONSTRAINT` rescans the existing rows with only `SHARE UPDATE EXCLUSIVE` [^pg16-altertable-notes]. PG18 extends this to `NOT NULL` [^pg18-notnull-notvalid].
+5. **`NOT VALID` + `VALIDATE CONSTRAINT` reduces the write-blocking interval.** Adding CHECK takes `ACCESS EXCLUSIVE`; adding an FK takes `SHARE ROW EXCLUSIVE` on both tables. Install without scanning, commit, then validate under a weaker lock.[^pg16-altertable-notes]
 
 
 ## Decision Matrix
@@ -95,7 +95,7 @@ PostgreSQL constraints follow five rules that drive almost every recipe and gotc
 **Three smell signals** that you reached for the wrong constraint:
 
 1. You wrote a `CHECK` constraint with a subquery — illegal; CHECK can only reference the current row. Use a trigger (and accept the race conditions) or model the rule with a FK.
-2. You added `DEFERRABLE` to a `CHECK` or `NOT NULL` — silently ignored; only UNIQUE/PK/FK/EXCLUDE can defer. Reorder your DML instead.
+2. You added `DEFERRABLE` to a `CHECK` or `NOT NULL`: PostgreSQL rejects it; those constraints cannot be deferred.[^pg16-deferrable]
 3. You wrote `UNIQUE (email) WHERE deleted_at IS NULL` — illegal syntax; UNIQUE constraints can't have a WHERE. Use `CREATE UNIQUE INDEX ... WHERE` instead.
 
 
@@ -142,7 +142,7 @@ CHECK can be inline on a column or written as a table constraint. The table form
 
 **Rules and restrictions** [^pg16-cttable]:
 
-- The expression must be `IMMUTABLE` (no `now()`, no subqueries, no references to other tables, no volatile functions).
+- PostgreSQL assumes the condition is immutable but does not enforce function volatility for CHECK expressions. Avoid `now()`, volatile functions, and functions querying other rows; subsequent changes can invalidate existing data.[^pg16-ddl-constraints]
 - The expression may reference the system column `tableoid` but no other system column.
 - A CHECK constraint can be marked `NO INHERIT` to scope it to one table only.
 
@@ -179,9 +179,9 @@ Column-constraint form:
 > - Foreign tables can have `NOT NULL` constraints.
 > - `NO INHERIT` is allowed on `NOT NULL` (PG≤17: not allowed).
 > - `ALTER TABLE ... ALTER CONSTRAINT ... [NO] INHERIT` works for NOT NULL [^pg18-notnull-inherit].
-> - `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL NOT VALID` is the canonical online-migration form [^pg18-notnull-notvalid].
+> - `ALTER TABLE ... ADD CONSTRAINT name NOT NULL column_name NOT VALID` installs a named not-null constraint without the initial scan.[^pg18-notnull-notvalid]
 
-On PG≤17, the only way to add a NOT NULL to a populated table is `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL` — which takes `ACCESS EXCLUSIVE` and scans the table. The PG18 `NOT VALID` form lets you install the constraint immediately and validate later (see Recipe 8).
+On PG≤17, `SET NOT NULL` ordinarily scans under `ACCESS EXCLUSIVE`, but a validated CHECK proving non-null lets PostgreSQL skip that scan.[^pg16-altertable-notes]
 
 > [!WARNING] Minor releases 2026-11-12
 > The 2026-11-12 minors fixed `NOT NULL NO INHERIT` constraints on partitioned tables, which could let a partition hold NULLs.[^minor-nov-announce] Find existing ones with:
@@ -304,7 +304,7 @@ Grammar:
 
 **MATCH modes.** Default is `MATCH SIMPLE`: a referencing row passes if *any* FK column is NULL. `MATCH FULL` requires *all* FK columns to be NULL or *all* non-NULL — no mix. `MATCH PARTIAL` is reserved but not implemented [^pg16-fk].
 
-**Lock level.** `ADD FOREIGN KEY` takes `SHARE ROW EXCLUSIVE` on both the referencing and referenced table — not `ACCESS EXCLUSIVE`. Reads and other DDL on conflicting modes are blocked; concurrent SELECTs are not [^pg16-altertable-notes]. The full scan to verify existing rows is the slow part; use `NOT VALID` + `VALIDATE CONSTRAINT` (Recipe 6) to split it.
+**Lock level.** `ADD FOREIGN KEY` takes `SHARE ROW EXCLUSIVE` on both tables. Ordinary SELECTs and row-locking SELECTs can continue; INSERT, UPDATE and DELETE wait until the DDL commits.[^pg16-altertable-notes]
 
 > [!NOTE] PostgreSQL 15 — column-list ON DELETE SET
 >
@@ -353,9 +353,8 @@ A row passes if, for every pair compared, at least one of `room_id = other.room_
 
 **btree_gist is only required when mixing operators.** A pure-range EXCLUDE — `EXCLUDE USING gist (period WITH &&)` — works without `btree_gist`. You need the extension only when mixing B-tree-only operators (`=`, `<`, `>`) with range/geometric operators in the same EXCLUDE clause. See [`24-gin-gist-indexes.md`](./24-gin-gist-indexes.md) for the GiST deep dive.
 
-> [!NOTE] PostgreSQL 17
->
-> Verbatim release-note quote: *"Allow exclusion constraints on partitioned tables (Paul A. Jungwirth). As long as exclusion constraints compare partition key columns for equality, other columns can use exclusion constraint-specific comparisons."* [^pg17-exclude-part] The partition-key-equality requirement is the same shape as the unique-constraint-must-include-partition-key rule.
+> [!NOTE] PostgreSQL 18
+> Exclusion constraints on partitioned tables are supported in PG18 with partition-key equality. See <https://www.postgresql.org/docs/18/ddl-partitioning.html>.
 
 
 ### NOT VALID + VALIDATE CONSTRAINT
@@ -471,7 +470,7 @@ PG16 restrictions on generated columns [^pg16-gencol]:
 >
 > Virtual generated columns occupy no storage; they are computed on every read. The PG18 grammar adds `[ STORED | VIRTUAL ]` with `VIRTUAL` as the default. Virtual generated columns cannot have user-defined types and the expression cannot reference user-defined functions or types.
 
-**Generated columns and CHECK constraints.** You can add a CHECK constraint that references a generated column (stored or virtual), and the CHECK fires every time the row is written. You cannot reference a generated column from a FOREIGN KEY's referencing-side; you can reference a generated column from a referenced-table PK (stored only; virtual columns can't have indexes that back constraints on PG18).
+**Generated columns and CHECK constraints.** A CHECK may reference a stored generated column. Foreign keys involving generated columns have restrictions on referential actions; consult the target version's `CREATE TABLE` reference before choosing actions.[^pg16-cttable]
 
 
 ### Lock-level matrix
@@ -493,7 +492,7 @@ This is the canonical matrix for constraint DDL. Lock levels come from `sql-alte
 | `ALTER TABLE DROP CONSTRAINT name` | `ACCESS EXCLUSIVE` | — | Drops associated index for UNIQUE/PK/EXCLUDE |
 | `ALTER TABLE ALTER CONSTRAINT name DEFERRABLE` | `ACCESS EXCLUSIVE` | — | Catalog-only change but takes full lock |
 | `ALTER TABLE ALTER COLUMN ... SET NOT NULL` (PG≤17) | `ACCESS EXCLUSIVE` | — | Full table scan during lock |
-| `ALTER TABLE ALTER COLUMN ... SET NOT NULL NOT VALID` (PG18+) | `ACCESS EXCLUSIVE` (brief) | — | No scan; brief lock |
+| `ALTER TABLE ... ADD CONSTRAINT ... NOT NULL column NOT VALID` (PG18+) | `ACCESS EXCLUSIVE` (brief) | — | No scan; brief lock |
 | `SET CONSTRAINTS ...` | none | none | Affects current transaction only |
 
 Cross-reference: [`43-locking.md`](./43-locking.md) has the full lock-conflict matrix.
@@ -507,7 +506,7 @@ Cross-reference: [`43-locking.md`](./43-locking.md) has the full lock-conflict m
 | **PG14** | No end-user constraint feature changes. Only internal: PK/UNIQUE/FK added to system catalogs. | [^pg14-syscat] |
 | **PG15** | `UNIQUE NULLS NOT DISTINCT` for constraints and indexes. `ON DELETE SET (col_list)` for FKs. | [^pg15-nulls] [^pg15-fk-cols] |
 | **PG16** | `NULLS NOT DISTINCT` disallowed for primary keys. | [^pg16-pk-nulls] |
-| **PG17** | Exclusion constraints on partitioned tables (with partition-key-equality requirement). | [^pg17-exclude-part] |
+| **PG17** | Identity columns on partitioned tables. |
 | **PG18** | **Major rewrite of NOT NULL:** stored in `pg_constraint`, explicit names, `NO INHERIT`, table-constraint syntax, `NOT VALID` for NOT NULL. `NOT ENFORCED` for CHECK and FK. **Virtual generated columns** (default). **Temporal constraints:** `WITHOUT OVERLAPS` and `PERIOD`. `ALTER CONSTRAINT [NO] INHERIT` for NOT NULL. `NOT VALID` FK on partitioned tables. `DROP CONSTRAINT ONLY` on partitioned tables. PK/FK collation determinism rule. | [^pg18-notnull-store] [^pg18-notnull-notvalid] [^pg18-notenforced] [^pg18-virtual] [^pg18-temporal] [^pg18-notnull-inherit] [^pg18-notvalid-fk-part] [^pg18-drop-only] [^pg18-collations] |
 
 
@@ -555,7 +554,7 @@ Creating a PK normally takes `ACCESS EXCLUSIVE` for the full B-tree build. The w
     CREATE UNIQUE INDEX CONCURRENTLY orders_pkey_idx ON orders (order_id);
 
     -- Step 2: ensure column is NOT NULL (also concurrently if needed)
-    ALTER TABLE orders ALTER COLUMN order_id SET NOT NULL;  -- ACCESS EXCLUSIVE, brief scan
+    ALTER TABLE orders ALTER COLUMN order_id SET NOT NULL;  -- ACCESS EXCLUSIVE; may scan
 
     -- Step 3: promote the existing index to PK (brief ACCESS EXCLUSIVE)
     ALTER TABLE orders ADD CONSTRAINT orders_pkey
@@ -660,16 +659,16 @@ Without `INITIALLY DEFERRED`, the first INSERT fails because `head_emp_id = 100`
 ### Recipe 8: PG18 — add NOT NULL to a large table without scanning
 
 
-On PG≤17, `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL` takes `ACCESS EXCLUSIVE` and scans the table. PG18 fixes this:
+On PG≤17, `SET NOT NULL` takes `ACCESS EXCLUSIVE` and normally scans unless a valid CHECK proves non-null. PG18 also supports a named `NOT VALID` not-null constraint:
 
     -- PG18+: brief ACCESS EXCLUSIVE, no scan
     ALTER TABLE events
-        ALTER COLUMN occurred_at SET NOT NULL NOT VALID;
+        ADD CONSTRAINT events_occurred_at_not_null NOT NULL occurred_at NOT VALID;
 
     -- Validate later under SHARE UPDATE EXCLUSIVE
     ALTER TABLE events VALIDATE CONSTRAINT events_occurred_at_not_null;
 
-Per [^pg18-notnull-notvalid], the NOT NULL is stored in `pg_constraint` with a name (auto-generated unless you specify). The validation step uses `SHARE UPDATE EXCLUSIVE` like every other `VALIDATE CONSTRAINT`.
+The explicitly named constraint can be validated later under `SHARE UPDATE EXCLUSIVE`.[^pg18-notnull-notvalid]
 
 **Pre-PG18 alternative:** add the NOT NULL as a CHECK constraint with NOT VALID:
 
@@ -680,7 +679,7 @@ Per [^pg18-notnull-notvalid], the NOT NULL is stored in `pg_constraint` with a n
 
     ALTER TABLE events VALIDATE CONSTRAINT events_occurred_at_not_null;
 
-This is functionally equivalent but produces an explicit CHECK constraint rather than a NOT NULL column attribute. The CHECK form is what the SQL standard calls a "table check constraint" and works on every version since PG9.x.
+The CHECK enforces the same null restriction on rows, but does not itself mark the column `NOT NULL`. After validation, `ALTER COLUMN occurred_at SET NOT NULL` can skip the scan; then the redundant CHECK can be dropped. See <https://www.postgresql.org/docs/16/sql-altertable.html>.
 
 
 ### Recipe 9: Naming all your constraints
@@ -714,7 +713,7 @@ The default-naming convention to mimic: `{table}_{column}_{suffix}` where the su
     -- If we reach here, everything passes; commit
     COMMIT;
 
-If `SET CONSTRAINTS ALL IMMEDIATE` raises (because there's a pending violation), you can stay in the transaction, fix the offending row, and run `SET CONSTRAINTS ALL IMMEDIATE` again. Or you can `ROLLBACK`.
+If `SET CONSTRAINTS ALL IMMEDIATE` raises, the transaction is aborted. Roll back the transaction or roll back to a savepoint established before the command before attempting repairs.[^pg16-setcon]
 
 
 ### Recipe 11: PG18 temporal constraints — non-overlapping prices per product
@@ -806,15 +805,15 @@ Foreign keys without a covering index on the child side (delete-on-parent will b
 
 3. **`UNIQUE NULLS NOT DISTINCT` is not allowed on PRIMARY KEY.** PG16+ rejects this combination [^pg16-pk-nulls]. The PG15 syntax allowed it; PG16 forbids it because a PK column is already NOT NULL.
 
-4. **`NOT DEFERRABLE` is the default for all constraints.** If you forget to write `DEFERRABLE`, you can't `SET CONSTRAINTS ... DEFERRED` later. The constraint must be created with `DEFERRABLE` at the start; `ALTER CONSTRAINT` can change the *initial* mode but only for FKs and only if the constraint was created deferrable.
+4. **`NOT DEFERRABLE` is the default.** A non-deferrable constraint cannot be deferred with `SET CONSTRAINTS`. PostgreSQL 16 permits `ALTER CONSTRAINT` to change foreign-key deferrability; other constraint kinds generally require replacement. See <https://www.postgresql.org/docs/16/sql-altertable.html>.
 
-5. **`NOT NULL` and `CHECK` are never deferrable.** Even if you write `DEFERRABLE` next to a `CHECK`, it's silently meaningless (the grammar accepts it but the constraint is always immediate). Verbatim: *"NOT NULL and CHECK constraints are always checked immediately when a row is inserted or modified (not at the end of the statement)."* [^pg16-setcon]
+5. **`NOT NULL` and `CHECK` are not deferrable.** PostgreSQL rejects an attempt to declare them `DEFERRABLE`; both are checked immediately.[^pg16-setcon]
 
 6. **`ALTER CONSTRAINT` works on FK only, pre-PG18.** To change a CHECK constraint's expression, you must drop and recreate. PG18 added `ALTER CONSTRAINT [NO] INHERIT` but only for NOT NULL [^pg18-notnull-inherit].
 
 7. **`CREATE UNIQUE INDEX CONCURRENTLY` doesn't create a UNIQUE constraint.** The index alone enforces uniqueness, but the catalog has no `pg_constraint` row. Use `ALTER TABLE ... ADD CONSTRAINT ... USING INDEX` to promote.
 
-8. **`ADD CONSTRAINT FOREIGN KEY` takes `SHARE ROW EXCLUSIVE`, not `ACCESS EXCLUSIVE`.** [^pg16-altertable-notes] This is the most often-misquoted lock level. Reads are not blocked; only conflicting DDL and `SHARE` modes higher. Concurrent SELECT/INSERT/UPDATE/DELETE proceed.
+8. **`ADD CONSTRAINT FOREIGN KEY` takes `SHARE ROW EXCLUSIVE` on both tables.** Concurrent SELECTs proceed, but INSERT, UPDATE and DELETE wait.[^pg16-altertable-notes]
 
 9. **`VALIDATE CONSTRAINT` does not parallelize.** The full-table scan runs single-threaded. On a 1 TB table this can take hours. Schedule it during a low-write window.
 
@@ -824,9 +823,9 @@ Foreign keys without a covering index on the child side (delete-on-parent will b
 
 12. **CHECK can't reference other tables.** No subqueries, no other relations. The expression sees only the current row and the table itself (via `tableoid`). Use a FK or a trigger for cross-table rules.
 
-13. **CHECK expressions must be IMMUTABLE.** No `now()`, no `random()`, no STABLE functions, no user-defined VOLATILE functions. The CHECK is re-evaluated only at write time, but PG requires deterministic evaluability for index-expression and dump-restore compatibility.
+13. **CHECK expressions are assumed immutable, not enforced immutable.** Time-dependent or table-reading functions can leave existing rows violating the constraint; avoid them.[^pg16-ddl-constraints]
 
-14. **`ALTER COLUMN SET NOT NULL` is `ACCESS EXCLUSIVE` + scan on PG≤17.** Use the PG18 `NOT VALID` form (Recipe 8) or the PG≤17 CHECK-constraint workaround.
+14. **`ALTER COLUMN SET NOT NULL` takes `ACCESS EXCLUSIVE` and may scan on PG≤17.** A validated CHECK proving non-null can avoid the scan; PG18 also supports a `NOT VALID` not-null constraint.
 
 15. **EXCLUDE constraints have per-insert lookup costs.** Every insert checks against the GiST/SP-GiST index. For very-high-write workloads (>10K/s sustained), profile EXCLUDE inserts before committing to the pattern. Cross-reference [`35-partitioning.md`](./35-partitioning.md) for mitigation via partition keys.
 
@@ -844,7 +843,7 @@ Foreign keys without a covering index on the child side (delete-on-parent will b
 
 22. **PG18 PK/FK collation rule can break pg_upgrade.** Verbatim: *"The restore of a pg_dump, also used by pg_upgrade, will fail if these requirements are not met; schema changes must be made for these upgrade methods to succeed."* [^pg18-collations] Audit FKs over text/varchar columns and confirm both sides use deterministic collations OR the same nondeterministic collation before upgrading to PG18.
 
-23. **`DEFERRABLE` doesn't make UNIQUE behave differently with `ON CONFLICT`.** Same gotcha as #11 but specifically: many teams add `DEFERRABLE` thinking it relaxes uniqueness checking inside a statement. It doesn't. INSERT statements check uniqueness row-by-row regardless; `DEFERRABLE` only matters for cross-statement timing.
+23. **Deferrability changes uniqueness-check timing.** Non-deferrable uniqueness is checked immediately; `DEFERRABLE INITIALLY IMMEDIATE` checks at statement end, and deferred constraints at transaction end.[^pg16-setcon]
 
 
 ## See Also
@@ -856,7 +855,7 @@ Foreign keys without a covering index on the child side (delete-on-parent will b
 - [`23-btree-indexes.md`](./23-btree-indexes.md) — `NULLS NOT DISTINCT` mechanics at the index level
 - [`24-gin-gist-indexes.md`](./24-gin-gist-indexes.md) — EXCLUDE with GiST and `btree_gist`
 - [`26-index-maintenance.md`](./26-index-maintenance.md) — `CREATE INDEX CONCURRENTLY` + `ADD CONSTRAINT ... USING INDEX` pattern
-- [`35-partitioning.md`](./35-partitioning.md) — partition-key-must-be-in-PK rule; PG17 EXCLUDE on partitioned tables
+- [`35-partitioning.md`](./35-partitioning.md) — partition-key-must-be-in-PK rule; PG18 EXCLUDE on partitioned tables
 - [`36-inheritance.md`](./36-inheritance.md) — what propagates through inheritance (CHECK and NOT NULL) vs what doesn't
 - [`38-foreign-keys-deep.md`](./38-foreign-keys-deep.md) — referential actions, MATCH modes, FK-on-partitioned, FK-referencing-partitioned, circular FKs
 - [`39-triggers.md`](./39-triggers.md) — when triggers are appropriate alternatives to CHECK (cross-table rules)

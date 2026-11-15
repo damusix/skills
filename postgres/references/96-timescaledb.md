@@ -56,8 +56,8 @@ Five rules:
 | Need sharding across nodes | Citus, not TimescaleDB | TimescaleDB single-node only since v2.14 (multi-node deprecated) |
 | Need ON UPDATE triggers on compressed data | Don't compress that chunk yet | Compressed chunks have severe UPDATE restrictions |
 | Need cross-database scheduled jobs | pg_cron, not timescaledb jobs | TimescaleDB scheduler runs per-database |
-| Need real-time SUMs that include uncommitted-recent data | `timescaledb.materialized_only = false` | Re-enables real-time aggregation (default OFF since v2.13) |
-| Want to migrate from native partitioning to hypertable | `create_hypertable(..., migrate_data => true)` | One-shot conversion; expect ACCESS EXCLUSIVE lock |
+| Need recent committed data in continuous aggregate queries | `timescaledb.materialized_only = false` | Re-enables real-time aggregation (default OFF since v2.13); normal MVCC visibility still applies |
+| Want to migrate from native partitioning to hypertable | Build a replacement hypertable and plan a fenced migration | `create_hypertable` does not convert an already partitioned table |
 | Need ALTER on compressed chunk | Decompress → ALTER → recompress | Or use newer hypercore which relaxes some restrictions |
 | Need GIST/GIN indexes on hypertable | Yes — same as regular tables | Indexes propagate to chunks automatically |
 | Need RLS on chunks | Not in columnstore | "ROW LEVEL SECURITY is not supported on chunks in the columnstore" per hypercore docs |
@@ -245,6 +245,7 @@ SELECT
     time_bucket('1 hour', time) AS bucket,
     device_id,
     AVG(temperature) AS avg_temp,
+    COUNT(temperature) AS sample_count,
     MAX(temperature) AS max_temp,
     MIN(temperature) AS min_temp
 FROM conditions
@@ -323,7 +324,7 @@ WITH (timescaledb.continuous) AS
 SELECT
     time_bucket('1 day', bucket) AS bucket_day,
     device_id,
-    AVG(avg_temp) AS avg_temp
+    SUM(avg_temp * sample_count) / NULLIF(SUM(sample_count), 0) AS avg_temp
 FROM conditions_hourly
 GROUP BY bucket_day, device_id;
 ```
@@ -413,16 +414,18 @@ SELECT add_job(
 ```
 add_job(
     proc              REGPROC,
-    schedule_interval INTERVAL DEFAULT '24 hours',
-    config            JSONB,
-    initial_start     TIMESTAMPTZ,
+    schedule_interval INTERVAL,
+    config            JSONB DEFAULT NULL,
+    initial_start     TIMESTAMPTZ DEFAULT NULL,
     scheduled         BOOLEAN DEFAULT TRUE,
-    check_config      REGPROC,
+    check_config      REGPROC DEFAULT NULL,
     fixed_schedule    BOOLEAN DEFAULT TRUE,
-    timezone          TEXT,
-    job_name          TEXT
+    timezone          TEXT DEFAULT NULL,
+    job_name          TEXT DEFAULT NULL
 ) RETURNS INTEGER  -- job_id
 ```
+
+Source: <https://github.com/timescale/timescaledb/blob/2.23.0/sql/job_api.sql>.
 
 **Inspect jobs:**
 
@@ -545,7 +548,7 @@ SELECT
     AVG(value)  AS avg_value,
     MAX(value)  AS max_value,
     MIN(value)  AS min_value,
-    COUNT(*)    AS sample_count
+    COUNT(value) AS sample_count
 FROM metrics
 GROUP BY bucket, device_id, metric
 WITH NO DATA;
@@ -562,7 +565,7 @@ SELECT
     time_bucket('1 day', bucket) AS day,
     device_id,
     metric,
-    AVG(avg_value) AS avg_value,
+    SUM(avg_value * sample_count) / NULLIF(SUM(sample_count), 0) AS avg_value,
     MAX(max_value) AS max_value,
     MIN(min_value) AS min_value
 FROM metrics_hourly
@@ -574,8 +577,8 @@ SELECT add_continuous_aggregate_policy('metrics_daily',
     end_offset        => INTERVAL '1 day',
     schedule_interval => INTERVAL '1 hour');
 
--- retention: keep raw 30d, hourly 2y, daily forever
-SELECT add_retention_policy('metrics',        INTERVAL '30 days');
+-- Adjust the existing raw-data retention policy if needed; one policy per hypertable.
+-- Keep hourly 2y, daily forever.
 SELECT add_retention_policy('metrics_hourly', INTERVAL '2 years');
 -- (no retention on metrics_daily — keep forever)
 ```
@@ -587,7 +590,7 @@ ALTER MATERIALIZED VIEW metrics_hourly
 SET (timescaledb.materialized_only = false);
 
 -- now queries include both materialized + raw-recent
-SELECT bucket, AVG(avg_value)
+SELECT bucket, SUM(avg_value * sample_count) / NULLIF(SUM(sample_count), 0) AS avg_value
 FROM metrics_hourly
 WHERE bucket > now() - INTERVAL '6 hours'
 GROUP BY bucket
@@ -666,19 +669,18 @@ FROM timescaledb_information.job_stats
 WHERE application_name LIKE '%refresh_summaries%';
 ```
 
-**8 — Pause all maintenance during a release window**
+**8 — Pause maintenance during a release window**
+
+Use the public `alter_job` API on each selected job. Record which jobs were scheduled beforehand, pause only those jobs, and resume only those same jobs after the release:
 
 ```sql
--- pause every TimescaleDB job
-UPDATE _timescaledb_config.bgw_job SET scheduled = false;
-
+SELECT job_id FROM timescaledb_information.jobs WHERE scheduled;
+SELECT alter_job(1001, scheduled => false);  -- replace with each selected job ID
 -- ... run release ...
-
--- resume
-UPDATE _timescaledb_config.bgw_job SET scheduled = true;
+SELECT alter_job(1001, scheduled => true);
 ```
 
-Or per-job: `SELECT alter_job(<id>, scheduled => false);`
+See the tagged API definition: <https://github.com/timescale/timescaledb/blob/2.23.0/sql/job_api.sql>.
 
 **9 — Inspect cagg refresh state + stale buckets**
 
@@ -691,13 +693,11 @@ SELECT
     finalized
 FROM timescaledb_information.continuous_aggregates;
 
--- check what windows have been refreshed
-SELECT
-    view_name,
-    completed_threshold,
-    invalidation_threshold
-FROM _timescaledb_catalog.continuous_aggs_invalidation_threshold
-JOIN timescaledb_information.continuous_aggregates USING (mat_hypertable_id);
+-- Inspect refresh jobs and their status through the supported information views.
+SELECT j.job_id, j.schedule_interval, s.last_run_status, s.last_successful_finish
+FROM timescaledb_information.jobs AS j
+JOIN timescaledb_information.job_stats AS s USING (job_id)
+WHERE j.hypertable_name = 'metrics_hourly';
 ```
 
 **10 — Bound chunk count for memory pressure**
@@ -754,24 +754,20 @@ Long-running cagg refresh → split into smaller `buckets_per_batch`. Long reten
 -- starting point: events table with declarative partitioning by week
 -- cannot create_hypertable on declaratively-partitioned table — must rebuild
 
--- 1. create fresh hypertable
+-- Schedule a write outage. This example retains the original table;
+-- review and recreate dependencies, grants, triggers and foreign keys separately.
 CREATE TABLE events_new (LIKE events INCLUDING ALL);
 SELECT create_hypertable('events_new', by_range('ts', INTERVAL '1 day'));
 
--- 2. copy data
-INSERT INTO events_new SELECT * FROM events;
-
--- 3. swap names (brief ACCESS EXCLUSIVE)
 BEGIN;
+LOCK TABLE events IN ACCESS EXCLUSIVE MODE;
+INSERT INTO events_new SELECT * FROM events;
 ALTER TABLE events RENAME TO events_old;
 ALTER TABLE events_new RENAME TO events;
 COMMIT;
-
--- 4. drop old after verification
-DROP TABLE events_old;
 ```
 
-Use logical replication for zero-downtime variant (cross-ref [`74-logical-replication.md`](./74-logical-replication.md)).
+Logical replication can reduce downtime, but still requires a fenced cutover and handling of schema, sequences, and dependencies. See <https://www.postgresql.org/docs/16/logical-replication-restrictions.html>.
 
 ## Gotchas / Anti-patterns
 

@@ -179,7 +179,7 @@ The result column names of an `OUT`/`INOUT`/`TABLE` function are taken from the 
 Rules[^create-function]:
 
 - Every parameter after the first one with a default must also have a default.
-- Defaults are evaluated at **call time**, not at `CREATE FUNCTION` time, in the caller's snapshot — so `DEFAULT now()` returns the calling statement's timestamp, not the time the function was defined.
+- Defaults are evaluated at **call time**, not at `CREATE FUNCTION` time. `now()` returns the start of the current transaction, which can predate the call.
 - Named-argument syntax (`name => value`) lets you skip a default in the middle. `=` and `:=` are also accepted between names and values inside calls; prefer `=>`.
 
 > [!NOTE] PostgreSQL 14
@@ -202,7 +202,7 @@ Three shapes:
 
 `RETURNS TABLE (a int, b text)` is *exactly* equivalent to `OUT a int, OUT b text` plus `RETURNS SETOF record`. Pick `TABLE` when the function is "row-returning"; pick named `OUT` parameters when the function is "single-row with multiple outputs"; pick a `composite` type if the row shape already has a name in the catalog.
 
-A function that returns `void` has no result row; calling it in `SELECT` produces an empty string column.
+A scalar function returning `void` still produces a row when called in a SELECT list; its void value is displayed as an empty field.
 
 > [!NOTE] PostgreSQL 17
 > SQL/JSON brought `JSON_TABLE` to make JSON document expansion an alternative to `RETURNS TABLE`, but it is a built-in row-returning *expression*, not a function form. See [`02-syntax-dql.md`](./02-syntax-dql.md) and [`17-json-jsonb.md`](./17-json-jsonb.md).
@@ -216,7 +216,7 @@ The volatility marker tells the planner what optimizations are legal[^xfunc-vola
 | Marker | May modify the DB? | Same args → same result? | Index-expression usable? | Constant-folded at plan time? |
 |---|---|---|---|---|
 | `VOLATILE` (default) | yes | no (may differ per row) | **no** | no |
-| `STABLE` | no | same result *within one statement* | **yes** | no (snapshot is per-statement) |
+| `STABLE` | no | same result *within one statement* | **no** (but usable as an index scan comparison value) | no (snapshot is per-statement) |
 | `IMMUTABLE` | no | same result *forever* | **yes** | **yes** (with constant arguments) |
 
 Concrete examples from the manual[^xfunc-volatility]:
@@ -267,7 +267,7 @@ Default for all **user-defined** functions is `UNSAFE`[^parallel-safety]. The pl
 **Default to `UNSAFE`. Promote to `SAFE` only when you can prove every branch is safe.** A wrong `SAFE` label produces incorrect results or crashes; a wrong `UNSAFE` label only forces serial execution.
 
 > [!NOTE] PL/pgSQL exception blocks
-> A PL/pgSQL `EXCEPTION` clause forces the function to be **at most `RESTRICTED`** (in practice you usually mark such functions `UNSAFE`). The block creates a subtransaction so the executor can roll back the protected statements. Subtransactions are not safe inside parallel workers.
+> A PL/pgSQL `EXCEPTION` block creates a subtransaction. Functions that change transaction state must be marked `PARALLEL UNSAFE`.[^parallel-safety]
 
 
 ### SECURITY DEFINER vs SECURITY INVOKER
@@ -357,11 +357,11 @@ Mark a function `STRICT` when you mean it — it changes behavior, not just perf
 The setting applies on function entry and is restored on exit[^create-function]. Most common uses:
 
 - **`SET search_path = ...`** — mandatory for every `SECURITY DEFINER` and any function used in an index expression (PG17+ — see above).
-- **`SET statement_timeout = '5s'`** — protect long calls from runaway queries.
+- **`SET statement_timeout`** — set it on the client session before issuing the call; changing it inside a running statement does not arm a new timeout for that statement.
 - **`SET jit = off`** — disable JIT for short fast functions that pay the JIT planning cost without benefit ([`61-jit-compilation.md`](./61-jit-compilation.md)).
-- **`SET row_security = on/off`** — bypass or enforce RLS within the function (subject to ownership).
+- **`SET row_security = off`** — does not bypass RLS: it raises an error if a policy would filter rows. Only roles with applicable bypass rights bypass RLS.
 
-`SET LOCAL` inside the function body is scoped to that function call, not the outer transaction; the outer caller's value is unaffected.
+`SET LOCAL` is restored at function exit only when the function has an attached `SET` clause for the same parameter; otherwise it lasts until transaction end.[^create-function]
 
 
 ### Polymorphic types
@@ -429,7 +429,7 @@ A C function (only superusers can set it) that the planner can call for selectiv
 | `ALTER FUNCTION ... { IMMUTABLE / SECURITY DEFINER / ... }` | Update on `pg_proc` row; takes a brief catalog lock |
 | `DROP FUNCTION` | `ACCESS EXCLUSIVE` on the `pg_proc` row; rejected if any object depends on it unless `CASCADE` |
 
-`CREATE OR REPLACE FUNCTION` does **not** invalidate prepared plans automatically across all backends — backends with cached generic plans referring to the old function body may still execute the old body until their plan cache is invalidated. Tools that rotate function bodies in production should follow with `DISCARD PLANS;` or sequence around peak traffic. Cross-reference: [`13-cursors-and-prepares.md`](./13-cursors-and-prepares.md).
+PostgreSQL invalidates dependent cached plans when a referenced object changes definition, and re-analyzes them before reuse. Existing in-flight calls are a separate rollout concern; coordinate long-running work when changing a function contract. See [PREPARE](https://www.postgresql.org/docs/16/sql-prepare.html).
 
 
 ## SQL function inlining (the big optimization)
@@ -443,9 +443,9 @@ Conditions for an SQL function to be inlined into a SELECT[^xfunc-sql]:
 - Body is **a single `SELECT`** (no multi-statement body for the inlinable case; `BEGIN ATOMIC` with one statement counts).
 - Marked `STABLE` or `IMMUTABLE` (or `VOLATILE` is acceptable for the no-`SETOF` scalar form when the planner can prove there is no side effect — but you should not rely on this; mark it `STABLE` or `IMMUTABLE`).
 - Not `SECURITY DEFINER` and not `SET configuration_parameter`.
-- Not `STRICT` if any argument is non-null (the strictness check itself prevents inlining when arguments are nullable).
+- Strictness and argument expressions must satisfy the optimizer's safety checks; a strict function is not categorically excluded from inlining.
 
-The same applies to **set-returning** SQL functions used in `FROM`: if the body is a single `SELECT`, the function expands into the caller's plan. This is why `SELECT * FROM get_user(123)` can use an index that the function itself never knew about — the body becomes the caller's body.
+Eligible **set-returning** SQL functions used in `FROM` can likewise expand into the caller's plan, enabling predicate pushdown. A single SELECT alone does not guarantee inlining; check `EXPLAIN`.
 
 **Practical implication:** make scalar SQL helpers small, single-statement, `IMMUTABLE` or `STABLE`, and watch them disappear from `EXPLAIN`. The function call has zero runtime cost; the body's expression appears inline in the plan.
 
@@ -502,6 +502,7 @@ Then `WHERE tenant_id = current_tenant_id()` becomes index-friendly because `STA
 
 A user-facing API that records an audit event without granting `INSERT` on the audit table to clients:
 
+    BEGIN;
     CREATE OR REPLACE FUNCTION audit_event(kind text, payload jsonb)
         RETURNS bigint
         LANGUAGE plpgsql
@@ -521,8 +522,9 @@ A user-facing API that records an audit event without granting `INSERT` on the a
     -- lock down execution surface
     REVOKE EXECUTE ON FUNCTION audit_event(text, jsonb) FROM PUBLIC;
     GRANT  EXECUTE ON FUNCTION audit_event(text, jsonb) TO app_role;
+    COMMIT;
 
-The `SET search_path = audit, pg_temp` is what makes this safe — without it, an attacker with `CREATE` on a schema earlier in the caller's `search_path` could create a `now()` of their own and hijack the body's logic.
+The path is safe only if untrusted users cannot create objects in `audit`. Create the function and restrict execution in one transaction to avoid a window of default PUBLIC execution.[^create-function]
 
 
 ### Recipe 4 — TABLE function with named output columns
@@ -545,7 +547,7 @@ The `SET search_path = audit, pg_temp` is what makes this safe — without it, a
 
     SELECT * FROM top_n_per_user(3);
 
-Because the body is a single `SELECT`, this function inlines into the caller — `EXPLAIN` will show only the underlying scan and window plan, not a `Function Scan`.
+This single-SELECT body may inline into the caller. Check `EXPLAIN` for the underlying plan rather than assuming inlining.
 
 
 ### Recipe 5 — Polymorphic helper using `anycompatible`
@@ -554,7 +556,7 @@ Because the body is a single `SELECT`, this function inlines into the caller —
     CREATE OR REPLACE FUNCTION coalesce_first_two(a anycompatible, b anycompatible)
         RETURNS anycompatible
         LANGUAGE sql IMMUTABLE PARALLEL SAFE
-        RETURN COALESCE(a, b);
+        AS $$ SELECT COALESCE(a, b); $$;
 
     SELECT coalesce_first_two(NULL::int, 7);          -- 7
     SELECT coalesce_first_two(1::int, 2.5::numeric);  -- 1 (promoted to numeric)
@@ -605,7 +607,7 @@ Because the body is a single `SELECT`, this function inlines into the caller —
       FROM posts_in_range('2026-05-01', '2026-06-01') AS p
      ORDER BY id LIMIT 50;
 
-Because the body is one `SELECT`, this inlines — the outer query is planned against `posts` directly, with the time-range filter folded in and the `ORDER BY id LIMIT 50` available to combine with whatever index exists.
+This single-SELECT body may inline, allowing the outer query to be planned against `posts`; check `EXPLAIN` for the actual plan.
 
 
 ### Recipe 9 — Idempotent function migration boilerplate
@@ -649,24 +651,20 @@ New (`BEGIN ATOMIC` — parsed at definition time, dependency on `posts` recorde
 ### Recipe 11 — Pin search_path on every SECURITY DEFINER and index-used function
 
 
-    -- catch up the entire schema in one go
-    DO $$
-    DECLARE r record;
-    BEGIN
-        FOR r IN
-            SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid) AS args
-              FROM pg_proc p
-              JOIN pg_namespace n ON n.oid = p.pronamespace
-             WHERE p.prosecdef = true
-               AND p.proconfig IS NULL                       -- no SET clause at all
-               AND n.nspname NOT IN ('pg_catalog','information_schema')
-        LOOP
-            EXECUTE format('ALTER FUNCTION %I.%I(%s) SET search_path = %I, pg_temp',
-                           r.nspname, r.proname, r.args, r.nspname);
-        END LOOP;
-    END $$;
+Audit first; do not bulk-change paths. Each function may require different trusted schemas, and putting a writable schema on a definer's path permits object shadowing.
 
-Run this audit before every major upgrade — especially before PG17 — and again as an alert (e.g., daily) so any newly created `SECURITY DEFINER` function without a pinned `search_path` shows up.
+    SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid) AS args,
+           p.proconfig
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.prosecdef AND p.prokind IN ('f', 'p')
+      AND NOT EXISTS (
+          SELECT 1 FROM unnest(p.proconfig) AS setting
+          WHERE setting LIKE 'search\_path=%'
+      )
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema');
+
+Review each result and set a path containing only trusted schemas, with `pg_temp` last. Review existing paths as well; their presence does not prove they are safe.
 
 
 ## Gotchas / Anti-patterns
@@ -676,7 +674,7 @@ Run this audit before every major upgrade — especially before PG17 — and aga
 2. **Mislabeled volatility on a function used in an index** — silent corruption. The index gets built using one snapshot of the function's results; queries use stale or differing snapshots. Always verify with `pg_get_indexdef()` and rebuild the index after fixing the marker.
 3. **`PARALLEL SAFE` on a function that allocates from a sequence** — wrong answers. Sequences are not parallel-safe.
 4. **PL/pgSQL function with `EXCEPTION` block marked `PARALLEL SAFE`** — the exception block creates a subtransaction; subtransactions are not parallel-safe.
-5. **`CREATE OR REPLACE FUNCTION` while the old function is in active use** — old in-flight calls keep running the old body. Plan cache invalidation across backends is *eventual*, not synchronous. Sequence rollouts during low traffic; consider a `DISCARD PLANS;` broadcast.
+5. **Replacing a function while it is active** — in-flight calls may continue using the old body. Dependent cached plans are invalidated on definition changes; coordinate in-flight work when changing a contract.
 6. **Overloading by type that the planner unifies through implicit casts** — `foo(text)` and `foo(varchar)` are not distinguishable in practice; PG will pick "wrong" half the time. Name your functions distinctly instead.
 7. **`STRICT` on a function that has to count NULL inputs** — the function body never sees them; the body just produces `NULL`.
 8. **`IMMUTABLE` on a function that touches a configuration parameter** (`current_setting('TimeZone')`, `current_setting('app.x')`) — at most `STABLE`. The setting can change between calls.

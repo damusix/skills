@@ -39,7 +39,7 @@ Five rules:
 1. **HA is built EXTERNALLY.** Core PG = streaming replication primitives + `pg_promote()` + replication slots + `pg_rewind`. Cluster manager = leader election + fencing + automatic failover + reconfiguration. No in-core orchestration ever[^pg-ha-chapter].
 2. **Cluster manager needs four things:** leader election (who's primary), fencing (kill or isolate diverged primary), watchdog (detect dead leader fast), promotion (run `pg_promote()` + reconfigure replicas + redirect traffic).
 3. **Distributed Consensus Store (DCS) is the source of truth.** Patroni / pg_auto_failover / Stolon use etcd / Consul / ZooKeeper / Kubernetes API as the consensus layer. Without DCS quorum, no safe failover.
-4. **Split-brain is preventable; not avoidable by hope.** Fencing (STONITH, replication-slot drops, network isolation), quorum (odd-node DCS), witness nodes, and synchronous replication each defend against a specific split-brain shape. Combine multiple.
+4. **Prevent split-brain with verified fencing and coordinated promotion.** STONITH or comprehensive network isolation can prevent an old primary from accepting writes. Dropping a replication slot and synchronous replication do not fence a primary.[^pg-ha-chapter]
 5. **RTO and RPO are independent dials.** RTO = time-to-recovery. RPO = data-loss tolerance. Synchronous replication shrinks RPO at the cost of write latency + write availability when sync standby unreachable. Pick the worst-case both your tolerance and your budget allow.
 
 ## Decision Matrix
@@ -52,7 +52,7 @@ Five rules:
 | Citus distributed | Citus + pg_auto_failover OR CNPG | Patroni without integration | pg_auto_failover designed for multi-node coordinator + worker shards |
 | Multi-cluster federation | DR pattern, NOT HA | Single cluster-manager spanning regions | HA = single-region tight latency. DR = cross-region async + manual decision. See [`90-disaster-recovery.md`](./90-disaster-recovery.md). |
 | Zero-downtime maintenance | Patroni `switchover` or CNPG `cnpg promote` | Stop-then-failover | Controlled switchover loses 0 transactions (synchronous_commit=on). Failover loses uncommitted in-flight. |
-| RPO = 0 across two nodes | `synchronous_standby_names = 'FIRST 1 (s1)'` + Patroni `synchronous_mode = on` | Async replication for primary OLTP | Cluster manager will refuse to promote a standby that wasn't sync. See [`73-streaming-replication.md`](./73-streaming-replication.md) Rule 3. |
+| Minimize acknowledged-write loss | Patroni synchronous mode with `synchronous_mode_strict` and eligible sync standbys | Async replication for critical writes | Strict mode blocks ordinary synchronous commits without a standby; per-transaction overrides, manual failover and concurrent failures still require careful handling. |
 | Quorum sync across 3 AZs | `synchronous_standby_names = 'ANY 1 (s1, s2)'` | `FIRST` mode for AZ failure | `ANY` accepts any 1-of-2 ack; survives single-AZ loss without blocking writes. |
 | New cluster, no tooling selected | Patroni (bare metal/VM) OR CloudNativePG (K8s) | Stolon | Stolon appears unmaintained — last release Sept 2021, caps at PG15[^stolon]. Avoid for new deployments. |
 | Logical replication-based HA | Use streaming replication + sync standby instead | Logical replication for failover | Logical: DDL not replicated, sequences not synced, conflicts block apply worker. See [`74-logical-replication.md`](./74-logical-replication.md) Gotcha #1. |
@@ -89,10 +89,10 @@ Goal: ensure old primary cannot accept writes after a new primary is promoted. W
 Three common mechanisms:
 
 - **STONITH** (Shoot The Other Node In The Head): hardware power-cycle or hypervisor-level VM kill. Strongest guarantee.
-- **Replication slot drop**: cluster manager drops the old primary's incoming-from-new-primary slot. Old primary blocks on `synchronous_standby_names` if it's still configured for sync, OR diverges on writes that never replicate.
+- **Replication slot drop is not fencing**: it affects WAL retention, not the old primary's ability to accept or commit writes. Never rely on it to prevent split-brain.
 - **Resource fencing**: cluster manager flips network policy / firewall / load-balancer to block old primary from clients.
 
-Patroni's default: watchdog + DCS-leadership-loss demotion. Will issue `pg_ctl stop -m fast` on old primary when it discovers it lost leadership. STONITH optional via external hook[^patroni-watchdog].
+Patroni can demote a leader on DCS leadership loss and supports a watchdog. Watchdog protection depends on configuration and successful activation; use tested external fencing where required.[^patroni-watchdog]
 
 CNPG: relies on Kubernetes pod deletion + StatefulSet ordering. Pod-level fencing[^cnpg-failure-modes].
 
@@ -128,10 +128,9 @@ Defenses, ordered by strength:
 | Defense | What it does | Cost |
 |---|---|---|
 | STONITH | Power-cycle old primary | Requires hardware/hypervisor integration |
-| `synchronous_commit = remote_apply` + DCS quorum | Old primary can't commit if sync standby unreachable | Write latency increases; write availability drops when sync standby down |
-| Watchdog timer | Kernel-level reboot if cluster manager hangs | Requires `softdog` or hardware watchdog kernel module |
-| Replication slot fencing | Old primary blocks because slot is gone | Doesn't help reads or writes that finish before slot drop |
-| Network-level fencing | Firewall / load-balancer blocks old primary | Depends on external infrastructure |
+| Synchronous replication | Improves acknowledged-write durability under its configured conditions | Does not prevent an isolated primary from accepting writes |
+| Watchdog timer | Reboots the host if the configured watchdog expires | Requires working hardware or software watchdog and tested activation |
+| Network-level fencing | Isolates the old primary from every write path | Depends on complete, independently enforced isolation |
 | Witness node | Tie-breaker quorum for 2-node setups | Adds infrastructure |
 
 > [!WARNING] Two-node clusters without a witness or quorum are unsafe.
@@ -259,14 +258,14 @@ RTO = recovery time objective (downtime budget). RPO = recovery point objective 
 | Async streaming + manual failover | 15-60 min | seconds-to-minutes | Human-in-the-loop |
 | Async streaming + repmgr | 30-60s | 1-30s | Lost in-flight async-replicated tx |
 | Async streaming + Patroni | 10-30s | 1-10s | TTL-driven failover |
-| Sync (`FIRST 1`) + Patroni | 10-30s | 0 (if sync standby healthy) | Writes block when sync standby unreachable |
-| Quorum sync (`ANY 1 of N`) + Patroni | 10-30s | 0 (survives single-node loss without blocking writes) | Best RPO/availability balance |
+| Sync (`FIRST 1`) + Patroni | workload-dependent | depends on strict mode and failover | Patroni may disable synchronous replication without strict mode |
+| Quorum sync (`ANY 1 of N`) + Patroni | workload-dependent | depends on surviving eligible standby and promotion policy | Manual failover and per-transaction overrides can lose data |
 | K8s operator (CNPG) | 20-60s | depends on sync mode | Pod restart adds latency |
 | Cross-region async (DR, not HA) | 5-30 min | 1-5 min | Not for automatic failover; see [`90-disaster-recovery.md`](./90-disaster-recovery.md) |
 
 > [!NOTE] RPO = 0 is expensive.
 >
-> `synchronous_commit = on` + `synchronous_standby_names = 'FIRST 1 (s1)'` gives RPO = 0 — but EVERY write blocks waiting for s1 to ack. If s1 is unreachable, ALL writes block until either s1 returns OR cluster manager swaps in another standby. Plan for unhealthy-sync-standby behavior explicitly. The verbatim docs warning: writes block when sync standby is gone[^sync-standby].
+> Synchronous commits wait for the configured standby acknowledgments. Patroni can relax this requirement when strict mode is off; even strict mode has documented failure and manual-failover caveats. Test the actual durability and availability policy.[Patroni replication modes](https://patroni.readthedocs.io/en/latest/replication_modes.html)
 
 ## Per-Version HA Surface
 
@@ -333,7 +332,7 @@ restapi:
   listen: 10.0.0.11:8008
   connect_address: 10.0.0.11:8008
 
-etcd:
+etcd3:
   hosts: 10.0.1.10:2379,10.0.1.11:2379,10.0.1.12:2379
 
 bootstrap:
@@ -354,7 +353,6 @@ bootstrap:
         max_replication_slots: 10
         wal_log_hints: on            # required for pg_rewind
         synchronous_commit: on
-        synchronous_standby_names: 'ANY 1 (pg02, pg03)'
 
 postgresql:
   listen: 10.0.0.11:5432
@@ -377,7 +375,7 @@ watchdog:
 Critical settings:
 
 - `wal_log_hints: on` — required for `pg_rewind` to re-attach old primary[^pg-rewind].
-- `synchronous_mode: on` + `synchronous_standby_names = 'ANY 1 (...)'` — quorum sync for RPO = 0 surviving single-node loss.
+- `synchronous_mode: on` lets Patroni manage synchronous standby selection. Enable `synchronous_mode_strict` when writes must block without an eligible standby; see the failure caveats above.
 - `maximum_lag_on_failover: 1048576` (1 MB) — Patroni refuses to promote a standby that's more than 1 MB behind. Tune for your throughput.
 - `watchdog.mode: required` — kernel reboots node if Patroni hangs.
 
@@ -434,11 +432,11 @@ SELECT
     inet_server_addr() AS node_ip,
     pg_is_in_recovery() AS is_replica,
     pg_last_wal_replay_lsn() AS replay_lsn,
-    pg_current_wal_lsn() AS write_lsn,    -- non-null only on primary
+    CASE WHEN NOT pg_is_in_recovery() THEN pg_current_wal_lsn() END AS write_lsn,
     current_timestamp;
 ```
 
-Two nodes with `is_replica = false` simultaneously = split-brain. Immediate action: stop the older-WAL-position one. Plan for data divergence reconciliation manually.
+Two nodes with `is_replica = false` simultaneously indicate split-brain. Fence the unauthorized primary using the established HA procedure; do not choose a survivor solely by comparing LSNs across divergent timelines. Preserve both data directories for reconciliation before rewinding.
 
 ### Recipe 5: Controlled Switchover (Patroni)
 
@@ -447,7 +445,7 @@ Zero-loss promotion of standby to primary, demoting old primary cleanly:
 ```bash
 # From any Patroni node with REST API access
 $ patronictl -c /etc/patroni/patroni.yml switchover \
-    --master pg01 \
+    --leader pg01 \
     --candidate pg02 \
     --scheduled now
 
@@ -587,9 +585,8 @@ ALTER SYSTEM SET synchronized_standby_slots = 'pg02_slot, pg03_slot';
 SELECT pg_reload_conf();
 
 -- Create logical slot with failover=true
-SELECT pg_create_logical_replication_slot('my_sub_slot', 'pgoutput', false, true, true);
-                                          --                                 ^      ^
-                                          --                            failover  twophase
+SELECT pg_create_logical_replication_slot('my_sub_slot', 'pgoutput', false, false, true);
+-- arguments: temporary=false, twophase=false, failover=true
 
 -- On each physical standby
 ALTER SYSTEM SET sync_replication_slots = on;
@@ -597,7 +594,7 @@ ALTER SYSTEM SET hot_standby_feedback = on;
 SELECT pg_reload_conf();
 ```
 
-After failover, the new primary already has `my_sub_slot` synchronized via `pg_sync_replication_slots()`. Subscriber reconnects to the new primary with zero data loss. See [`75-replication-slots.md`](./75-replication-slots.md) Recipe 7 for full failover-slot setup.
+Before failover, verify the intended standby has a synchronized, usable slot. Fence the old primary and account for asynchronous commit loss and replay when reconnecting subscribers. See [`75-replication-slots.md`](./75-replication-slots.md) Recipe 7.
 
 ### Recipe 13: DR Drill Procedure
 
@@ -606,7 +603,7 @@ HA is one-region tight-coupling. DR is cross-region. Quarterly drill suggested:
 1. Take a base backup from prod primary to a DR-region object store.
 2. Restore to a fresh DR-region cluster.
 3. Verify schema + row counts match prod.
-4. Simulate region failure: stop prod primary, document RTO.
+4. Simulate primary failure in an isolated drill environment, document RTO.
 5. Promote DR cluster as the new primary.
 6. Repoint a canary application to DR.
 7. Verify reads + writes.

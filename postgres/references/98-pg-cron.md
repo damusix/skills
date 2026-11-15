@@ -641,7 +641,7 @@ UPDATE cron.job SET active = true;          -- resume all
 
 1. **`shared_preload_libraries` requires server restart.** `pg_cron` cannot be installed via `CREATE EXTENSION` alone — postmaster must already have loaded the library at startup. `ALTER SYSTEM SET shared_preload_libraries = 'pg_cron'` then `pg_reload_conf()` does **not** take effect — a full `pg_ctl restart` is required (cross-reference [`53-server-configuration.md`](./53-server-configuration.md) gotcha #4).
 
-2. **`cron.timezone` defaults to GMT, not UTC, not local.** A `'0 2 * * *'` job in default config runs at 02:00 GMT, which may be 21:00 / 19:00 / 03:00 / 11:00 in your local zone depending on DST. Always set `cron.timezone` explicitly in postgresql.conf.
+2. **`cron.timezone` defaults to GMT.** GMT and UTC have the same zero offset for these schedules; local wall-clock time varies with the chosen time zone and daylight saving rules. Set `cron.timezone` explicitly when local scheduling is required.
 
 3. **pg_cron may only be installed in ONE database per cluster.** `CREATE EXTENSION pg_cron` in two databases gives the second one a confused half-install. Use `cron.schedule_in_database()` for cross-database dispatch.
 
@@ -649,7 +649,7 @@ UPDATE cron.job SET active = true;          -- resume all
 
 5. **HA failover skips in-flight jobs.** A job mid-execution on the old primary is killed when the new primary promotes. The next scheduled fire starts fresh from the new primary's `cron.job` rows. No checkpoint / resume — design jobs to be idempotent.
 
-6. **`cron.use_background_workers` competes with autovacuum and parallel queries for `max_worker_processes`.** Default `max_worker_processes = 8` includes autovacuum (default 3) + parallel-query workers + logical-replication apply workers + extensions. Bump to 32-64 when enabling bgworker mode (cross-reference [`63-internals-architecture.md`](./63-internals-architecture.md)).
+6. **`cron.use_background_workers` shares `max_worker_processes` with parallel queries, logical replication workers and other extensions.** Autovacuum has its own worker limit; it is not counted in `max_worker_processes`. Size the budget for the actual workload. See <https://www.postgresql.org/docs/16/runtime-config-resource.html#GUC-MAX-WORKER-PROCESSES>.
 
 7. **`[interval] seconds` form cannot be combined with other cron fields.** `'30 seconds * * * *'` is invalid — must be just `'30 seconds'`. The two syntaxes are mutually exclusive.
 
@@ -671,15 +671,15 @@ UPDATE cron.job SET active = true;          -- resume all
 
 16. **`cron.alter_job()` cannot change `jobname`.** Drop + re-add to rename.
 
-17. **`pg_dump` does NOT dump `cron.job` rows by default.** They live in a contrib extension's tables — captured by `pg_dump --extension pg_cron` or `pg_dumpall --globals-only` does NOT include them. Restoring to a new cluster requires re-running `cron.schedule()` calls (cross-reference [`83-backup-pg-dump.md`](./83-backup-pg-dump.md)).
+17. **A normal logical dump does not preserve pg_cron job definitions automatically.** `cron.job` is an extension table and the v1.6.8 install script does not register it with `pg_extension_config_dump`. Export and recreate schedules explicitly, and test the restore with jobs disabled until safe. `pg_dumpall --globals-only` does not dump database table contents. See <https://github.com/citusdata/pg_cron/blob/v1.6.8/pg_cron.sql> and <https://www.postgresql.org/docs/16/extend-extensions.html#EXTEND-EXTENSIONS-CONFIG-TABLES>.
 
-18. **No `@every 5m` / `@hourly` / `@daily` shortcut macros** like Vixie cron. pg_cron only accepts the 5-field standard syntax + the `[N] seconds` form. `@daily` errors.
+18. **Cron shortcuts are supported.** The v1.6.8 parser recognizes `@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly` and aliases; `@every 5m` is not supported. See <https://github.com/citusdata/pg_cron/blob/v1.6.8/src/entry.c>.
 
-19. **Concurrent execution cap is per-job-class, not per-job.** `cron.max_running_jobs = 32` means total concurrent jobs across all definitions. Two `* * * * *` jobs that each take 90 seconds will queue, not parallelize, beyond the cap.
+19. **`cron.max_running_jobs` caps concurrent jobs across all definitions.** Separately, pg_cron runs only one instance of a particular job at a time; later scheduled runs wait. See <https://github.com/citusdata/pg_cron/blob/v1.6.8/README.md>.
 
 20. **No "run job once" mechanism.** pg_cron is recurring-only. Workarounds: schedule + `cron.alter_job(active := false)` from the job itself after first run, or use `cron.unschedule()` from the job body (which deletes the row before the function returns — works but feels unsafe).
 
-21. **Background-worker mode under heavy load can deadlock with logical-replication apply workers** (rare). Both compete for the same `max_worker_processes` budget. Bump generously and monitor `pg_stat_activity` for `backend_type = 'background worker'` saturation.
+21. **Background-worker mode shares the worker budget with logical replication and parallel workers.** Insufficient `max_worker_processes` can delay worker startup. Size and monitor the budget for your workload.
 
 22. **`cron.timezone` change requires a restart.** The v1.6.8 source registers it as `PGC_POSTMASTER`: `ALTER SYSTEM SET cron.timezone = 'America/New_York';` then restart the server. `pg_reload_conf()` does not apply it.[^10]
 

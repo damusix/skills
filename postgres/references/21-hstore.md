@@ -44,11 +44,11 @@ Five rules. Internalize these and you can read, write, and migrate `hstore` colu
 
 2. **Values can be SQL `NULL`; keys cannot.** *"A value (but not a key) can be an SQL `NULL`. For example: `key => NULL`. The `NULL` keyword is case-insensitive. Double-quote the `NULL` to treat it as the ordinary string `'NULL'`."*[^hstore-null] The `defined(h, k)` function distinguishes "key absent" from "key present with NULL value"; the `?` operator does not.
 
-3. **Duplicate keys are silently dropped, last-write-unspecified.** *"Each key in an `hstore` is unique. If you declare an `hstore` with duplicate keys, only one will be stored in the `hstore` and there is no guarantee as to which will be kept."*[^hstore-dup] Same behavior as `jsonb`; a silent bug source on input from multi-valued sources.
+3. **Duplicate keys are silently dropped, with no guaranteed winner.** `hstore` keeps one value without specifying which; `jsonb` instead keeps the last value.[^hstore-dup]
 
 4. **The default index is GIN, just like `jsonb`.** `gin_hstore_ops` supports `@>`, `?`, `?&`, `?|`. `gist_hstore_ops` is a lossy bitmap-signature opclass primarily useful when combining `hstore` with other GiST-indexable columns in a single index. B-tree and hash support only `=` on the whole value.
 
-5. **`hstore` is a trusted extension.** Since PG13, `hstore` can be installed by any non-superuser with `CREATE` privilege on the database (subject to `pg_available_extensions.trusted = true`). On managed providers this generally means `CREATE EXTENSION hstore` works without elevation.
+5. **`hstore` is a trusted extension.** A non-superuser with `CREATE` on the database can install it if the extension is available.[^hstore]
 
 > [!NOTE] PostgreSQL 14
 > Generalized subscripting was added to `hstore`. `h['key']` is now legal for both read (returns the value or NULL) and write (`UPDATE t SET h['k'] = 'v'` replaces or inserts). *"Allow subscripting of hstore values"*[^pg14-sub]. Subscripted fetch returns `NULL` if the key does not exist; subscripted update fails if the subscript itself is `NULL`.
@@ -87,7 +87,7 @@ No use cases left where `hstore` strictly beats `jsonb`. Rows 9–10 are ties. E
 
     CREATE EXTENSION IF NOT EXISTS hstore;
 
-The extension is marked **trusted** in `pg_available_extensions`, so a non-superuser holding `CREATE` on the database may install it.
+The extension is trusted, so a non-superuser holding `CREATE` on the database may install it if available.
 
 Inventory check:
 
@@ -107,7 +107,7 @@ Input: a comma-separated list of `key => value` pairs.
 
     SELECT 'foo => bar, baz => "with whitespace"'::hstore;
 
-    SELECT 'with comma => "x, y", with arrow => "x=>y"'::hstore;
+    SELECT '"with comma" => "x, y", "with arrow" => "x=>y"'::hstore;
 
 Quoting rules from the docs:
 
@@ -228,7 +228,7 @@ Pre-PG14 deployments must use the operator/function forms (`h -> 'k'`, `h || hst
 - **Strict** (`hstore_to_jsonb`): every value emerges as a JSON string. `'count=>42'::hstore` → `{"count": "42"}`.
 - **Loose** (`hstore_to_jsonb_loose`): if a value looks like a JSON number or boolean, it is emitted as that type. `'count=>42, ok=>true'::hstore` → `{"count": 42, "ok": true}`.
 
-The loose form is convenient for migrations *if* you trust the source data, but it is a heuristic — `'count=>007'::hstore` emits `{"count": 7}` (leading zero lost) so for *audit*-grade migrations prefer the strict form plus an application-side typed cast.
+The loose form is heuristic. For example, the documented leading-zero value `012345` remains a string. Values that look like valid numbers or booleans can nevertheless change type, so use strict conversion for fidelity.[^hstore]
 
 For the reverse direction, `jsonb_each_text(j)` produces a `(key, value)` row set you can pass to `hstore(...)`. This only works for flat, all-text `jsonb`; nested structure cannot be represented in `hstore`. See Recipe 8.
 
@@ -252,7 +252,7 @@ Index creation:
 The `gist_hstore_ops` opclass exposes a `siglen` parameter (default 16 bytes, range 1–2024). *"Longer signatures lead to a more precise search (scanning a smaller fraction of the index and fewer heap pages), at the cost of a larger index."*[^hstore-gist]
 
 > [!NOTE] PostgreSQL 18
-> Parallel GIN index build is available, which materially reduces `REINDEX` time on large `hstore` columns under high `maintenance_work_mem`. See [`24-gin-gist-indexes.md`](./24-gin-gist-indexes.md) for the full GIN tuning surface.
+> GIN index builds can use parallel workers. This can reduce build time when CPU, memory, I/O, and worker availability permit. See [`24-gin-gist-indexes.md`](./24-gin-gist-indexes.md) for the build and tuning constraints.
 
 Functional B-tree on a single hoisted key is the standard way to support `=` on a single key:
 
@@ -374,25 +374,24 @@ The subscript syntax does not have a "delete key" form — `UPDATE ... SET h['k'
 
 ### Recipe 7 — Migrate an `hstore` column to `jsonb`
 
-This is the canonical recipe and the reason most readers are in this file. Online, lock-light variant:
+For an online migration, synchronize writes before backfilling and keep synchronization in place until cutover. Audit dependent objects, grants, defaults and nullability before dropping the old column.
 
     -- Step 1: Add the new column (fast metadata-only change)
     ALTER TABLE event ADD COLUMN attrs_j jsonb;
 
-    -- Step 2: Backfill in batches; commit between batches to keep autovacuum healthy.
-    -- Loose form preserves numeric/boolean values where they look like numbers/booleans.
-    -- Strict form (hstore_to_jsonb) preserves the original-as-string fidelity.
+    -- Step 2: First deploy dual writes or a trigger that updates attrs_j whenever attrs changes.
+    -- Backfill in batches and commit between batches. Use strict conversion here.
     UPDATE event
-    SET attrs_j = hstore_to_jsonb_loose(attrs)
+    SET attrs_j = hstore_to_jsonb(attrs)
     WHERE attrs_j IS NULL
       AND id BETWEEN $1 AND $2;
 
     -- Step 3: Add the GIN index concurrently
     CREATE INDEX CONCURRENTLY event_attrs_j_gin ON event USING gin (attrs_j);
 
-    -- Step 4: Migrate readers to the new column; verify in shadow traffic.
-
-    -- Step 5: When confident, swap and drop. This briefly locks the table.
+    -- Step 4: Verify both columns agree, then migrate readers and writers.
+    -- Quiesce writes during the final verification and cutover.
+    -- Step 5: Swap only after all dependencies have been migrated.
     BEGIN;
     ALTER TABLE event DROP COLUMN attrs;
     ALTER TABLE event RENAME COLUMN attrs_j TO attrs;
@@ -411,7 +410,7 @@ Only works for flat, all-string-value `jsonb`. Any nested object or non-string v
             FROM jsonb_each_text(j) AS kv(k, v)) AS h
     FROM things;
 
-If `jsonb_each_text(j)` raises on a row, that row contains a nested object (`jsonb_each_text` only descends one level; nested objects come back as their JSON serialization, which is usually not what you want). The presence of any such row is your signal that the migration direction is wrong.
+`jsonb_each_text` serializes nested values as text rather than rejecting them. Validate `jsonb_typeof(j) = 'object'` and each value's type before conversion; decide explicitly whether JSON null is permitted.
 
 ### Recipe 9 — Override composite fields with `#=` / `populate_record`
 
@@ -501,7 +500,7 @@ This is the equivalent of the JSONB recipe `SELECT key FROM event, jsonb_object_
     WHERE attrs ? 'count'
       AND (attrs -> 'count') !~ '^-?\d+$';
 
-The negation of an integer regex catches NULL values from `->` automatically (NULL `!~ regex` is NULL, which is falsy in the WHERE clause). To explicitly include NULL-value rows: `OR (attrs ? 'count' AND attrs -> 'count' IS NULL)`.
+The negated regex excludes NULL values because the predicate evaluates to SQL NULL. Include them explicitly with `OR (attrs ? 'count' AND attrs -> 'count' IS NULL)`.
 
 ### Recipe 16 — Side-by-side: same query in `hstore` and `jsonb`
 
@@ -570,7 +569,7 @@ The `before_attrs - after_attrs` form (in `changed_only`) returns the pairs in *
 
 11. **The deprecated `@` and `~` containment operators were removed in PG14.** Old code using `attrs @ 'key=>val'::hstore` will fail to parse. Replace with `@>` and `<@`. Verbatim release-note: *"The more consistently named `<@` and `@>` have been recommended for many years."*[^pg14-remove-ops]
 
-12. **`hstore_to_jsonb_loose` is a heuristic, not an audit-grade conversion.** A value of `"007"` becomes JSON `7`; a value of `"1.0"` becomes JSON `1.0` but `"1.00"` becomes JSON `1` (trailing-zero normalization). For audit-grade migrations use strict `hstore_to_jsonb` and cast on the application side.
+12. **`hstore_to_jsonb_loose` is a heuristic, not an audit-grade conversion.** Values that look numeric or boolean may change JSON type. Use strict `hstore_to_jsonb` when the original strings must be preserved.
 
 13. **`hstore` is single-level. `each()` is the deepest iteration.** Treating an `hstore`-encoded JSON-string-as-value as nested data is a smell that says you should be on `jsonb`.
 

@@ -58,7 +58,7 @@ Five rules. Each names a misconception that frequently produces wrong tuning rec
 |--------------------------------------------------------|---------------------------------------------------------------------|-------------------------------|---------------------------------|----------------------------------------------------------------------------------------------------|
 | Make planner prefer index scans on SSD-class storage   | `random_page_cost`                                                  | `4.0`                         | `1.1` (NVMe) or `2.0` (cloud SSD) | Setting `0.0` (breaks cost model entirely)                                                         |
 | Tell planner about real OS cache size                  | `effective_cache_size`                                              | `4GB`                         | ~75% of system RAM              | Setting `< shared_buffers` (forces seqscan bias)                                                   |
-| Increase bitmap-heap-scan prefetch                     | `effective_io_concurrency`                                          | PG18+: `16`; PG≤17: `1`       | `200` SSD, `2` spinning         | Setting on Windows (no-op)                                                                         |
+| Increase bitmap-heap-scan prefetch | `effective_io_concurrency` | PG16: `1` on supported systems | Measure on the actual storage | Nonzero settings where prefetch support is unavailable |
 | Increase maintenance prefetch                          | `maintenance_io_concurrency`                                        | PG18+: `16`; PG≤17: `10`      | Match `effective_io_concurrency` | Cluster-wide >256 (kernel saturates)                                                              |
 | Debug "why isn't planner using my index"               | `SET LOCAL enable_seqscan = off`                                    | `on`                          | Never set cluster-wide          | Putting in `postgresql.conf`                                                                       |
 | Debug "why is this nested loop slow"                   | `SET LOCAL enable_nestloop = off`                                   | `on`                          | Never set cluster-wide          | Cluster-wide override                                                                              |
@@ -120,7 +120,7 @@ ALTER SYSTEM SET effective_io_concurrency = 2;
 SELECT pg_reload_conf();
 ```
 
-Both are `sighup`-context: change takes effect on reload, no restart needed. Cross-reference [`53-server-configuration.md`](./53-server-configuration.md) for GUC contexts.
+These settings can be changed without restart; inspect `pg_settings.context` for their permitted scopes. Cross-reference [`53-server-configuration.md`](./53-server-configuration.md).
 
 ### effective_cache_size
 
@@ -147,7 +147,7 @@ The default `4GB` is almost certainly too low for any production host. See [`54-
 | `maintenance_io_concurrency` | `10` | `16` |
 
 > [!WARNING] Not supported on Windows
-> Both default to `0` (off) on Windows builds because `posix_fadvise` is POSIX-only. Setting them is a no-op on Windows.[^docs-resource]
+> PG16 defaults to `0` on systems without support. If `posix_fadvise` is absent, a nonzero value is rejected rather than silently ignored.[^docs-resource]
 
 ### Parallel Cost Constants
 
@@ -216,7 +216,7 @@ Cross-reference [`35-partitioning.md`](./35-partitioning.md) for the conditions 
 The planner has two strategies for join-order selection:
 
 1. **Exhaustive dynamic-programming search** (default) — considers every join order. Optimal but cost scales as N! for N tables.
-2. **Genetic Query Optimization (GEQO)** — heuristic search. Kicks in when the number of `FROM` items exceeds `geqo_threshold`. Non-deterministic by default (`geqo_seed = 0`), so the same query may produce different plans on different runs.[^docs-genetic]
+2. **Genetic Query Optimization (GEQO)** — heuristic search. It applies at or above `geqo_threshold`. The default seed is the fixed value `0`; changing the seed explores different paths.[^docs-genetic]
 
 | GUC | Default | Effect |
 |---|---|---|
@@ -228,7 +228,7 @@ The planner has two strategies for join-order selection:
 | `geqo_pool_size` | `0` | `0` = auto-pick from `geqo_effort`. |
 | `geqo_generations` | `0` | `0` = auto-pick from `geqo_effort`. |
 | `geqo_selection_bias` | `2.00` | 1.5–2.0. Higher = less diversity. |
-| `geqo_seed` | `0` | Random seed; `0` means randomize. Set to a constant for reproducibility. |
+| `geqo_seed` | `0` | Initial random-generator seed; vary it to explore different plans. |
 
 #### Practical guidance
 
@@ -247,8 +247,8 @@ SET geqo_threshold = 24;
 
 The cost of exhaustive search at 16 tables is on the order of seconds (16! ≈ 2×10¹³ join orderings, pruned aggressively by dynamic programming). Above 20–24 tables the planner's exhaustive search becomes the dominant time cost — GEQO is the only practical option.
 
-> [!WARNING] `geqo_seed = 0` makes plans non-deterministic
-> Production queries above `geqo_threshold` may produce *different* plans on different runs unless you pin `geqo_seed` to a constant. Setting a constant seed reproduces the same plan run-to-run but doesn't make GEQO produce the *optimal* plan — only the same heuristic one.[^docs-genetic]
+> [!NOTE] GEQO reproducibility
+> A fixed seed, including the default zero, makes the random search reproducible for unchanged inputs and settings. Different statistics, settings, or query structure can still change the plan.[^docs-genetic]
 
 ### `plan_cache_mode`
 
@@ -353,7 +353,7 @@ ORDER BY name;
 ```
 
 > [!NOTE]
-> All four GUCs above are `sighup`-context — no restart needed. See [`53-server-configuration.md`](./53-server-configuration.md) for the seven contexts.
+> These settings do not require restart. Their `pg_settings.context` values determine whether session-level overrides are permitted.
 
 ### Recipe 2 — Diagnose: "Why isn't my index being used?"
 
@@ -414,7 +414,7 @@ SHOW geqo;
 SHOW geqo_threshold;
 
 -- 2. Pin the GEQO seed for reproducibility in your investigation:
-SET geqo_seed = 1.0;
+SET geqo_seed = 0.5;  -- deliberately compare a different fixed search seed
 
 -- 3. Compare plans deterministically:
 EXPLAIN (ANALYZE, BUFFERS) SELECT ...;
@@ -460,7 +460,7 @@ EXPLAIN (ANALYZE, BUFFERS) EXECUTE q ('common_value');
 The plan-flip diagnosis query (PG14+):
 
 ```sql
-SELECT query, calls, generic_plan_calls, custom_plan_calls
+SELECT name, statement, generic_plans, custom_plans
 FROM pg_prepared_statements;
 ```
 
@@ -622,7 +622,7 @@ Set `cursor_tuple_fraction = 0.001` per-session in a paginated-reader connection
 
 4. **`effective_cache_size = 4GB` is the silent default and is almost always wrong.** Set it explicitly. See [`54-memory-tuning.md`](./54-memory-tuning.md) Gotcha #9.
 
-5. **`effective_io_concurrency` is a no-op on Windows.** The setting exists but `posix_fadvise` isn't available.[^docs-resource]
+5. **On PG16 systems without `posix_fadvise`, nonzero `effective_io_concurrency` is rejected.** The default on unsupported systems is zero.[^docs-resource]
 
 6. **PG18 changed `effective_io_concurrency` and `maintenance_io_concurrency` defaults from 1/10 to 16.** Carry-forward configurations explicitly setting `1`/`10` are now suboptimal — remove the override.[^pg18-io-concurrency]
 
@@ -630,7 +630,7 @@ Set `cursor_tuple_fraction = 0.001` per-session in a paginated-reader connection
 
 8. **`recursive_worktable_factor` is PG15, NOT PG17.** Used to estimate the size of the working table in recursive CTEs. Setting it lower than 10.0 produces plans that assume the recursion terminates quickly; setting higher pessimizes.[^pg15-rwf]
 
-9. **`geqo_seed = 0` means non-deterministic plans for queries above `geqo_threshold`.** Two runs of the same query can produce different plans. Pin to a constant value for reproducibility during debugging.[^docs-genetic]
+9. **`geqo_seed = 0` is a fixed seed, not a request for random seeding.** Vary it deliberately to compare heuristic searches.[^docs-genetic]
 
 10. **`join_collapse_limit = 1` makes the planner respect textual join order exactly.** A debugging tool, not a production setting. The verbatim docs note: *"if you can find a better plan than the planner can, then set `join_collapse_limit = 1`."*[^docs-other]
 
@@ -648,13 +648,13 @@ Set `cursor_tuple_fraction = 0.001` per-session in a paginated-reader connection
 
 17. **The cost model has no concept of network/disk latency in milliseconds.** Cost units are pseudo-units. Tuning by "this query takes 2 seconds, so I'll set cost to 2" misunderstands the model.
 
-18. **GEQO above `geqo_threshold = 12` is not deterministic by default.** Operators investigating "why did this query produce a different plan today?" frequently miss that GEQO is the cause.
+18. **GEQO uses a fixed seed by default.** Different inputs or settings can change plans; vary `geqo_seed` deliberately when comparing searches.
 
 19. **Disabled-method plans show `Disabled: true` in PG18 EXPLAIN output.** Pre-PG18 there was no marker — operators forgot they had `enable_X = off` set somewhere. Cross-reference [`56-explain.md`](./56-explain.md) Recipe 14.
 
 20. **Bumping `jit_above_cost` to disable JIT is preferable to `jit = off`.** The former leaves the infrastructure available for queries that genuinely benefit; the latter disables everything.
 
-21. **`enable_partitionwise_aggregate` requires GROUP BY on the partition key.** Otherwise no partitionwise plan is eligible regardless of the GUC. Same for partitionwise join.
+21. **Partitionwise aggregation can use partial aggregation without grouping by the partition key.** It then finalizes the results above the partitions.[^docs-enable]
 
 22. **Carrying forward `random_page_cost = 4.0` (default) on NVMe storage costs 5–10× on index-heavy queries.** This is the single highest-leverage planner change for new clusters on modern storage. The default was set for spinning rust.
 

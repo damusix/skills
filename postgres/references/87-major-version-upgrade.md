@@ -52,9 +52,9 @@ Five rules.
 - **`pg_dump` + restore**: hours to days (proportional to data size). Simplest, most portable.
 - **`pg_upgrade --copy`**: minutes to ~1 hour for moderate clusters. Doubles disk during copy.
 - **`pg_upgrade --link`/`--clone`/`--swap`**: seconds to minutes regardless of size. Old cluster cannot be restarted (link/swap modes).
-- **Logical replication blue/green** (manual or via `pg_createsubscriber` PG17+): seconds of cutover (just connection-string flip). Hours-to-days of catch-up replication runtime.
+- **Logical replication blue/green**: cutover requires fencing writes, catching up, and synchronizing nonreplicated state; measure downtime in a rehearsal.
 
-**Rule 2 — Cross-version constraints differ per strategy.** `pg_dump` works across any pair where target ≥ source (newer `pg_dump` reads older server). `pg_upgrade` works any source ≥ PG9.2 (since PG15) → any newer or equal target. Logical replication works between adjacent or skipping majors as long as both sides support `wal_level = logical`. Same-architecture rule applies to `pg_upgrade` only — others are byte-format-independent.
+**Rule 2 — Cross-version constraints differ per strategy.** Use a compatible newer `pg_dump`; `pg_upgrade` upgrades supported older sources to its target major. Logical replication can span major versions but has feature and schema compatibility restrictions. See <https://www.postgresql.org/docs/16/logical-replication-restrictions.html>.
 
 **Rule 3 — Extensions are the single biggest upgrade hazard.** Every C extension needs a build for the new PG major (different ABI). Verify extension availability on target cluster BEFORE upgrade. `pg_upgrade --check` flags missing extensions. Logical replication doesn't replicate DDL — schema (including extensions) must be re-created on target manually before catching up data.
 
@@ -86,16 +86,16 @@ Five rules.
 
 | Scenario | Strategy | Downtime | Notes |
 |---|---|---|---|
-| Small cluster (<100 GB), simple schema, downtime OK | `pg_dump -Fd \| pg_restore -j N` | 30 min – 4 h | Most portable; cross-architecture safe; PG version flexible. |
+| Small cluster (<100 GB), simple schema, downtime OK | `pg_dump -Fd` to a directory, then `pg_restore -j N` | 30 min – 4 h | Most portable; cross-architecture safe; PG version flexible. |
 | Medium cluster (100 GB – 1 TB), 30 min downtime budget | `pg_upgrade --link` or `--clone` | 5–30 min | See [`86-pg-upgrade.md`](./86-pg-upgrade.md). |
 | Large cluster (TB+), <5 min downtime | logical replication blue/green | 1–5 min cutover | Hours/days of pre-cutover catchup. Manual conflict handling. |
-| Large cluster (TB+), <1 min downtime, source ≥ PG17 physical standby | `pg_createsubscriber` (PG17+) | <1 min cutover | Converts physical standby → logical subscriber. |
+| Large cluster with a PG17+ physical standby | `pg_createsubscriber`, then upgrade subscriber | measure in a rehearsal | Conversion avoids the initial copy, but is not itself a major upgrade. |
 | Cross-architecture (x86_64 → arm64) | `pg_dump`/restore OR logical replication | proportional to data | `pg_upgrade` doesn't work cross-arch. |
 | Cross-platform (Linux → Windows) | `pg_dump`/restore | proportional to data | Same constraint. |
 | Cross-encoding (e.g., LATIN1 → UTF8) | `pg_dump`/restore | proportional to data | `pg_upgrade` keeps source encoding (PG15 partial relaxation). |
-| Skip multiple majors (PG13 → PG18) | Any except logical replication | proportional | `pg_upgrade` supports any source PG9.2+ since PG15. Test extension compat. |
+| Skip multiple majors (PG13 → PG18) | `pg_upgrade`, dump/restore, or compatible logical replication | varies | Test extension and version compatibility. |
 | Source already EOL (PG13 today) | upgrade fast, any strategy | depends | Don't run unsupported versions in production. |
-| Tight maintenance-window calendar | `pg_upgrade --link` + `--swap` (PG18+) | seconds | Cross-reference [`86-pg-upgrade.md`](./86-pg-upgrade.md). |
+| Tight maintenance-window calendar | `pg_upgrade --link` or `--swap` (PG18+) | measure in a rehearsal | Transfer modes are alternatives, not combined flags. |
 | Application requires near-zero downtime | logical replication blue/green | seconds (cutover only) | Plan rollback path. |
 | Need to test new version while keeping old in production | logical replication, source unchanged | n/a | Old cluster keeps serving until cutover. |
 | Cluster has logical replication subscribers | source must be PG17+ for slot migration | n/a | Otherwise route to manual blue/green. Cross-reference [`75-replication-slots.md`](./75-replication-slots.md). |
@@ -122,6 +122,10 @@ The most portable, most flexible, and slowest method. Logical extraction + repla
 
 **Procedure (canonical):**
 
+After the source dump completes, prepare `globals-reviewed.sql` as a reviewed copy using the bootstrap-role reconciliation in [logical restore preparation](83-backup-pg-dump.md). Keep the original globals dump unchanged and restore the reviewed globals before the database archives.
+
+The baseline below recreates the source database name and metadata from the archive, so that database must not already exist on the target. For an encoding or locale change, create the target with the desired properties and restore without `--create`; explicitly apply the source database's ACLs, comments and applicable settings from reviewed metadata.
+
     # On source cluster (current version):
     pg_dumpall --globals-only > globals.sql
     pg_dump -Fd -j 4 -d production -f /backup/production-dump
@@ -130,11 +134,8 @@ The most portable, most flexible, and slowest method. Logical extraction + repla
     pg_restore --list /backup/production-dump | head -20
 
     # On target cluster (new version, fresh initdb):
-    psql -f globals.sql postgres
-    createdb -O appowner production
-    pg_restore -d production -j 8 --section=pre-data /backup/production-dump
-    pg_restore -d production -j 8 --section=data /backup/production-dump
-    pg_restore -d production -j 8 --section=post-data /backup/production-dump
+    psql -X -v ON_ERROR_STOP=1 -f globals-reviewed.sql postgres
+    pg_restore --exit-on-error --create -d postgres -j 8 /backup/production-dump
 
     # Run vacuumdb after restore:
     vacuumdb --all --analyze-in-stages --jobs=8
@@ -208,7 +209,7 @@ Run new-version cluster in parallel as logical replication subscriber. Cutover =
     # 4. Adjust source for logical replication:
     # postgresql.conf: wal_level = logical, max_replication_slots = N, max_wal_senders = N
     # pg_hba.conf: allow target to connect with REPLICATION privilege
-    pg_ctl reload
+    # Restart the source if wal_level or other start-only settings changed.
 
     # 5. CREATE PUBLICATION on source (FOR ALL TABLES is canonical):
     psql -h source -d production -c "CREATE PUBLICATION upgrade_pub FOR ALL TABLES;"
@@ -228,23 +229,20 @@ Run new-version cluster in parallel as logical replication subscriber. Cutover =
     "
     # srsubstate = 'r' (ready) means table is fully synced + streaming.
 
-    # 8. Cutover (during downtime window):
-    # 8a. Pause writes on source (application-side, e.g., set read-only mode).
-    # 8b. Wait for pg_subscription_rel all 'r' AND pg_stat_subscription replay caught up:
-    psql -h target -d production -c "
-      SELECT pid, application_name, state, pg_wal_lsn_diff(latest_end_lsn, pg_last_wal_replay_lsn())
-      FROM pg_stat_subscription;
-    "
-    # 8c. Sync sequences (logical replication doesn't replicate sequences):
-    psql -h source -t -c "
-      SELECT format('SELECT setval(%L, %s);', schemaname||'.'||sequencename, last_value)
-      FROM pg_sequences;
-    " | psql -h target -d production
-    # 8d. Flip application connection strings to target.
+    # 8. Cutover: fence all source writers and wait for in-flight transactions.
+    # Before cutover, create and publish a marker table as part of upgrade_pub.
+    # After fencing writers, commit a unique marker row on the source.
+    # Wait until that exact row is visible on the target and all tables are ready.
+    # Use one marker per subscription; repeat for each database.
+    # Copy each sequence's last_value AND is_called from the source to the target,
+    # with writers still fenced. Preserve quoted schema/name and sequence settings.
+    # A sequence-only pg_dump can emit setval statements; inspect and restore them.
+    # See https://www.postgresql.org/docs/16/logical-replication-restrictions.html.
+    # Flip application connection strings to target after verification.
 
-    # 9. Cleanup:
-    psql -h target -c "DROP SUBSCRIPTION upgrade_sub;"
-    psql -h source -c "DROP PUBLICATION upgrade_pub;"
+    # 9. Cleanup when rollback is no longer needed:
+    psql -h target -d production -c "DROP SUBSCRIPTION upgrade_sub;"
+    psql -h source -d production -c "DROP PUBLICATION upgrade_pub;"
 
 **Trade-offs:**
 
@@ -257,21 +255,20 @@ Cross-reference [`74-logical-replication.md`](./74-logical-replication.md) for r
 
 ### Strategy D — pg_createsubscriber (PG17+)
 
-PG17 introduced `pg_createsubscriber` — converts a running physical standby into a logical-replication subscriber in seconds. Verbatim PG17 release-note: *"Add application pg_createsubscriber to create a logical replica from a physical standby server (Euler Taveira)."*[^pg17-createsub]
+PG17 introduced `pg_createsubscriber`, which converts a stopped physical standby into a logical subscriber without an initial table copy. The source, standby and utility must be the same major version at conversion; upgrading the resulting subscriber is a separate operation. See <https://www.postgresql.org/docs/17/app-pgcreatesubscriber.html>.
 
 **When to use:**
 
 - Source cluster is PG17 or later AND has a physical standby.
-- Need fastest possible blue/green cutover (<1 min, no data-copy phase).
+- Want to avoid a fresh initial table copy; conversion and later upgrade still require planning and downtime.
 - Want to leverage existing standby instead of bootstrapping a new subscriber from scratch.
 
 **Procedure (canonical):**
 
     # Prerequisites:
-    # - Source cluster (primary) PG17+
-    # - Physical standby of that source already running, fully caught up
-    # - Standby has been running with: wal_level = logical, max_replication_slots > 0
-    # - Schema already in place (logical replication requires it)
+    # - Source and standby run the same PG17+ major version as the utility.
+    # - Source has wal_level=logical; check slot and worker prerequisites.
+    # - Stop the physical standby before running the conversion.
 
     # 1. Stop the standby (offline, since the conversion is offline):
     pg_ctl -D /var/lib/postgresql/17/standby stop
@@ -279,8 +276,8 @@ PG17 introduced `pg_createsubscriber` — converts a running physical standby in
     # 2. Run pg_createsubscriber:
     pg_createsubscriber \
         --pgdata=/var/lib/postgresql/17/standby \
-        --publisher-server="host=primary port=5432 dbname=production user=replicator" \
-        --subscriber-server="host=standby port=5432 dbname=production user=replicator" \
+        --publisher-server="host=primary port=5432 dbname=production user=postgres" \
+        --subscriber-port=50432 \
         --database=production \
         --verbose
 
@@ -290,7 +287,8 @@ PG17 introduced `pg_createsubscriber` — converts a running physical standby in
     # 4. Verify subscription is active:
     psql -h standby -c "SELECT * FROM pg_stat_subscription;"
 
-    # 5. Cutover: same as Strategy C step 8.
+    # 5. To upgrade, follow the logical-replication upgrade procedure for
+    #    the converted subscriber, then fence and cut over as in Strategy C.
 
 **PG18 enhancements:**
 
@@ -302,8 +300,8 @@ PG18 added significant `pg_createsubscriber` flags. Verbatim PG18 release-note: 
 
 **Trade-offs:**
 
-- Pros: fastest possible logical-replication subscriber bootstrap (no `COPY` phase — physical standby already has data). Source must be PG17+.
-- Cons: PG17+ source only. Cannot be undone (the physical standby becomes a subscriber, no rollback path back to physical standby without re-bootstrapping).
+- Pros: avoids the initial logical table copy by using an existing standby.
+- Cons: PG17+ and matching major versions at conversion; the standby must be rebuilt to return to physical replication.
 
 > [!WARNING] pg_createsubscriber cannot be undone
 > Once `pg_createsubscriber` runs, the standby is no longer a physical standby. If you abort the cutover, the converted subscriber must be either kept running as a logical subscriber (and a new physical standby provisioned) or destroyed and re-built. Always have a backup of the standby's `$PGDATA` before running `pg_createsubscriber`. Cross-reference [`75-replication-slots.md`](./75-replication-slots.md) for slot inspection.
@@ -333,11 +331,11 @@ PostgreSQL Global Development Group (PGDG) supports each major version for **5 y
 
 Three rules govern which tool can do what across versions.
 
-**Rule 1 — Newer client tools can target older servers.** `pg_dump` / `pg_restore` / `psql` / `pg_basebackup` from version N can connect to any server back to PG9.2 (since PG15). Always use the **newer** tool when crossing versions. Verbatim PG15 release-note: *"Limit support of pg_upgrade to old servers running PostgreSQL 9.2 or later (Tom Lane)."*[^pg15-floor]
+**Rule 1 — Check compatibility for each utility.** A newer `pg_dump` can dump supported older servers, but `pg_basebackup` and `pg_upgrade` have different compatibility rules. Use the target version's `pg_upgrade` binary. See <https://www.postgresql.org/docs/16/app-pgdump.html> and <https://www.postgresql.org/docs/16/app-pgbasebackup.html>.
 
 **Rule 2 — Older client tools talking to newer servers may break on new types/syntax.** Don't pin client tools to old PG version when server upgrades. Especially relevant for `pg_dump` — PG14 `pg_dump` doesn't know how to serialize PG18 features (virtual generated columns, temporal constraints, NOT ENFORCED, etc.).
 
-**Rule 3 — `pg_upgrade` accepts any source ≥ PG9.2 → any newer-or-equal target.** Cross-major jumps work in one shot. PG13 → PG18 is supported.
+**Rule 3 — `pg_upgrade` upgrades supported older source versions to the utility's target major.** For example, PG13 → PG18 is supported; it is not a same-major upgrade tool. See <https://www.postgresql.org/docs/18/pgupgrade.html>.
 
 ### Client Driver and ABI Compatibility
 
@@ -506,14 +504,15 @@ Full canonical procedure (Strategy C expanded):
         AND c.relreplident = 'd'  -- DEFAULT requires PK
         AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = c.oid AND contype = 'p');
     "
-    # Any rows = tables that will silently lose UPDATE/DELETE replication. Fix before continuing.
+    # UPDATE/DELETE on a published table without usable replica identity fail.
 
     # 5. On source: create replication user + grant + adjust pg_hba:
-    psql -h source -c "
+    psql -h source -d production -c "
       CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'strong_password';
       GRANT USAGE ON SCHEMA public TO replicator;
       GRANT SELECT ON ALL TABLES IN SCHEMA public TO replicator;
     "
+    # Grant access for every other published schema and table too.
     # Add to pg_hba.conf: hostssl production replicator <target-ip>/32 scram-sha-256
     pg_ctl reload
 
@@ -529,25 +528,18 @@ Full canonical procedure (Strategy C expanded):
     "
 
     # 8. Monitor catchup (loop until all tables 'r' state):
-    psql -h target -c "
+    psql -h target -d production -c "
       SELECT srsubstate, count(*) FROM pg_subscription_rel GROUP BY srsubstate;
     "
     # 'd' = data being copied, 'f' = finished initial copy, 's' = synced, 'r' = ready (streaming).
 
     # 9. Cutover (downtime starts):
-    # 9a. Application: enter read-only mode (e.g., set RDS read-replica or feature flag).
-    # 9b. Wait for source flush (no more writes coming):
-    psql -h source -c "SELECT pg_current_wal_lsn();"
-    # 9c. Wait for target replay to catch up to that LSN:
-    psql -h target -c "SELECT pid, latest_end_lsn, pg_current_wal_lsn() FROM pg_stat_subscription;"
-    # When latest_end_lsn matches the source LSN from 9b, you're caught up.
-
-    # 9d. Sync sequences (SQL emits SELECT setval()... statements):
-    psql -h source -d production -At -c "
-      SELECT format('SELECT setval(%L, %s, true);',
-                    schemaname||'.'||sequencename, last_value)
-      FROM pg_sequences;
-    " | psql -h target -d production
+    # Fence all source writers and wait for in-flight transactions to finish.
+    # Commit a unique row in a previously created and published marker table.
+    # Wait for that exact row on the target, once per subscription/database.
+    # With writers still fenced, copy each sequence's last_value and is_called
+    # from source to target, preserving quoted names and sequence settings.
+    # A sequence-only pg_dump emits setval statements for restoration.
 
     # 9e. Re-verify all tables in 'r' state (Step 8) one last time.
 
@@ -555,19 +547,16 @@ Full canonical procedure (Strategy C expanded):
     # Test critical paths immediately.
 
     # 10. Cleanup (after grace period to confirm new cluster is stable):
-    psql -h target -c "DROP SUBSCRIPTION upgrade_sub;"
-    psql -h source -c "DROP PUBLICATION upgrade_pub;"
+    psql -h target -d production -c "DROP SUBSCRIPTION upgrade_sub;"
+    psql -h source -d production -c "DROP PUBLICATION upgrade_pub;"
     # Decommission old cluster after backup retained.
 
 ### Recipe 4 — pg_createsubscriber for PG17+ Source
 
-Fastest blue/green cutover for source ≥ PG17 with existing physical standby:
+Convert a same-major physical standby without initial table copy; a later major upgrade is separate:
 
-    # Prerequisites verified on source primary:
-    # - PG17+
-    # - At least one physical standby running, fully caught up
-    # - Standby has wal_level = logical
-    # - Schema already in place on standby (it's a physical replica)
+    # Source, standby and pg_createsubscriber must have the same PG17+ major.
+    # Source needs wal_level=logical and sufficient replication capacity.
 
     # Verify standby state:
     psql -h standby -At -c "SELECT pg_is_in_recovery();"  # expect 't'
@@ -578,8 +567,8 @@ Fastest blue/green cutover for source ≥ PG17 with existing physical standby:
     # Run pg_createsubscriber:
     pg_createsubscriber \
         --pgdata=/var/lib/postgresql/17/standby \
-        --publisher-server="host=primary port=5432 dbname=production user=replicator" \
-        --subscriber-server="host=standby port=5432 dbname=production user=replicator" \
+        --publisher-server="host=primary port=5432 dbname=production user=postgres" \
+        --subscriber-port=50432 \
         --database=production \
         --verbose
 
@@ -590,22 +579,24 @@ Fastest blue/green cutover for source ≥ PG17 with existing physical standby:
     psql -h standby -c "SELECT subname, subenabled, subconninfo FROM pg_subscription;"
     psql -h standby -c "SELECT * FROM pg_stat_subscription;"
 
-    # Cutover: same as Recipe 3 step 9.
+    # Upgrade the subscriber separately, then use the fenced cutover in Recipe 3.
 
 PG18 enhancement — convert all databases at once with `--all`:
 
     # PG18+:
-    pg_createsubscriber --all --pgdata=... --publisher-server=... --subscriber-server=...
+    pg_createsubscriber --all --pgdata=/var/lib/postgresql/18/standby --publisher-server="host=primary user=postgres"
 
 ### Recipe 5 — Test Upgrade on Disposable Replica
 
 Standard pre-production drill:
 
-    # 1. Take a recent base backup of production:
+    # 1. Take a recent base backup to a disposable host, mapping all external
+    # tablespaces to isolated paths. Never point a drill at production tablespaces.
     pg_basebackup -h prod -D /tmp/test-restore -X stream -P
 
-    # 2. Spin up disposable host with new PG version installed.
-    # 3. Restore + start as new-version cluster:
+    # 2. On the isolated host, start and cleanly stop the restored cluster
+    # using its original PG major to finish backup recovery.
+    # 3. Initialize a compatible target, matching the source checksum setting:
     /usr/lib/postgresql/18/bin/initdb -D /tmp/upgrade-target
     /usr/lib/postgresql/18/bin/pg_upgrade --check \
         --old-datadir=/tmp/test-restore \
@@ -629,11 +620,12 @@ Standard pre-production drill:
 
 | Strategy | Rollback method |
 |---|---|
-| A (`pg_dump`+restore) | Old cluster untouched. Just point applications back. |
-| B (`pg_upgrade --copy`) | Old cluster intact in `--old-datadir`. Stop new, start old. |
-| B (`pg_upgrade --link`/`--clone`/`--swap`) | **No rollback** — old data files modified or moved. Restore from base backup. |
-| C (logical replication) | Old cluster still serving until cutover. After cutover: re-flip connection strings, drop subscription on old (if reverse-direction was set up). |
-| D (pg_createsubscriber) | **No rollback for the standby conversion** — physical standby gone. But source primary still serving. Re-flip applications back to source primary. |
+| A (`pg_dump`+restore) | Before new writes, point applications back. After new writes, reconcile them or accept their loss. |
+| B (`pg_upgrade --copy`) | Old cluster files remain intact. Stop the new cluster and reconcile any new writes before returning. |
+| B (`pg_upgrade --link`/`--swap`) | Restore the old cluster from backup if its files were modified or moved. |
+| B (`pg_upgrade --clone`) | Old files remain intact. Stop the new cluster before restarting the old; reconcile writes made after cutover. |
+| C (logical replication) | Before cutover the source remains authoritative. After target writes begin, returning to source requires reverse synchronization or accepting loss of those writes. |
+| D (pg_createsubscriber) | Conversion destroys the standby's physical-replica role. After application writes on the new side, reconcile them before returning to the source. |
 
 **Always have a base backup before any upgrade strategy.** Cross-reference [`84-backup-physical-pitr.md`](./84-backup-physical-pitr.md).
 
@@ -655,13 +647,14 @@ Pre-flight: which extensions installed on source, are they available on target?
 
 ### Recipe 8 — Force ANALYZE on Target Cluster
 
-Required after `pg_upgrade` (pre-PG18) and `pg_dump`+restore. Recommended for safety after PG18+ pg_upgrade for extended statistics:
+Follow the post-upgrade instructions emitted by `pg_upgrade`, including on PG18+ where statistics transfer is incomplete.
 
     # Pre-PG18 target:
     vacuumdb --all --analyze-in-stages --jobs=$(nproc)
 
     # PG18+ target (faster: only fill missing stats):
     vacuumdb --all --analyze-in-stages --missing-stats-only --jobs=$(nproc)
+    vacuumdb --all --analyze-only --jobs=$(nproc)
 
 The `--analyze-in-stages` mode runs three passes with progressively higher statistics targets (1, 10, default), making the cluster usable for queries quickly while improving stats over the next minutes.
 
@@ -683,7 +676,7 @@ The `--analyze-in-stages` mode runs three passes with progressively higher stati
 12. **PG18 PK/FK collation rule breaks upgrades** when columns use mixed-determinism collations[^pg18-collation]. Audit before upgrade.
 13. **`pg_upgrade` doesn't migrate `pg_hba.conf`, `postgresql.conf`, `archive_command`, scheduled jobs.** Re-create on target.
 14. **Logical replication source cluster must have `wal_level = logical`** — requires restart. Plan a separate maintenance window for this if not already set.
-15. **REPLICA IDENTITY DEFAULT + table without primary key = silent UPDATE/DELETE drop** for logical replication. Audit before upgrade. Cross-reference [`74-logical-replication.md`](./74-logical-replication.md) gotcha #4.
+15. **A published table without replica identity cannot accept published UPDATE/DELETE operations.** Configure a primary key or suitable replica identity before enabling such writes. See <https://www.postgresql.org/docs/16/logical-replication-publication.html>.
 16. **Newer `pg_dump` connecting to older server is OK; older `pg_dump` connecting to newer server is NOT.** Always use the newer client tool when crossing versions.
 17. **Cross-encoding migration must use `pg_dump`+restore.** `pg_upgrade` mostly preserves source encoding (PG16+ relaxed locale but encoding still strict).
 18. **Cross-collation migration is risky.** PG18 PK/FK collation rule applies. ICU + libc differences can change sort order silently.

@@ -90,7 +90,7 @@ Three smell signals that a parallel-query configuration is broken:
 | `PARALLEL RESTRICTED` | *"cannot be performed in a parallel worker, but ... can be performed in the leader while parallel query is in use"* | Function reads session state (`current_user`, temp tables, session-scope GUCs) but does not modify global state; the planner allows parallel plans for sibling subtrees but runs this function only in the leader |
 | `PARALLEL SAFE` | *"does not conflict with the use of parallel query"* | Function is deterministic, reads only committed data, makes no writes, calls no parallel-unsafe / parallel-restricted functions, and has no side effects |
 
-A function inherits the strictest parallel-safety of any function it calls. A `PARALLEL SAFE` SQL function that calls a `PARALLEL UNSAFE` function is itself effectively unsafe — the planner walks the call tree.
+The planner relies on declared markings; it cannot generally infer a user-defined function's safety by inspecting its body. The author must account for all called operations and mark the function conservatively.[^psafety]
 
 The verbatim rule on marking accuracy: *"If a function is marked as `PARALLEL SAFE` when it is in reality `PARALLEL UNSAFE`, you may see crashes or wrong results when trying to use the function in a parallel query."*[^psafety]
 
@@ -106,7 +106,7 @@ Worker counts are bounded by a chain of caps where the smallest wins. All four G
 | `max_worker_processes` | 8 | postmaster | Cluster-wide pool of all background worker slots — parallel workers, logical-replication workers, pg_cron, pg_stat_statements collectors, etc. compete for these slots[^maxworkers] |
 | `max_parallel_workers` | 8 | sighup | Of the `max_worker_processes` pool, how many may be used for parallel query at any moment[^maxworkers] |
 | `max_parallel_workers_per_gather` | 2 | user | The cap a single `Gather` or `Gather Merge` node may request[^maxworkers] |
-| `max_parallel_maintenance_workers` | 2 | user | Per-`CREATE INDEX` / `VACUUM` / `CLUSTER` cap, independent of `max_parallel_workers_per_gather` |
+| `max_parallel_maintenance_workers` | 2 | user | Cap for supported parallel maintenance operations, independent of `max_parallel_workers_per_gather` |
 
 Three operational rules:
 
@@ -150,7 +150,6 @@ The verbatim rules from `when-can-parallel-query-be-used.html`:[^when-parallel]
 2. *"A query which is suspended during its execution. In any situation in which the system thinks that partial or incremental execution might occur, no parallel plan is generated. For example, a cursor created using `DECLARE CURSOR` will never use a parallel plan."* PL/pgSQL `FOR row IN SELECT ... LOOP` is rewritten as a cursor and is therefore never parallel.
 3. *"A query that runs inside of another query that is already parallel."* No nested parallelism — a parallel-safe function called from a parallel worker runs serially in that worker.
 4. The query uses functions marked `PARALLEL RESTRICTED` (forces leader-only) or `PARALLEL UNSAFE` (disables parallel entirely).
-5. The transaction isolation level is `SERIALIZABLE` AND the query reads any table whose snapshot semantics require predicate-locking coordination. (Note: PG10+ relaxed this; verify by EXPLAIN if relevant.) Cross-reference [`42-isolation-levels.md`](./42-isolation-levels.md).
 6. The query is `SELECT ... FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` / `FOR KEY SHARE` at the top level — row-locking is incompatible with parallel plans.
 7. The query references a function with side effects on the session (`set_config`, advisory locks acquired during execution, temp-table creation).
 
@@ -162,7 +161,7 @@ The verbatim rules from `when-can-parallel-query-be-used.html`:[^when-parallel]
 
 The verbatim plan-node rules from `parallel-plans.html`:[^plans]
 
-**Gather and Gather Merge.** Every parallel plan has exactly one `Gather` or `Gather Merge` node at the "parallel boundary." Below the node, the plan runs in parallel workers + optionally the leader; above the node, the plan runs serially in the leader.
+**Gather and Gather Merge.** Each node marks a parallel boundary: its child is a partial plan executed by workers and possibly the leader, while its parent consumes the results. A plan can contain multiple such nodes.
 
 - `Gather` returns rows in arbitrary order (whichever worker finishes a tuple first ships it)
 - `Gather Merge` returns rows in sorted order, requiring each worker to produce its rows pre-sorted
@@ -353,21 +352,20 @@ The fix is usually to raise `max_worker_processes` (full restart required) AND `
 
 ### Recipe 7: Parallel CREATE INDEX
 
-`CREATE INDEX` (B-tree, BRIN PG17+, GIN PG18+) parallelizes if `max_parallel_maintenance_workers > 0` and the index size justifies it. `CREATE INDEX CONCURRENTLY` does **not** parallelize at all.
+`CREATE INDEX` (B-tree, BRIN PG17+, GIN PG18+) can use parallel workers if the budget and cost model permit. `CREATE INDEX CONCURRENTLY` also supports parallel builds; only its first table scan runs in parallel.[^create-index-parallel]
 
 ```sql
 -- One-off maintenance window: raise parallel budget temporarily
 SET maintenance_work_mem = '4GB';
 SET max_parallel_maintenance_workers = 8;
 
+-- PG18+ example; use a B-tree index on PG16.
 CREATE INDEX big_table_payload_gin ON big_table USING gin (payload jsonb_path_ops);
 
--- Verify it actually parallelized:
--- Look for "Workers Launched" in EXPLAIN (ANALYZE) of the index build, or check the log
--- with log_min_duration_statement and a verbose maintenance_work_mem allocation message.
+-- Inspect pg_stat_progress_create_index and parallel workers from another session.
 ```
 
-Cross-reference [`26-index-maintenance.md`](./26-index-maintenance.md) for the CONCURRENTLY-cannot-parallelize gotcha, [`23-btree-indexes.md`](./23-btree-indexes.md) for parallel B-tree builds (PG11+), [`24-gin-gist-indexes.md`](./24-gin-gist-indexes.md) for parallel GIN (PG18+), and [`25-brin-hash-spgist-bloom-indexes.md`](./25-brin-hash-spgist-bloom-indexes.md) for parallel BRIN (PG17+).
+Cross-reference [`26-index-maintenance.md`](./26-index-maintenance.md), [`23-btree-indexes.md`](./23-btree-indexes.md), [`24-gin-gist-indexes.md`](./24-gin-gist-indexes.md), and [`25-brin-hash-spgist-bloom-indexes.md`](./25-brin-hash-spgist-bloom-indexes.md).
 
 
 ### Recipe 8: Parallel VACUUM (PG13+)
@@ -376,7 +374,7 @@ Cross-reference [`26-index-maintenance.md`](./26-index-maintenance.md) for the C
 -- VACUUM PARALLEL n only applies to index cleanup phase, not the heap scan
 VACUUM (PARALLEL 4, VERBOSE) big_table;
 
--- Cluster-wide default for autovacuum and manual VACUUM
+-- Cluster-wide default for supported manual parallel maintenance operations
 ALTER SYSTEM SET max_parallel_maintenance_workers = 4;
 SELECT pg_reload_conf();
 ```
@@ -401,7 +399,7 @@ EXPLAIN (ANALYZE, BUFFERS) SELECT COUNT(*) FROM big_events;
 
 Reading rules:
 - `Partial Aggregate` and `Parallel Seq Scan` show `loops=5` (4 workers + 1 leader, since `parallel_leader_participation = on`)
-- Each loop processed `rows / loops` rows on average
+- `actual rows` is already the average per loop; multiply by `loops` for the approximate total
 - `Gather` returns 5 rows (one partial aggregate per loop) which `Finalize Aggregate` combines into 1
 - Cross-reference [`56-explain.md`](./56-explain.md) for the full reading guide
 
@@ -469,7 +467,7 @@ GROUP BY l.pid, l.query;
 ### Recipe 13: Test PG18 parallel GIN build
 
 ```sql
--- PG18+ enables parallel GIN builds at CREATE INDEX time (NOT for CIC, see gotcha #15)
+-- PG18+ enables parallel GIN builds; concurrent builds parallelize only the first scan.
 SET maintenance_work_mem = '4GB';
 SET max_parallel_maintenance_workers = 8;
 
@@ -530,15 +528,15 @@ Continues iteration-66 cross-reference to `70-fdw.md`. The PG14 release-note ver
 
 10. **Cursors and PL/pgSQL row loops disable parallel.** `DECLARE CURSOR ... SELECT ...`, `FETCH FROM cursor`, and PL/pgSQL `FOR row IN SELECT ... LOOP` all become serial. PL/pgSQL `RETURN QUERY` was the exception added in PG14[^pg14-rq] — use it instead of a `FOR ... LOOP` to retain parallelism.
 
-11. **`SELECT ... FOR UPDATE` (and siblings) disables parallel.** Row-level locking is incompatible with parallel plans. If you need both, split: read the rows in a parallel SELECT, then issue locking statements separately.
+11. **`SELECT ... FOR UPDATE` (and siblings) disables parallel.** A separate parallel read followed by locking is not equivalent: rows can change between statements. Preserve the required transactional locking semantics.
 
-12. **The leader is one of the workers.** With `parallel_leader_participation = on` (default), `Workers Launched: 4` means the work is done by 5 processes (4 + leader), not 4. EXPLAIN's `loops=5` reflects this. Turning leader participation off is rare — usually correct only when measuring worker behavior in isolation.
+12. **The leader can participate in addition to the workers.** With `parallel_leader_participation = on` (default), `Workers Launched: 4` can mean up to five participating processes; actual participation depends on the plan and execution.
 
 13. **`Workers Launched < Workers Planned` is a sign of worker starvation, not planner bug.** The planner computed how many it wanted; the runtime granted what was available. Diagnose with `pg_stat_activity backend_type='parallel worker'` to find who's holding the slots.
 
 14. **Parallel workers each get their own `work_mem`.** A query with 4 workers + leader running a hash join with `work_mem = 256MB` may consume `5 × 256MB = 1.25 GB` of memory. Cross-reference [`54-memory-tuning.md`](./54-memory-tuning.md) gotcha #4.
 
-15. **`CREATE INDEX CONCURRENTLY` does NOT parallelize.** Only the non-CONCURRENTLY form can use parallel workers, and only for B-tree (PG11+), BRIN (PG17+), GIN (PG18+). Cross-reference [`26-index-maintenance.md`](./26-index-maintenance.md) gotcha #21.
+15. **`CREATE INDEX CONCURRENTLY` can parallelize its first scan.** Index-method support and worker availability still apply.[^create-index-parallel]
 
 16. **`pg_stat_activity` shows `leader_pid IS NULL` for the leader and `leader_pid = leader.pid` for workers.** A common mistake is filtering `WHERE leader_pid IS NOT NULL` to find "parallel queries" and missing the leader. To include both: `WHERE backend_type = 'client backend' AND pid IN (SELECT leader_pid FROM pg_stat_activity WHERE leader_pid IS NOT NULL) OR backend_type = 'parallel worker'`.
 
@@ -558,7 +556,7 @@ Continues iteration-66 cross-reference to `70-fdw.md`. The PG14 release-note ver
 
 24. **`async_capable=on` is a `postgres_fdw` server-level opt-in, not automatic.** PG14 added the *capability* for foreign-table scans to run asynchronously, but every foreign server must explicitly set `ALTER SERVER ... OPTIONS (ADD async_capable 'true')` to use it.[^pg14-async] Without the option, `UNION ALL` queries across remote tables run serially even on PG14+.
 
-25. **`parallel_leader_participation = off` does NOT free workers for other queries.** It only changes whether the leader does work — the leader process still exists, still runs the plan tree above the Gather node, and still consumes one of the `max_parallel_workers_per_gather` slots conceptually. Turning it off rarely improves throughput; usually it slows the query because one fewer process is processing rows.
+25. **`parallel_leader_participation = off` changes whether the leader executes the partial plan.** The leader is not one of the requested worker slots; it still consumes the results above Gather. Measure the effect before changing this setting.
 
 
 ## See Also
@@ -568,7 +566,7 @@ Continues iteration-66 cross-reference to `70-fdw.md`. The PG14 release-note ver
 - [`23-btree-indexes.md`](./23-btree-indexes.md) — parallel B-tree builds (PG11+)
 - [`24-gin-gist-indexes.md`](./24-gin-gist-indexes.md) — parallel GIN builds (PG18+)
 - [`25-brin-hash-spgist-bloom-indexes.md`](./25-brin-hash-spgist-bloom-indexes.md) — parallel BRIN builds (PG17+)
-- [`26-index-maintenance.md`](./26-index-maintenance.md) — `CREATE INDEX CONCURRENTLY` does NOT parallelize
+- [`26-index-maintenance.md`](./26-index-maintenance.md) — concurrent index builds
 - [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md) — `VACUUM (PARALLEL n)` and `max_parallel_maintenance_workers`
 - [`35-partitioning.md`](./35-partitioning.md) — Parallel Append + partition-wise plans
 - [`41-transactions.md`](./41-transactions.md) — `SET LOCAL` for scoped parallel disable
@@ -618,3 +616,5 @@ Continues iteration-66 cross-reference to `70-fdw.md`. The PG14 release-note ver
 [^pg18-stats]: PG18 release notes verbatim: "Add pg_stat_statements columns to report parallel activity (Guillaume Lelarge)." Columns `parallel_workers_to_launch` and `parallel_workers_launched` were added to both `pg_stat_database` and `pg_stat_statements`. https://www.postgresql.org/docs/release/18.0/
 
 [^pg11-pappend]: PG11 release notes verbatim: "Allow Append operator to execute its children in parallel (Amit Khandekar)." This enables Parallel Append, used heavily by partitioned-table queries. https://www.postgresql.org/docs/release/11.0/
+
+[^create-index-parallel]: PostgreSQL 16, CREATE INDEX: concurrent builds support parallelism for the first table scan. https://www.postgresql.org/docs/16/sql-createindex.html

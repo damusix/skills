@@ -39,7 +39,7 @@ This file documents the **mechanism**. For the specific parameters operators tun
 
 1. **Every tunable is a GUC and every GUC has a context.** The seven contexts (`internal`, `postmaster`, `sighup`, `superuser-backend`, `backend`, `superuser`, `user`) decide *who* can change the value and *when* the change takes effect. `pg_settings.context` is the source of truth — if you don't know whether a parameter requires restart, look up its row.
 2. **`ALTER SYSTEM` writes `postgresql.auto.conf`, not `postgresql.conf`.** They are separate files. Both are read at startup and at reload; `postgresql.auto.conf` overrides `postgresql.conf`.[^alter-system] If your `postgresql.conf` edit isn't taking effect, check whether `postgresql.auto.conf` is overriding it.
-3. **Precedence is layered from most-narrow to most-broad.** `SET LOCAL` (transaction) → `SET` (session) → `ALTER ROLE ... IN DATABASE` (per-role-per-DB) → `ALTER ROLE SET` (per-role) → `ALTER DATABASE SET` (per-DB) → `postgresql.auto.conf` (ALTER SYSTEM) → `postgresql.conf` → command-line / compiled-in default (`boot_val`).
+3. **Precedence is layered.** Session and transaction settings override role/database defaults, which override server command-line flags. Command-line flags override `postgresql.auto.conf`, which overrides `postgresql.conf`; compiled-in defaults are the fallback.[^config-setting]
 4. **SIGHUP reload only re-reads files; it does not re-bind existing sessions for non-`sighup`-context parameters.** A `superuser-backend` or `backend` parameter changed in `postgresql.conf` requires a *new session* to be observed; a `postmaster` parameter requires a *restart*; only `sighup` / `superuser` / `user` parameters apply live to existing sessions on reload. The `pg_settings.pending_restart` column flags settings waiting on a restart.
 5. **`pg_settings` is truth; `pg_file_settings` is the file contents pre-apply.** Use `pg_settings` to find the *effective* value, its source, and whether it's pending a restart. Use `pg_file_settings` to validate a config edit *before* reloading (it shows every `name = value` entry across all `postgresql.conf` / `postgresql.auto.conf` / included files with a `applied` flag).
 
@@ -63,8 +63,8 @@ This file documents the **mechanism**. For the specific parameters operators tun
 
 Three smell signals:
 
-- **"I set X in `postgresql.conf` but `SHOW X` still returns the old value":** check `pg_settings.source` — it will read `database`, `user`, or `session` if a narrower override is winning. Or it will be `pending_restart` if the parameter requires a server restart.
-- **"My `ALTER SYSTEM SET` was rejected with `permission denied`":** the role lacks `pg_write_server_files` or hasn't been GRANT-ed `ALTER SYSTEM ON PARAMETER x` (PG15+). On PG17+, also check `allow_alter_system`.
+- **"I set X in `postgresql.conf` but `SHOW X` still returns the old value":** check `pg_settings.source` for a higher-precedence override, and check the separate `pending_restart` column if the parameter requires a server restart.
+- **"My `ALTER SYSTEM SET` was rejected with `permission denied`":** it requires superuser status or `ALTER SYSTEM` privilege on that parameter (PG15+). On PG17+, also check `allow_alter_system`.
 - **"My `SET LOCAL` issued a `WARNING` and did nothing":** `SET LOCAL` outside a transaction is silently a no-op with a warning. Either wrap in `BEGIN; ... COMMIT;` or use `SET` for session scope.
 
 ### Parameter contexts (the seven contexts)
@@ -99,9 +99,9 @@ A GUC's effective value is determined by walking from most-narrow to most-broad 
 3. **`ALTER ROLE u IN DATABASE d SET y = v`** — applies when `u` connects to `d`
 4. **`ALTER ROLE u SET y = v`** — applies when `u` connects to any database
 5. **`ALTER DATABASE d SET y = v`** — applies when any role connects to `d`
-6. **`postgresql.auto.conf`** (set via `ALTER SYSTEM`) — applied at startup and SIGHUP
-7. **`postgresql.conf`** — applied at startup and SIGHUP
-8. **Command-line flags** to `postgres` / `pg_ctl start` — applied at startup
+6. **Command-line flags** to `postgres` / `pg_ctl start` — override configuration files
+7. **`postgresql.auto.conf`** (set via `ALTER SYSTEM`) — applied at startup and SIGHUP
+8. **`postgresql.conf`** — applied at startup and SIGHUP
 9. **Compiled-in default** (`pg_settings.boot_val`) — fallback
 
 Verbatim docs precedence rule: *"Settings set for all databases are overridden by database-specific settings attached to a role. Settings for specific databases or specific roles override settings for all roles. ... database-role-specific settings override role-specific ones, which in turn override database-specific ones."*[^alter-role]
@@ -164,7 +164,7 @@ Behavior:
 
 > [!WARNING] `ALTER SYSTEM SET` for `postmaster`-context parameters is staged, not live
 >
-> `ALTER SYSTEM SET shared_buffers = '8GB'` succeeds silently. The new value is written to `postgresql.auto.conf` and stored in `pg_settings.reset_val`, but `pg_settings.setting` (the current value) is unchanged until the next restart. `pg_settings.pending_restart` becomes `true`. Audit pending changes with Recipe 4.
+> `ALTER SYSTEM SET shared_buffers = '8GB'` writes to `postgresql.auto.conf`; after reload, `pg_settings.setting` remains unchanged until restart and `pending_restart` becomes `true`. Inspect the desired file value with `pg_file_settings`. Audit pending changes with Recipe 4.
 
 ### SET, SET LOCAL, RESET
 
@@ -236,7 +236,7 @@ ORDER BY database NULLS FIRST, role NULLS FIRST;
 |---|---|---|
 | `pg_reload_conf()` / `pg_ctl reload` / SIGHUP to postmaster | `sighup`, `superuser`, `user` context | Yes for `sighup`; for `superuser`/`user` only if no session-local `SET` won |
 | `pg_reload_conf()` for `superuser-backend` / `backend` | Reload is accepted but applies to *new* sessions only | No |
-| `pg_reload_conf()` for `postmaster` context | Setting is staged in `pg_settings.reset_val`; `pending_restart` becomes `true` | No |
+| `pg_reload_conf()` for `postmaster` context | File setting awaits restart; `pending_restart` becomes `true` | No |
 | `pg_ctl restart` | All contexts | All sessions reconnect — the restart kills them |
 
 `pg_reload_conf()` verbatim: *"Causes all processes of the PostgreSQL server to reload their configuration files. (This is initiated by sending a SIGHUP signal to the postmaster process, which in turn sends SIGHUP to each of its children.) You can use the `pg_file_settings`, `pg_hba_file_rules` and `pg_ident_file_mappings` views to check the configuration files for possible errors, before reloading."*[^functions-admin]
@@ -313,7 +313,7 @@ SELECT current_setting('myapp.tenant_id');                -- raises if missing
 SELECT current_setting('myapp.tenant_id', true);          -- returns NULL if missing (PG9.6+)
 ```
 
-The two-argument form of `current_setting()` is the safe form for use inside RLS policies and triggers — cross-reference [`47-row-level-security.md`](./47-row-level-security.md) Recipe 1.
+The two-argument form avoids an error for a missing setting, but custom GUCs are user-settable and are not authenticated identities. Do not use them as an RLS trust boundary when users can issue arbitrary SQL; see [`47-row-level-security.md`](./47-row-level-security.md).
 
 > [!NOTE] PostgreSQL 17: `ALTER SYSTEM` accepts unrecognized custom variables
 >
@@ -347,7 +347,7 @@ huge_pages = try                    # restart required
 
 # --- WAL ---
 wal_level = replica                 # or 'logical' if you need logical replication
-wal_compression = lz4               # PG14+
+wal_compression = lz4               # requires PostgreSQL built with LZ4
 max_wal_size = 16GB
 min_wal_size = 2GB
 checkpoint_timeout = 15min
@@ -363,7 +363,7 @@ hot_standby_feedback = off          # set 'on' only if standby runs reporting qu
 # --- Autovacuum ---
 autovacuum_vacuum_cost_delay = 2ms
 autovacuum_naptime = 30s
-log_autovacuum_min_duration = 10min # default since PG15
+log_autovacuum_min_duration = 10min # workload-specific threshold
 
 # --- Connections ---
 max_connections = 200               # restart required; use a pooler for >200
@@ -377,7 +377,7 @@ log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log'
 log_rotation_age = 1d
 log_rotation_size = 100MB
 log_line_prefix = '%m [%p] %q%u@%d/%a '
-log_connections = on                # default since PG15 emits for trust too
+log_connections = on                # explicitly enable connection logging
 log_disconnections = on
 log_lock_waits = on
 log_temp_files = 0                  # log every temp file (rarely innocuous)
@@ -473,14 +473,14 @@ Settings apply at session start, in precedence order: per-role-in-database wins 
 
 ```sql
 -- Audit pending changes
-SELECT name, setting AS current_value, reset_val AS pending_value,
+SELECT name, setting AS current_value, reset_val,
        sourcefile, sourceline
 FROM pg_settings
 WHERE pending_restart
 ORDER BY name;
 ```
 
-If this returns rows, a restart is required for those settings to apply. The current `setting` is what's active *now*; `reset_val` reflects what the loaded config files say. Settings drift between them is exactly what `pending_restart` flags.
+If this returns rows, a restart is required for those settings to apply. The current `setting` is what's active now; inspect `pg_file_settings` for the configured value awaiting restart.
 
 ### Recipe 5: `include_dir` for management-tool-generated rules
 
@@ -523,11 +523,12 @@ FROM pg_settings WHERE name = 'work_mem';
 SELECT
     coalesce(d.datname, '<all>') AS db,
     coalesce(r.rolname, '<all>') AS role,
-    unnest(s.setconfig) AS setting
+    cfg.setting
 FROM pg_db_role_setting s
+CROSS JOIN LATERAL unnest(s.setconfig) AS cfg(setting)
 LEFT JOIN pg_database d ON d.oid = s.setdatabase
 LEFT JOIN pg_roles    r ON r.oid = s.setrole
-WHERE unnest(s.setconfig) LIKE 'work_mem=%';
+WHERE cfg.setting LIKE 'work_mem=%';
 
 -- Step 3: check the raw file
 SELECT sourcefile, sourceline, name, setting, applied, error
@@ -628,12 +629,12 @@ Same shape as the iteration-41 `SET LOCAL` pattern for `lock_timeout` during `AL
 BEGIN;
     SET LOCAL maintenance_work_mem = '4GB';
     SET LOCAL max_parallel_maintenance_workers = 4;
-    REINDEX INDEX CONCURRENTLY large_idx;
+    REINDEX INDEX large_idx;
 COMMIT;
 -- maintenance_work_mem and max_parallel_maintenance_workers revert to session values here
 ```
 
-`SET LOCAL` is the right tool when you want a parameter change scoped to one operation and reverted automatically — no risk of leaking the elevated `maintenance_work_mem` to the next statement in the session. The `WARNING` it would otherwise issue (gotcha #3) is suppressed because we're inside an explicit `BEGIN ... COMMIT`.
+`SET LOCAL` reverts at transaction end. `REINDEX CONCURRENTLY` cannot run in a transaction block; use session-level `SET` and `RESET` around that command instead.
 
 ### Recipe 12: Categorize every parameter that diverges from default by category
 
@@ -685,7 +686,7 @@ SELECT name, setting, source, sourcefile FROM pg_settings WHERE name = 'work_mem
 7. **`ALTER ROLE` / `ALTER DATABASE SET` doesn't apply to existing sessions.** The new value takes effect only on the next *connection*. Existing sessions must reconnect or use explicit `SET` to pick it up.
 8. **Per-role GUCs do NOT propagate across pgBouncer transaction-mode pools.** The role's `ALTER ROLE SET` baseline runs once per backend, not per logical session. Cross-reference [`46-roles-privileges.md`](./46-roles-privileges.md) gotcha #6.
 9. **`pg_settings.source = 'session'` hides the underlying file source.** A session `SET` masks where the *default* came from. Issue `RESET y` (or close the session) to expose the underlying value.
-10. **`pending_restart = true` is silent.** No error, no warning, no log entry on reload — just a flag in `pg_settings`. Monitor for it actively or you'll wonder why your `ALTER SYSTEM SET shared_buffers` didn't take effect.
+10. **`pending_restart = true` indicates a restart is needed.** PostgreSQL also logs that a parameter cannot be changed without restarting; inspect `pg_file_settings` for the configured value.
 11. **`RESET y` doesn't restore the compiled-in default.** It restores `reset_val`, which respects `ALTER ROLE SET` / `ALTER DATABASE SET` defaults that were in effect at session start. To force the compiled-in default (`boot_val`), use `ALTER ROLE u RESET y` to remove the per-role override.
 12. **`RESET ALL` doesn't reset every parameter.** Certain settings (`transaction_isolation`, transaction-state parameters) are excluded. PG16 tightened the rules to forbid individually resetting these in inappropriate situations.[^pg16-reset]
 13. **`data_directory` cannot be `ALTER SYSTEM`-set.** Some parameters are reserved for server-start configuration only and cannot live in `postgresql.auto.conf`.[^alter-system]

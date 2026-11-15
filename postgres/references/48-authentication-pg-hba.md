@@ -132,7 +132,7 @@ Either a comma-separated list of database names, a special keyword, or a regex.
 | `/regex` | PG16+: regex match. Names beginning with `/` must be double-quoted[^pg16-regex] |
 
 > [!NOTE] PostgreSQL 16
-> Regular-expression matching on database names was introduced in PG16[^pg16-regex]. Prefix the pattern with `/`. Patterns are anchored at end (use `^` and `$` to anchor explicitly if needed). To reference a literal database name starting with `/`, wrap it in double quotes.
+> Regular-expression matching on database names was introduced in PG16[^pg16-regex]. Prefix the pattern with `/` and use `^` and `$` when full-name matching is required. To reference a literal database name starting with `/`, wrap it in double quotes.
 
 ### The `user` column
 
@@ -182,7 +182,7 @@ Eleven methods. Pick from this catalog:
 | `password` | Cleartext password over the wire. Only safe over TLS. |
 | `peer` | OS-user-to-DB-user mapping for **local Unix-socket** connections only. Uses `getpeereid()`/SO_PEERCRED. |
 | `ident` | OS-user-to-DB-user mapping via the **ident protocol** (RFC 1413) on **TCP/IP** only. Rarely used today.[^ident] |
-| `cert` | Client TLS certificate; CN (or DN with `clientname=DN`) mapped to DB user.[^cert] |
+| `cert` | Client TLS certificate; CN (or DN with `clientname=DN`) mapped to the database user.[^cert-redundant][^pg14-clientname] |
 | `gss` | Kerberos / GSSAPI. Unix-side. Service principal `postgres/hostname@REALM`. |
 | `sspi` | Windows native GSS-compatible. *"On Windows, use SSPI instead of Kerberos."* |
 | `ldap` | LDAP. Two modes: simple-bind or search+bind.[^ldap] |
@@ -338,11 +338,11 @@ op  /^(.*)@example\.com$  \1
 
 This maps `alice@example.com` → `alice`. Useful for Kerberos principals (`alice@EXAMPLE.COM`) and email-formatted LDAP usernames.
 
-**Two-way map:** A single `mapname` can have many lines — the first matching system-username wins for that map.
+**Multiple mappings:** A single `mapname` can have many lines. Authentication succeeds if any applicable mapping permits the requested database user.
 
 ### Inspection views
 
-Three SQL-visible views document the current state:
+These SQL-visible views expose configuration and parsed files, not necessarily the rules currently loaded:
 
 | View | Since | What it shows |
 |---|---|---|
@@ -417,7 +417,7 @@ ssl_key_file  = '/etc/postgresql/16/server.key'
 password_encryption = 'scram-sha-256'
 ```
 
-**The final two `reject` lines are mandatory.** Without them, any client matching no `host*` rule reaches an *implicit* reject — but you don't see it in the logs as a rule match. The explicit reject gives a log entry on every blocked attempt. Cross-reference [`82-monitoring.md`](./82-monitoring.md) for alerting on `connection rejected` log volume spikes.
+The explicit `reject` lines document the intended catch-all and identify the rejection as an HBA reject. If no record matches, PostgreSQL rejects the connection implicitly as well.
 
 ### Recipe 2: Force TLS for every remote connection
 
@@ -511,8 +511,8 @@ sudo -u postgres psql -c 'SELECT line_number, error FROM pg_hba_file_rules WHERE
 # 3. If empty result, reload:
 sudo -u postgres psql -c 'SELECT pg_reload_conf();'
 
-# 4. Verify the new rules are active:
-sudo -u postgres psql -c "SELECT line_number, type, database, user_name, address, auth_method FROM pg_hba_file_rules WHERE auth_method NOT IN ('reject');"
+# 4. Check the server log for reload errors, then test representative
+#    allowed and denied connections. This view shows the file, not loaded rules.
 ```
 
 ### Recipe 6: Validate `pg_ident.conf` reload
@@ -600,14 +600,14 @@ hostssl  app_db  all  10.0.0.0/8  ldap  ldapserver=ldap.corp.example.com ldapsch
 
 The PG server binds as `cn=pg_lookup,...`, searches for `uid=<requested-user>` under `dc=corp,dc=example,dc=com`, finds the user's DN, then re-binds as that DN with the user-supplied password.
 
-**The role must still exist in PostgreSQL** — LDAP authenticates but doesn't grant. Pre-create roles or use a `BEFORE LOGIN` event trigger (PG17+, see [`40-event-triggers.md`](./40-event-triggers.md)) to create-on-first-login if your organization permits.
+**The role must already exist in PostgreSQL** — LDAP authenticates but doesn't create or grant roles. Provision roles separately before login.
 
 Encryption: `ldapscheme=ldaps` (port 636 by default) protects the *server-to-LDAP* hop. The *client-to-PG* hop is protected by `hostssl`. Verbatim warning: *"using ldapscheme or ldaptls only encrypts the traffic between the PostgreSQL server and the LDAP server."*[^ldap-tls]
 
 ### Recipe 10: Kerberos / Active Directory (`gss`)
 
 ```
-hostssl  all  all  10.0.0.0/8  gss  include_realm=0  krb_realm=CORP.EXAMPLE.COM  map=krbmap
+hostssl  all  all  10.0.0.0/8  gss  include_realm=1  krb_realm=CORP.EXAMPLE.COM  map=krbmap
 ```
 
 In `postgresql.conf`:
@@ -622,7 +622,7 @@ In `pg_ident.conf`:
 krbmap  /^([^@]+)@CORP\.EXAMPLE\.COM$  \1
 ```
 
-This maps `alice@CORP.EXAMPLE.COM` → DB role `alice`. The `include_realm=0` option strips the realm before mapping; some shops prefer to keep `include_realm=1` and write a regex that handles it.
+This maps `alice@CORP.EXAMPLE.COM` → DB role `alice`. Keep `include_realm=1` so the mapping receives the realm matched by this expression.
 
 > [!NOTE] PostgreSQL 16
 > Kerberos credential delegation: the server-side `gss_accept_delegation` GUC + the libpq `gssdelegation` parameter let an authenticated GSS connection forward its credentials to outbound FDW or replication connections[^pg16-gssdelegation]. This eliminates a class of "service account per FDW link" tickets.
@@ -700,15 +700,15 @@ If the server requests `md5`, `password`, `trust`, or any non-SCRAM method, libp
 
 3. **`replication` pseudo-database only matches *physical* replication.** Logical replication subscriptions connect to a named database and authenticate via the regular rules[^replication-pseudo]. Forgetting this produces "no pg_hba.conf entry for logical replication."
 
-4. **`hostnossl` and `hostssl` are *not* a partition** — `host` matches both. To force TLS, use `hostssl` for the allow rules AND a final `host` reject.
+4. **`hostssl` and `hostnossl` partition TCP connections by SSL use**, while `host` matches both. To force TLS, ensure every matching allow rule requires `hostssl` and no broader earlier allow rule admits non-TLS clients.
 
-5. **Hostname matching requires forward AND reverse DNS resolution.** Verbatim: *"The host name is first looked up to verify that the connecting IP address matches one of the host name's resolved addresses, and then a reverse lookup is performed on the host name to verify that the resolved name matches the client's IP address."* DNS misconfiguration silently denies access. Prefer CIDR.
+5. **Hostname matching requires reverse AND forward DNS resolution.** PostgreSQL first reverse-resolves the client IP, compares the name to the HBA entry, and then forward-resolves the name to confirm the client IP. DNS misconfiguration can prevent matching. Prefer CIDR where appropriate. See the [PG16 HBA documentation](https://www.postgresql.org/docs/16/auth-pg-hba-conf.html).
 
 6. **PG14 removed `clientcert=1` / `clientcert=no-verify`.** Only `verify-ca` and `verify-full` are accepted on PG14+[^pg14-clientcert]. Configurations carried forward from PG13 will fail at startup with a clear error message; check release notes before upgrades.
 
 7. **`pg_hba.conf` is read-on-SIGHUP but existing connections keep their authorization.** Use `pg_terminate_backend()` after a tightening reload if you need to force re-auth of currently-connected clients. Cross-reference [`46-roles-privileges.md`](./46-roles-privileges.md) Recipe 3 (soft revocation).
 
-8. **A syntactically invalid `pg_hba.conf` causes the reload to fail silently** (the postmaster keeps the old config). Always validate via `pg_hba_file_rules` before relying on a reload (Recipe 5). On startup, a broken file prevents startup entirely.
+8. **A syntactically invalid `pg_hba.conf` causes the reload to fail**, retaining the previous configuration and logging errors. Check `pg_hba_file_rules` and the server log before relying on a reload. On startup, a broken file prevents startup.
 
 9. **`peer` does not work over TCP/IP.** Verbatim: *"When peer is specified in pg_hba.conf, the operating system user name of the connecting client is obtained from the kernel, which is only available for local Unix-domain sockets."* Use `ident` (TCP/IP) with the same conceptual model, but ident requires an external ident server (RFC 1413) and is largely deprecated.
 
@@ -724,7 +724,7 @@ If the server requests `md5`, `password`, `trust`, or any non-SCRAM method, libp
 
 15. **An `include` of a missing file causes the *entire* `pg_hba.conf` reload to fail.** Use `include_if_exists` when the included file may legitimately be absent.
 
-16. **Regex on `database`/`user` columns is anchored at *both* ends implicitly.** Verbatim: *"Regular expression patterns are prefixed with a slash."*[^pg16-regex] If you write `/^app_` you'll match `app_users` but also `app_` followed by anything; the pattern is `\Aapp_.*\z` semantically. Explicitly use `^` and `$` to be precise.
+16. **Regexes in `database` and `user` columns are not implicitly anchored.** Prefix a pattern with `/` and use `^` and `$` where full-name matching is required.[^pg16-regex]
 
 17. **`pg_ident.conf` system-username regex with a capture group + database-username regex *cannot* both be regex.** Verbatim: *"When the database-username field is a regular expression, it is not possible to use \1."*[^ident-regex] You can capture from the system side OR regex-match on the DB side, not both.
 
@@ -754,7 +754,7 @@ If the server requests `md5`, `password`, `trust`, or any non-SCRAM method, libp
 - [`80-connection-pooling.md`](./80-connection-pooling.md), [`81-pgbouncer.md`](./81-pgbouncer.md) — Pool client-server authentication.
 - [`82-monitoring.md`](./82-monitoring.md) — Alerting on rejected-connection log volume.
 - [`101-managed-vs-baremetal.md`](./101-managed-vs-baremetal.md) — Managed providers expose `pg_hba.conf` through an abstraction; bare metal exposes the file directly.
-- [`40-event-triggers.md`](./40-event-triggers.md) — `BEFORE LOGIN` event trigger (PG16+) for dynamic connection control and LDAP auto-provisioning patterns.
+- [`40-event-triggers.md`](./40-event-triggers.md) — Event trigger support and limitations.
 
 ## Sources
 

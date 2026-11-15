@@ -110,7 +110,7 @@ FROM orders o;
 SELECT id "Order ID", amount_cents amt FROM orders;   -- legal but ugly
 ```
 
-- Output aliases are visible to `ORDER BY` and (since PG, always) to the result-set column names — but **not** to `WHERE`, `GROUP BY`, or `HAVING`.
+- Output aliases are visible to `ORDER BY` and `GROUP BY`, subject to name-resolution rules, but not to `WHERE` or `HAVING`.
 - Use **double-quoted identifiers** when an alias contains spaces or mixed case; otherwise PostgreSQL folds it to lowercase.
 - A **subquery in the target list** (a "scalar subquery") must return at most one row and one column.
 
@@ -136,7 +136,7 @@ FROM orders
 FROM ONLY orders                              -- only the parent, not partitions
 FROM orders *                                 -- redundant; "*" is the historical "include children" marker
 
--- 2. A subquery (must be aliased).
+-- 2. A subquery (an alias is optional in PG16+, but useful for qualified references).
 FROM (SELECT id, amount_cents FROM orders WHERE created_at > now() - interval '7 days') o
 
 -- 3. A function call.
@@ -164,7 +164,7 @@ WHERE o.id = 1;
 ```
 
 > [!NOTE]
-> Subqueries and function calls in `FROM` **must** have an alias (in `psql` you'll see `ERROR: subquery in FROM must have an alias`). A plain table is the only `FROM`-item where the alias is optional.
+> In PostgreSQL 16, subqueries in `FROM` may omit an alias. Function calls may also omit one; an alias is useful for naming their result columns.
 
 
 ### Join types — `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, `NATURAL`
@@ -376,8 +376,8 @@ GROUP BY CUBE (region, product, channel);
 > **`GROUP BY DISTINCT`** removes duplicate grouping sets that are produced when you combine multiple `ROLLUP` / `CUBE` clauses. The release note: *"Allow `DISTINCT` to be added to `GROUP BY` to remove duplicate `GROUPING SET` combinations."*[^pg14-group-by-distinct]
 >
 > ```sql
-> -- Without DISTINCT, ((a,b),(a),(),  (a,c),(a),()) — note (a) and () repeat.
-> -- With DISTINCT, ((a,b),(a,c),(a),()).
+> -- Multiple ROLLUP items produce a cross product of grouping sets.
+> -- DISTINCT removes duplicates from that cross product.
 > SELECT a, b, c, COUNT(*)
 > FROM t
 > GROUP BY DISTINCT ROLLUP(a,b), ROLLUP(a,c);
@@ -406,7 +406,7 @@ ORDER BY customer_id, created_at DESC;
 `DISTINCT ON` is a PostgreSQL extension (not SQL standard) but it is the **most efficient** "top-1 per group" pattern in PG when you also have a btree index on `(group_col, sort_col DESC)`. The alternative — a window function — almost always plans worse for top-1.
 
 > [!WARNING] `DISTINCT ON` and `ORDER BY` must agree
-> The leading `ORDER BY` keys **must** match the `DISTINCT ON` columns, in the same order. Otherwise the planner emits *"SELECT DISTINCT ON expressions must match initial ORDER BY expressions."* Add any additional tie-breaker columns *after* the DISTINCT-ON keys.
+> The leftmost `ORDER BY` expressions must match the `DISTINCT ON` expressions; their order among those leading keys may differ. Add tie-breaker columns after the DISTINCT-ON keys.
 
 
 ### `UNION`, `INTERSECT`, `EXCEPT`
@@ -472,7 +472,7 @@ SELECT name FROM users ORDER BY last_login_at DESC;
 SELECT name FROM users ORDER BY last_login_at DESC NULLS LAST;
 ```
 
-`ORDER BY` is the only clause where SELECT-list aliases are visible and where positional references are allowed. Use named expressions in production code — positions silently re-map when you change the target list.
+`GROUP BY` and `ORDER BY` accept SELECT-list aliases and positional references. Use named expressions in production code: positions can change when the target list changes.
 
 
 ### `LIMIT` / `OFFSET` / `FETCH FIRST ... WITH TIES`
@@ -552,7 +552,7 @@ UPDATE jobs SET status = 'done' WHERE id = ANY (:claimed_ids);
 COMMIT;
 ```
 
-`SKIP LOCKED` and `NOWAIT` are mutually exclusive with `WITH TIES`. The full table-level + row-level lock interaction matrix lives in [`43-locking.md`](./43-locking.md).
+`SKIP LOCKED` is incompatible with `WITH TIES`; `NOWAIT` is not subject to that restriction.[^select] The full lock matrix lives in [`43-locking.md`](./43-locking.md).
 
 
 ### `TABLESAMPLE` — `BERNOULLI` and `SYSTEM`
@@ -616,7 +616,7 @@ SELECT * FROM ROWS FROM (
 -- VALUES as a stand-alone statement.
 VALUES (1, 'a'), (2, 'b'), (3, 'c');
 
--- VALUES as a FROM-item (must be aliased).
+-- VALUES as a FROM-item (alias optional in PG16+).
 SELECT v.id, v.label
 FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) AS v(id, label);
 
@@ -722,7 +722,7 @@ FROM (
 WHERE rn <= 3;
 ```
 
-For the index `CREATE INDEX ON orders (customer_id, created_at DESC)`, options A and B both use an index-only walk and short-circuit early; option C reads every row before filtering. Pick (A) for N = 1, (B) for small N.
+The index `CREATE INDEX ON orders (customer_id, created_at DESC)` can help these plans, especially parameterized lookups in B. An index-only scan also requires all selected columns in the index and suitable visibility; A may scan many index entries. Compare plans with `EXPLAIN`.
 
 
 ### Anti-join: `NOT EXISTS` vs `LEFT JOIN ... IS NULL` vs `NOT IN`
@@ -756,13 +756,7 @@ WHERE NOT EXISTS (
 ### Sampling: rough `COUNT(DISTINCT)` estimation
 
 
-```sql
--- Estimate distinct customer_id values cheaply on a giant table.
-SELECT COUNT(DISTINCT customer_id) * 100 AS est_distinct
-FROM events TABLESAMPLE SYSTEM (1);
-
--- HLL via the hll extension is much more accurate but requires the extension.
-```
+Sampling rows and multiplying `COUNT(DISTINCT customer_id)` by the inverse sampling fraction is not a valid general estimate: frequent customers can appear in many sampled rows. Use full-table distinct counting or a validated distinct-count sketch, such as an HLL extension.
 
 
 ### Keyset pagination (deep-paging without `OFFSET`)
@@ -783,7 +777,7 @@ ORDER BY created_at DESC, id DESC
 LIMIT 50;
 ```
 
-Index: `CREATE INDEX ON orders (created_at DESC, id DESC)`. This is O(log n + 50) per page regardless of depth. Compare with `OFFSET 100000` which is O(100050).
+Assume `created_at` and `id` are non-null and `id` breaks ties uniquely; nullable sort keys need explicit handling. An index on `(created_at DESC, id DESC)` can support an efficient seek. Concurrent changes can still alter results between pages unless a consistent snapshot is held.
 
 
 ### Stable random ordering for fixed-seed exploration
@@ -930,12 +924,12 @@ WHERE o.id IN (SELECT id FROM flagged_orders);
 - **Scalar subqueries that fan out crash at runtime, not plan time.** Always rewrite as `LEFT JOIN ... GROUP BY` when there's any chance the inner query can produce more than one row.
 - **`UNION` deduplicates; `UNION ALL` does not.** The default is `UNION` (= `DISTINCT`). On large sets that's a sort or hash you may not have wanted.
 - **Set-operation column matching is positional, not by name.** Reorder columns in the second `SELECT` if the source-of-truth layouts differ.
-- **`FOR UPDATE` on a `LEFT JOIN` locks only the rows from the FROM-list table named in `OF`.** Plain `FOR UPDATE` locks all rows from all base tables in `FROM`, including the right side of `LEFT JOIN`s; that often surprises developers who only meant to lock the primary table. Use `FOR UPDATE OF mytable` to scope.
+- **`FOR UPDATE` on an outer join cannot lock its nullable side.** Scope locking to the preserved table with `FOR UPDATE OF mytable`; an unqualified lock on the nullable side is rejected.
 - **`SELECT *` in views is fragile.** When the underlying table gains a column, the view's stored column list does not auto-update — you'll need a `CREATE OR REPLACE VIEW ...` (or `DROP` + recreate) to pick it up. See [`05-views.md`](./05-views.md).
 - **`OFFSET` and `LIMIT` are applied *after* `ORDER BY`, which is applied *after* set operations.** That means `ORDER BY` / `LIMIT` belong at the very end of a `UNION` chain; if you want per-`SELECT` ordering you need parentheses + a wrapping query.
-- **`FOR UPDATE` cannot be combined with aggregates, `DISTINCT`, `GROUP BY`, `HAVING`, `WINDOW`, `UNION`/`INTERSECT`/`EXCEPT`, or a `LIMIT/OFFSET` that follows them.** PG will reject these combinations: locking applies to specific source rows, and those clauses make the row identity ambiguous.
+- **`FOR UPDATE` cannot be combined with aggregation, `DISTINCT`, `GROUP BY`, `HAVING`, window functions, or set operations.** `LIMIT` and `OFFSET` can be combined with row locking.
 - **`WITH TIES` is incompatible with `SKIP LOCKED`.** Pick one.
-- **Aliases in `SELECT` are visible to `ORDER BY` but not to `WHERE`, `GROUP BY`, or `HAVING`.** Repeat the expression in those clauses or wrap with a subquery.
+- **Aliases in `SELECT` are visible to `ORDER BY` and `GROUP BY`, not to `WHERE` or `HAVING`.** Repeat the expression or wrap it in a subquery where needed.
 
 
 ## See Also

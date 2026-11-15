@@ -50,9 +50,9 @@ Five rules to keep:
 
 1. **`shared_buffers` is fixed-size shared cache; everything else is per-backend or per-operation.** The docs recommend ~25% of system RAM as a starting value with the verbatim caveat *"it is unlikely that an allocation of more than 40% of RAM to `shared_buffers` will work better than a smaller amount."*[^shbuf-pg16] Server-start-only — context = `postmaster`.
 
-2. **`work_mem` is per-node, not per-query, not per-session.** A single query can use multiple `work_mem`-sized allocations because a sort, hash join, hash aggregate, materialize, and CTE scan are *separate* operations. The official quote: *"if a sort or hash table exceeds work_mem, it will use temporary files on disk."*[^workmem] A 5-node parallel plan with 4 workers each can use up to ~20 × `work_mem`. Per-connection budgets must respect this.
+2. **`work_mem` is a per-operation base limit, not a per-query or per-session budget.** A query can have several concurrent sort or hash operations; hash limits use `work_mem × hash_mem_multiplier`, and parallel workers can multiply memory use. Actual allocations depend on the plan and workload.[^workmem]
 
-3. **`maintenance_work_mem` is per-maintenance-operation, and PG17 removed the silent 1 GB cap for VACUUM.** Pre-PG17 setting `maintenance_work_mem = 4GB` for a manual VACUUM was wasted budget — only the first GB was usable. PG17 verbatim: *"vacuum is no longer silently limited to one gigabyte of memory when `maintenance_work_mem` or `autovacuum_work_mem` are higher."*[^pg17-mwm] Set it generously on PG17+.
+3. **`maintenance_work_mem` bounds maintenance memory, and PG17 removed VACUUM's 1 GB dead-tuple identifier limit.** On PG16 and earlier, only that identifier collection is capped at 1 GB; the setting is not necessarily reserved in full. Size it for the workload and available memory.[^pg17-mwm]
 
 4. **`effective_cache_size` is a planner hint, not an allocation.** Docs: *"Sets the planner's assumption about the effective size of the disk cache that is available to a single query."*[^ecs] Set it to a realistic estimate of OS page cache + `shared_buffers`. The planner uses it to bias index scans vs sequential scans. No memory is reserved.
 
@@ -77,7 +77,7 @@ Five rules to keep:
 | Make hash joins less spill-happy | `hash_mem_multiplier` = 2.0 (default PG15+) or higher | Setting > 4.0 cluster-wide | Hash bias is intentional; raise per-role for analytics |
 | Speed manual VACUUM (PG17+) | `SET maintenance_work_mem = '4GB'` inside session | Cluster-wide bump that also affects every CREATE INDEX | PG17 lifted the 1 GB cap for vacuum specifically[^pg17-mwm] |
 | Speed CREATE INDEX | `SET maintenance_work_mem = '2GB'` for the session | Permanent cluster-wide raise | One-off ops should be SET LOCAL or SET in the session |
-| Size autovacuum workers | `autovacuum_work_mem` = explicit value | Default `-1` paired with high `maintenance_work_mem` | At `-1` autovacuum reuses MWM; with high MWM and `autovacuum_max_workers = 5` you commit `5 × MWM` of memory[^mwm-warning] |
+| Size autovacuum workers | Set `autovacuum_work_mem` explicitly | Assuming a high `maintenance_work_mem` has no autovacuum effect | With `-1`, each worker uses the maintenance limit; concurrent workers can multiply memory demand[^mwm-warning] |
 | Bound logical decoding memory | `logical_decoding_work_mem` per-walsender | Default 64 MB on busy publishers | Larger value = less disk spill for big transactions |
 | Constrain VACUUM's buffer pool footprint | `vacuum_buffer_usage_limit` (PG16+) | Setting `0` (uses all of shared_buffers) | Default protects working set during maintenance |
 | Enable huge pages on Linux | `vm.nr_hugepages` via sysctl + `huge_pages = on` | `huge_pages = on` without sysctl reservation | Server fails to start if pages aren't pre-reserved[^kernel] |
@@ -100,19 +100,7 @@ PostgreSQL memory splits into:
 > [!NOTE] PostgreSQL 15: `shared_memory_size` introspection
 > Verbatim release-note: *"Add server variable `shared_memory_size` to report the size of allocated shared memory ... Add server variable `shared_memory_size_in_huge_pages` to report the number of huge memory pages required (Linux only)."*[^pg15-shmem] Query with `SHOW shared_memory_size;` — gives you the total without manually summing GUCs.
 
-The capacity formula at full saturation is roughly:
-
-```
-RAM commitment ≈ shared_buffers
-              + wal_buffers (typically capped at 16 MB)
-              + min_dynamic_shared_memory (default 0)
-              + max_connections × (work_mem × parallel-nodes-per-query × parallel-workers-per-node)
-              + autovacuum_max_workers × max(autovacuum_work_mem, maintenance_work_mem)
-              + temp_buffers × N-sessions-using-temp-tables
-              + small overhead per backend (~10 MB)
-```
-
-That formula is **not a static budget** — `work_mem` is only consumed when a node actually needs it, and most OLTP backends use far less than the maximum. Plan for the worst case in capacity terms, not for steady-state.
+Capacity planning must account for shared memory, concurrent per-operation allocations, parallel workers and leader participation, autovacuum workers, temporary buffers, other backend memory, and the OS. `work_mem` is allocated as needed; hash operations can use `work_mem × hash_mem_multiplier`. Different plan nodes need not be active simultaneously, and shared parallel operations need not allocate a full copy per process. Model representative worst-case concurrency rather than treating a single multiplication as a hard upper bound.[^workmem]
 
 
 ### `shared_buffers`
@@ -131,7 +119,7 @@ Practical-sizing tiers:
 
 The 32 GB practical ceiling above is **community lore, not the docs.** The official statement is the 40 % rule. The reason past ~32 GB the wins flatten: at that size you've cached the working set, and additional space caches cold data that the OS would cache anyway.
 
-The 25 % default reasoning: half of RAM is reserved for OS page cache (which Postgres also uses transitively for files not in `shared_buffers`); the remaining half is split between `shared_buffers` and per-backend / per-process memory.
+The 25% figure is a starting point, not a reservation rule. Leave memory for the OS cache, concurrent operations, and other processes, and measure the workload.
 
 > [!WARNING] `shared_buffers` is server-start-only
 > Changing requires a restart, not a SIGHUP reload. Plan the change with a maintenance window or rolling-failover plan. Context column in `pg_settings` says `postmaster`.
@@ -152,16 +140,10 @@ Context: `user`. Can be set per-session, per-role, per-database.
 
 Verbatim docs: *"Sets the base maximum amount of memory to be used by a query operation (such as a sort or hash table) before writing to temporary disk files. ... Note that for a complex query, several sort or hash operations might be running in parallel; each operation will generally be allowed to use as much memory as this value specifies before it starts to write data into temporary files. Also, several running sessions could be doing such operations concurrently."*[^workmem] Default: 4 MB. Context: `user`.
 
-The per-node multiplication is the trap. A query with:
-
-- A 3-table hash join (3 hash nodes)
-- One sort for ORDER BY
-- One hash aggregate
-
-uses up to **5 × `work_mem`**. Under parallel query with `max_parallel_workers_per_gather = 4`, each parallel worker independently uses its own `work_mem` per node — so the same query at 5 workers (1 leader + 4) could use **25 × `work_mem`**.
+For example, multiple hash joins, a sort, and a hash aggregate can each consume memory during execution. Hash operations may each use `work_mem × hash_mem_multiplier`, and parallel execution can multiply allocations across processes. Inspect the actual plan and concurrency instead of assuming a fixed number of nodes or a universal upper bound.
 
 > [!WARNING] Setting cluster-wide `work_mem` high is a footgun
-> A 100-connection cluster with `work_mem = 256MB`, average 3 nodes per query, average 2 parallel workers, can commit `100 × 3 × 2 × 256 MB = 150 GB`. The right pattern is per-role override:
+> As an illustration, 100 concurrent sessions, three simultaneous sort operations per session, and two participating processes per operation at `work_mem = 256MB` imply about 150 GB of sort budgets. Actual usage can be lower or higher, especially with hash operations. Per-role overrides can scope this risk:
 >
 >     ALTER ROLE reporter SET work_mem = '256MB';
 >     ALTER ROLE webapp SET work_mem = '8MB';
@@ -204,11 +186,11 @@ Practical sizing:
 | Cluster-wide default | 64 MB – 256 MB | Conservative because of `autovacuum_max_workers` multiplication |
 | One-off CREATE INDEX | 1–4 GB (SET in session) | Index build is bounded by memory; more = fewer external sort passes |
 | One-off VACUUM on PG17+ | 4–16 GB (SET in session) | Cap is gone; large vacuums benefit dramatically |
-| One-off VACUUM on PG≤16 | 1 GB (anything higher is wasted on vacuum) | Hard internal cap |
+| One-off VACUUM on PG≤16 | Up to 1 GB for dead-tuple identifiers | This limit applies to identifier collection, not an upfront reservation of the setting |
 | CREATE INDEX CONCURRENTLY | Same as CREATE INDEX | Memory split between two phases |
 
-> [!WARNING] `maintenance_work_mem × autovacuum_max_workers` is real RAM
-> Verbatim docs: *"This memory is allocated when running maintenance operations. For autovacuum it is `autovacuum_max_workers` times this much."*[^mwm-warning] With default `autovacuum_max_workers = 3` and `maintenance_work_mem = 1 GB`, autovacuum can commit 3 GB of memory cluster-wide. Set `autovacuum_work_mem` explicitly to break the linkage (see next section).
+> [!WARNING] Autovacuum workers multiply memory demand
+> Each concurrent autovacuum worker can allocate up to its applicable maintenance limit, subject to operation-specific limits. With `autovacuum_work_mem = -1`, the applicable setting is `maintenance_work_mem`; set it explicitly to decouple the two.[^mwm-warning]
 
 
 ### `autovacuum_work_mem`
@@ -224,7 +206,7 @@ The decoupling pattern: set `maintenance_work_mem` to a generous interactive val
 maintenance_work_mem = 1GB        # for interactive ops
 autovacuum_work_mem = 256MB       # for autovacuum workers
 autovacuum_max_workers = 3        # default
-# Worst-case autovacuum RAM: 3 × 256MB = 768MB (instead of 3GB)
+# Illustrative configured worker budgets: 3 × 256MB = 768MB
 ```
 
 `autovacuum_work_mem` is `sighup` context — reload picks it up, no restart needed. But existing autovacuum workers keep their old value until they finish.
@@ -245,7 +227,7 @@ Verbatim docs: *"The amount of shared memory used for WAL data that has not yet 
 
 The auto-sizing is correct for most workloads. The only reason to override is on very write-heavy clusters where `shared_buffers` is huge (≥ 512 MB) — at 1/32, `wal_buffers` is already capped at 16 MB, and that cap is fine. Explicitly setting `wal_buffers = 16MB` makes the value visible and stable across `shared_buffers` changes.
 
-Setting above 16 MB has no benefit because WAL is fsynced at COMMIT boundaries and the buffer doesn't accumulate past a single transaction's WAL anyway.
+The one-segment cap applies only to automatic sizing. Explicit settings can exceed it; measure whether a larger allocation helps the workload.[^walbuf]
 
 Context = `postmaster`: requires restart.
 
@@ -259,7 +241,7 @@ Logical decoding buffers transaction changes in memory until either the transact
 > [!NOTE] PostgreSQL 14: streaming of in-progress transactions
 > Pre-PG14: transactions exceeding `logical_decoding_work_mem` always spilled to disk and were only delivered at commit time. PG14 added streaming via `STREAM_IN_PROGRESS_TRANSACTIONS` option, so changes can be streamed before commit if the subscriber supports it.
 
-Tuning rule: for clusters with many small transactions, default is fine. For clusters with bulk-loader transactions (>>64 MB of changes), raise to 256 MB or 1 GB per walsender. The memory is committed per active replication slot.
+For bulk transactions, consider a larger per-logical-decoding budget after measuring spills and concurrent decoding memory use. The setting is a limit, not an upfront reservation.
 
 
 ### `vacuum_buffer_usage_limit` (PG16+)
@@ -367,14 +349,14 @@ Transparent huge pages (THP) are different from explicit huge pages. THP is dyna
 # Shared memory (postmaster context, requires restart)
 shared_buffers = 16GB                   # 25% of RAM
 huge_pages = try                        # Use huge pages if reserved; fall back gracefully
-wal_buffers = 16MB                      # Pin at max (auto would also pick this)
+wal_buffers = 16MB                      # Explicit value; auto also picks this here
 min_dynamic_shared_memory = 0           # Default; raise if heavy parallel + huge pages
 
 # Planner hint (no allocation; user context)
 effective_cache_size = 48GB             # shared_buffers + OS page cache estimate
 
 # Per-backend memory (user context — apply per-role for differentiation)
-work_mem = 16MB                         # Per-node; 200 conns × 3 nodes × 16MB = ~10GB worst case
+work_mem = 16MB                         # Per-operation base; hash and parallelism multiply demand
 hash_mem_multiplier = 2.0               # Default since PG15; explicit for clarity
 temp_buffers = 8MB                      # Default; raise per-session for ETL
 
@@ -496,9 +478,9 @@ ORDER BY temp_bytes DESC;
 
 Interpretation:
 
-- `temp_files = 0` and `temp_bytes = 0`: no spills, `work_mem` is adequate.
-- `temp_files` rising slowly with `avg_temp_file_size < work_mem`: edge cases spilling, ignore.
-- `temp_files` climbing fast with `avg_temp_file_size = work_mem` (or close): chronic spill, raise `work_mem` for the offending workload (use `pg_stat_statements` to find the queries).
+- Zero counters mean no tracked temporary files since the statistics reset, not proof that `work_mem` is adequate.
+- Rising counters indicate temporary-file activity, which can have causes other than sort/hash spills. File size alone does not identify a suitable `work_mem`.
+- Use per-query statistics and execution plans to identify the operation before tuning.
 
 Per-query spill detection via `EXPLAIN`:
 
@@ -520,9 +502,7 @@ RESET maintenance_work_mem;
 RESET vacuum_buffer_usage_limit;
 ```
 
-The PG17 release-note (verbatim): *"vacuum is no longer silently limited to one gigabyte of memory when `maintenance_work_mem` or `autovacuum_work_mem` are higher."*[^pg17-mwm] On a 500 GB table with hundreds of millions of dead rows, the difference between 1 GB and 8 GB is the difference between many index passes and a single index pass — often a 5–10× speedup.
-
-Pre-PG17 the same setting would silently cap at 1 GB; the additional 7 GB was reserved but unused for the vacuum.
+PG17 removed the 1 GB dead-tuple-identifier limit.[^pg17-mwm] A larger budget can reduce repeated index passes when identifier storage was the bottleneck; measure the workload. Earlier releases did not reserve the unused portion of a larger setting.
 
 
 ### Recipe 7: Audit memory-related GUCs
@@ -548,9 +528,9 @@ ORDER BY context, name;
 Cross-reference: [`53-server-configuration.md`](./53-server-configuration.md) for `pg_settings.context` interpretation and [`64-system-catalogs.md`](./64-system-catalogs.md) for `pg_settings` schema.
 
 
-### Recipe 8: Compute the worst-case memory budget
+### Recipe 8: Illustrate a memory sizing scenario
 
-A back-of-envelope formula in SQL:
+This illustrative calculation assumes standard 8 kB blocks and a hypothetical number of active operations. It is not a worst-case bound:
 
 ```sql
 WITH cfg AS (
@@ -558,6 +538,7 @@ WITH cfg AS (
     (SELECT setting::bigint * 8192 FROM pg_settings WHERE name = 'shared_buffers') AS shared_buffers,
     (SELECT setting::bigint * 1024 FROM pg_settings WHERE name = 'work_mem') AS work_mem,
     (SELECT setting::bigint * 1024 FROM pg_settings WHERE name = 'maintenance_work_mem') AS maintenance_work_mem,
+    (SELECT setting::bigint FROM pg_settings WHERE name = 'autovacuum_work_mem') AS autovacuum_work_mem_kb,
     (SELECT setting::bigint FROM pg_settings WHERE name = 'max_connections') AS max_connections,
     (SELECT setting::bigint FROM pg_settings WHERE name = 'autovacuum_max_workers') AS av_workers,
     (SELECT setting::numeric FROM pg_settings WHERE name = 'hash_mem_multiplier') AS hash_mult
@@ -565,17 +546,17 @@ WITH cfg AS (
 SELECT
   pg_size_pretty(shared_buffers) AS shared_buffers,
   pg_size_pretty(max_connections * work_mem * 3) AS work_mem_typical,
-  pg_size_pretty(max_connections * work_mem * 5 * hash_mult::int) AS work_mem_worst_with_hashes,
-  pg_size_pretty(av_workers * maintenance_work_mem) AS autovacuum_cap,
+  pg_size_pretty((max_connections * work_mem * 5 * hash_mult)::bigint) AS five_hash_operations,
+  pg_size_pretty(av_workers * CASE WHEN autovacuum_work_mem_kb = -1 THEN maintenance_work_mem ELSE autovacuum_work_mem_kb * 1024 END) AS autovacuum_budget,
   pg_size_pretty(
     shared_buffers
     + (max_connections * work_mem * 3)
-    + (av_workers * maintenance_work_mem)
+    + (av_workers * CASE WHEN autovacuum_work_mem_kb = -1 THEN maintenance_work_mem ELSE autovacuum_work_mem_kb * 1024 END)
   ) AS rough_total
 FROM cfg;
 ```
 
-`work_mem_typical` assumes 3 nodes per query at full saturation; `work_mem_worst_with_hashes` assumes 5 nodes all using hashes. Reality is between these.
+These are illustrative scenarios, not upper bounds. Actual plans, worker participation, hash multipliers, maintenance operations, and concurrent sessions may produce higher or lower usage. The autovacuum term uses `maintenance_work_mem` only when `autovacuum_work_mem = -1`.
 
 
 ### Recipe 9: Inspect shared-memory composition (PG15+)
@@ -688,13 +669,13 @@ For most workloads the additional memory commitment is negligible (~30 MB). The 
 
 2. **`shared_buffers` is server-start-only.** Context = `postmaster`. Plan changes with maintenance windows.
 
-3. **`work_mem` is per-node, not per-query or per-session.** A 5-node query with 4 parallel workers can use 25 × `work_mem`. Cluster-wide hikes are dangerous; per-role is the right scope.
+3. **`work_mem` is a per-operation base limit, not a per-query or per-session budget.** Parallel processes and hash multipliers can increase total use.
 
-4. **Cluster-wide `work_mem = 256MB` with `max_connections = 200`** commits up to ~150 GB at worst case (200 conns × 3 nodes × 2 workers × 256 MB). Use per-role overrides.
+4. **A concurrency multiplication is a scenario, not a hard maximum.** Include the leader, active plan operations, hash multipliers, and concurrent workload when assessing memory pressure.
 
-5. **`maintenance_work_mem × autovacuum_max_workers` is committed RAM.** Verbatim docs: *"For autovacuum it is `autovacuum_max_workers` times this much."*[^mwm-warning] Decouple via `autovacuum_work_mem`.
+5. **Autovacuum worker limits multiply potential memory demand, not upfront committed RAM.** When `autovacuum_work_mem = -1`, each worker uses `maintenance_work_mem`; set a separate limit if needed.[^mwm-warning]
 
-6. **Pre-PG17 `maintenance_work_mem > 1 GB` is wasted for VACUUM.** Silent 1 GB cap on the dead-tuple TID array.[^pg17-mwm] CREATE INDEX and ALTER TABLE ADD FK do use the larger value.
+6. **Pre-PG17 VACUUM limits dead-tuple identifier collection to 1 GB.** A larger setting does not increase that specific collection limit.[^pg17-mwm]
 
 7. **`temp_buffers` is frozen after first temp-table use.** Set it before any temp activity in the session.
 
@@ -702,7 +683,7 @@ For most workloads the additional memory commitment is negligible (~30 MB). The 
 
 9. **`effective_cache_size = 4 GB` (default) is far below modern reality.** Planner under-uses indexes. Set explicitly to OS-cache + `shared_buffers`.
 
-10. **`wal_buffers` capped at 16 MB (one segment size) even when set higher.** The `auto` value (-1) already picks this; explicit values > 16 MB are silently clamped.
+10. **Only automatic `wal_buffers` sizing is capped at one WAL segment.** A manually specified value can be larger.[^walbuf]
 
 11. **`huge_pages = on` fails startup if sysctl reservation is insufficient.** Use `try` until you've verified the reservation works. The verbatim docs: *"PostgreSQL will fail to start if not enough huge pages are available."*[^kernel]
 
@@ -712,7 +693,7 @@ For most workloads the additional memory commitment is negligible (~30 MB). The 
 
 14. **`vacuum_buffer_usage_limit = 0` allows VACUUM to use any of `shared_buffers`.** This is sometimes useful for one-off vacuums where the table is hot anyway, but as a default it can sweep working-set pages out of the buffer pool.
 
-15. **`logical_decoding_work_mem` is per-walsender.** A cluster with 10 logical replication slots and `logical_decoding_work_mem = 256 MB` commits 2.5 GB across the publishers.
+15. **`logical_decoding_work_mem` applies per logical decoding connection.** Multiple active connections can each consume memory up to their applicable limit; slots alone do not reserve that memory.
 
 16. **`autovacuum_work_mem` context is `sighup`**, but existing autovacuum workers keep their old value until they finish their current vacuum. The new value takes effect for the next worker started.
 
@@ -757,7 +738,7 @@ For most workloads the additional memory commitment is negligible (~30 MB). The 
 
 [^mwm]: PostgreSQL 16 — Resource Consumption / Memory, `maintenance_work_mem`. Verbatim: *"Specifies the maximum amount of memory to be used by maintenance operations, such as VACUUM, CREATE INDEX, and ALTER TABLE ADD FOREIGN KEY."* https://www.postgresql.org/docs/16/runtime-config-resource.html
 
-[^mwm-warning]: PostgreSQL 16 — Resource Consumption / Memory, `maintenance_work_mem`. Verbatim: *"This memory is allocated when running maintenance operations. For autovacuum it is `autovacuum_max_workers` times this much."* https://www.postgresql.org/docs/16/runtime-config-resource.html
+[^mwm-warning]: PostgreSQL 16 — Resource Consumption / Memory, `maintenance_work_mem`: *"when autovacuum runs, up to autovacuum_max_workers times this memory may be allocated"*; `autovacuum_work_mem` can control the budget separately. https://www.postgresql.org/docs/16/runtime-config-resource.html
 
 [^avwm]: PostgreSQL 16 — Resource Consumption / Memory, `autovacuum_work_mem`. Verbatim: *"Specifies the maximum amount of memory to be used by each autovacuum worker process. ... The default value is `-1`, indicating that the value of `maintenance_work_mem` should be used instead."* https://www.postgresql.org/docs/16/runtime-config-resource.html
 

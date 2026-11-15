@@ -159,14 +159,13 @@ Quoted from upstream release notes overview. Lists are illustrative, NOT exhaust
 - **Parallel FULL and right-OUTER hash joins** — planner can parallelize previously-serial join shapes.
 - **Logical replication from standby** — subscriber can subscribe to a physical standby's published tables. See [74-logical-replication.md](./74-logical-replication.md).
 - **Parallel apply of large transactions on subscriber** — `streaming=parallel` opt-in. See [74 admonition](./74-logical-replication.md).
-- **`pg_stat_io` view** — per-relation, per-context, per-backend-type I/O statistics. See [58-performance-diagnostics.md](./58-performance-diagnostics.md) and [32-buffer-manager.md](./32-buffer-manager.md).
+- **`pg_stat_io` view** — I/O statistics by backend type, object type, and context, not individual relation. See <https://www.postgresql.org/docs/16/monitoring-stats.html#MONITORING-PG-STAT-IO-VIEW>.
 - **SQL/JSON constructors** — `JSON_ARRAY()`, `JSON_OBJECT()`, `JSON_ARRAYAGG()`, `JSON_OBJECTAGG()`. See [17-json-jsonb.md](./17-json-jsonb.md).
 - **Page-freezing during normal vacuum** — `VACUUM` opportunistically freezes pages while it's already touching them. See [28-vacuum-autovacuum.md](./28-vacuum-autovacuum.md).
 - **`pg_hba.conf` and `pg_ident.conf` include directives** — `include_dir`, `include_if_exists`. See [48-authentication-pg-hba.md](./48-authentication-pg-hba.md).
 - **`pg_hba.conf` regex matching** on database and user columns.
 - **CREATEROLE narrowed** — non-superuser with CREATEROLE can no longer trivially grant SUPERUSER or BYPASSRLS to other roles. See [46-roles-privileges.md](./46-roles-privileges.md).
 - **HOT updates with BRIN-only indexed column** — PG16 relaxes the HOT-disabled rule for BRIN-only updates. See [30-hot-updates.md](./30-hot-updates.md).
-- **`ALTER SYSTEM`-grantable parameters** — non-superuser can ALTER SYSTEM specific GUCs via `GRANT ... ON PARAMETER`. See [53-server-configuration.md](./53-server-configuration.md).
 
 ### PostgreSQL 17 (2024-09-26, EOL 2029-11-08)
 
@@ -177,7 +176,7 @@ Quoted from upstream release notes overview. Lists are illustrative, NOT exhaust
 - **Streaming I/O for sequential reads** — sequential scans now use a streaming-read API, faster on high-latency storage. Foundation for PG18 AIO. See [32-buffer-manager.md](./32-buffer-manager.md).
 - **Multi-value B-tree index search** — `WHERE col IN (a, b, c)` can now use a single index descent per value batch.
 - **`pg_createsubscriber` CLI** — convert a physical replica to a logical-replication subscriber without re-bootstrapping. See [74-logical-replication.md](./74-logical-replication.md) and [77-standby-failover.md](./77-standby-failover.md).
-- **Logical replication slots preserved through `pg_upgrade`** — major-upgrade no longer requires re-creating subscriptions. See [86-pg-upgrade.md](./86-pg-upgrade.md).
+- **Logical replication slot migration through `pg_upgrade`** — supported when the source is PG17+ and the documented prerequisites hold. See <https://www.postgresql.org/docs/17/pgupgrade.html>.
 - **Logical-slot failover via standby sync** — `failover=true` on slot creation + `synchronized_standby_slots` + `sync_replication_slots`. See [75-replication-slots.md](./75-replication-slots.md).
 - **`sslnegotiation=direct`** — TLS handshake without prior CLEARTEXT round-trip via ALPN. See [49-tls-ssl.md](./49-tls-ssl.md).
 - **`pg_basebackup --incremental`** + `pg_combinebackup` — incremental + synthetic-full backups. See [84-backup-physical-pitr.md](./84-backup-physical-pitr.md).
@@ -193,7 +192,7 @@ Quoted from upstream release notes overview. Lists are illustrative, NOT exhaust
 **Asynchronous I/O + pg_upgrade preserves stats + skip scan.** Biggest perf release in years.
 
 - **Asynchronous I/O subsystem** — `io_method` GUC (default `worker`, opt-in `io_uring` on Linux). Up to 3x faster on read-heavy workloads (seq scans, bitmap heap scans, vacuum). New `pg_aios` view. See [32-buffer-manager.md](./32-buffer-manager.md).
-- **`pg_upgrade` preserves optimizer statistics** — no more cluster-wide `vacuumdb --analyze-in-stages` post-upgrade for PG17→18 jumps. Extended stats still NOT preserved. See [55-statistics-planner.md headline](./55-statistics-planner.md) and [86-pg-upgrade.md](./86-pg-upgrade.md).
+- **`pg_upgrade` preserves some optimizer statistics** — PG18 transfers supported statistics, but not all statistics are preserved. Follow `pg_upgrade`'s post-upgrade ANALYZE instructions. See <https://www.postgresql.org/docs/18/pgupgrade.html>.
 - **B-tree skip scan** — multicolumn index can answer queries that don't filter on the leading column. See [23-btree-indexes.md](./23-btree-indexes.md).
 - **`uuidv7()` in core** — time-ordered UUIDs without extension. See [18-uuid-numeric-money.md](./18-uuid-numeric-money.md).
 - **Virtual generated columns as default** — new generated columns are VIRTUAL unless declared STORED. PG14-17 had STORED-only. See [01-syntax-ddl.md](./01-syntax-ddl.md).
@@ -207,7 +206,6 @@ Quoted from upstream release notes overview. Lists are illustrative, NOT exhaust
 - **`pg_stat_io` extended with bytes columns and WAL rows**. New `pg_stat_get_backend_io()` per-backend function. See [58-performance-diagnostics.md](./58-performance-diagnostics.md).
 - **`pg_stat_checkpointer.num_done` and `slru_written`** — distinguish completed-from-skipped checkpoints.
 - **AFTER triggers fire as queue-time role, not commit-time role.** Silent semantic change. See [39-triggers.md headline WARNING](./39-triggers.md).
-- **`promote_trigger_file` removed** (was deprecated since PG12, removed in PG16) — only `pg_promote()` and `pg_ctl promote` work.
 
 ### PostgreSQL 19 (RC 2; GA planned 2026-11-19)
 
@@ -240,7 +238,7 @@ Quoted from upstream release notes overview. Lists are illustrative, NOT exhaust
 | Wait event `BufferPin` | type `BufferPin` | type `Buffer`, event `BufferCleanup`; `BufferContent` split into `BufferShared` / `BufferShareExclusive` / `BufferExclusive` |
 | `pg_stat_subscription_stats.sync_error_count` | present | renamed `sync_table_error_count`; `sync_seq_error_count` added |
 | Default `inet`/`cidr` GiST opclass | btree_gist | core GiST; `pg_upgrade` refuses clusters with btree_gist `inet`/`cidr` indexes |
-| FTS and pg_trgm character classification | libc | database locale provider; reindex FTS and pg_trgm indexes after `pg_upgrade` |
+| FTS and pg_trgm character classification | PG18 changed to database locale provider; reindex affected indexes when upgrading to PG18 | check PG19 release notes for additional changes |
 | `json_array()` over zero rows | `NULL` | empty JSON array |
 | C compiler for extensions | C99 | C11 |
 
@@ -351,7 +349,7 @@ Use these to find which version introduced a feature in a given area.
 | `log_destination=jsonlog` | PG15 |
 | `pg_stat_wal` columns relocated to `pg_stat_io` | PG18 |
 | `pg_aios` view (async I/O state) | PG18 |
-| `pg_get_backend_io()` per-backend function | PG18 |
+| `pg_stat_get_backend_io()` per-backend function | PG18 |
 | `pg_stat_checkpointer.num_done` (distinguishes completed from skipped) | PG18 |
 
 ### Configuration
@@ -385,7 +383,9 @@ SELECT
             THEN 'EOL November 2028'
         WHEN current_setting('server_version_num')::int < 180000
             THEN 'EOL November 2029'
-        ELSE 'EOL November 2030'
+        WHEN current_setting('server_version_num')::int < 190000
+            THEN 'EOL November 2030'
+        ELSE 'Check current support policy'
     END AS support_window;
 ```
 
@@ -406,7 +406,7 @@ If you run multiple clusters:
 ```bash
 for host in db1 db2 db3 db4 db5; do
     version=$(psql -h $host -At -c "SHOW server_version_num")
-    if [ "$version" -lt 140000 ]; then
+    if [ "$version" -lt 150000 ]; then
         echo "$host: EOL ($version)"
     fi
 done
@@ -540,7 +540,7 @@ If unsure when feature X arrived:
 
 4. **Treating `server_version_num` as patch-numbering aware.** `version_num` packs major + minor only. For exact build (e.g., compile flags, OS package version), check `SELECT version()`.
 
-5. **Mixing minor releases across HA cluster.** Patroni / repmgr / streaming-replication clusters must run **identical** minor versions on primary and standbys. A minor-skew can cause failover failures and WAL incompatibility. See [78-ha-architectures.md](./78-ha-architectures.md).
+5. **Leaving minor releases mismatched across an HA cluster.** Keep primary and standbys on the same minor release where possible; for rolling minor updates, PostgreSQL recommends updating standbys first. Different minors are likely to work but are not formally supported. See <https://www.postgresql.org/docs/16/warm-standby.html#STANDBY-PLANNING>.
 
 6. **Believing the "current" alias in docs URLs.** `/docs/current/` moves with every major release. Cite specific majors: `/docs/16/`, `/docs/17/`, `/docs/18/`.
 

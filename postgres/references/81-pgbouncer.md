@@ -1,13 +1,13 @@
 # pgBouncer Deep Dive
 
 > [!WARNING] pgBouncer single-process single-threaded
-> One pgBouncer process serves ALL clients via `libevent` event loop. Multi-core hosts need multiple pgBouncer instances behind load balancer + peering (1.23+) or `SO_REUSEPORT` for cancellation routing. Vertical scaling caps ~10-20k connections / 60-80k QPS per process depending on workload. Beyond that → multi-instance.
+> One pgBouncer process serves clients via a `libevent` event loop. Use multiple instances for multiple CPU cores. Configure peering for cancellation routing across instances; `SO_REUSEPORT` distributes connections but does not by itself route cancellation requests to the instance holding the client.
 
 ## When to Use This Reference
 
 - Configuring pgBouncer for production (`pool_mode`, sizing, TLS, auth)
 - Operational tasks via console (`SHOW POOLS`, `SHOW STATS`, `RELOAD`, `PAUSE`, `RESUME`)
-- Enabling prepared statements (PG17 + libpq + `max_prepared_statements`)
+- Enabling protocol-level named prepared statements (pgBouncer 1.21+ and nonzero `max_prepared_statements`)
 - Peering multiple pgBouncer instances for cancellation routing (1.23+)
 - Authenticating via `auth_query` against PG vs static `auth_file`
 - Diagnosing pool exhaustion / `cl_waiting` / `maxwait` spikes
@@ -24,7 +24,7 @@ Sibling files: [`80-connection-pooling.md`](./80-connection-pooling.md) for WHY 
 - [GUC Reference](#guc-reference)
 - [Console Commands](#console-commands)
 - [Per-Database and Per-User Overrides](#per-database-and-per-user-overrides)
-- [Prepared Statements](#prepared-statements-pg17)
+- [Prepared Statements](#prepared-statements)
 - [TLS](#tls)
 - [Authentication](#authentication)
 - [Peering](#peering-pgbouncer-123)
@@ -37,7 +37,7 @@ Sibling files: [`80-connection-pooling.md`](./80-connection-pooling.md) for WHY 
 
 ## Mental Model
 
-1. **Single-threaded per process**. `libevent`-based. Scales horizontally not vertically. Multi-core hosts need multiple pgBouncer processes behind a load balancer + peering (1.23+) or `SO_REUSEPORT` for cancellation routing.
+1. **Single-threaded per process**. `libevent`-based. Scale across processes when measurements justify it; configure peering to route cancellations between instances.
 
 2. **`pool_mode` default `session`** — keeps connection per client. **`transaction`** = production default for new deployments — releases server connection at `COMMIT`. **`statement`** = rare, breaks transactions.
 
@@ -45,7 +45,7 @@ Sibling files: [`80-connection-pooling.md`](./80-connection-pooling.md) for WHY 
 
 4. **Console = primary operational surface**. Connect to `pgbouncer` virtual database as `stats_users` / `admin_users`. `SHOW POOLS` for capacity, `SHOW STATS` for throughput, `SHOW CLIENTS` / `SHOW SERVERS` for forensics, `RELOAD` / `PAUSE` / `RESUME` for online ops.
 
-5. **Prepared statements require PG17 libpq + `max_prepared_statements > 0`**[^pg17-libpq]. Default is **200** since pgBouncer 1.24; 1.21 added the feature with default 0[^prepstmt-default]. App driver must use protocol-level prepare (not SQL `PREPARE` / `DEALLOCATE`). Older app drivers using SQL-level PREPARE will not benefit.
+5. **Protocol-level named prepared statements need pgBouncer 1.21+ and `max_prepared_statements > 0`**. PG17 libpq is not required. SQL-level `PREPARE` is not tracked.[^prepstmt-default]
 
 ## Decision Matrix
 
@@ -104,7 +104,7 @@ Five operational facts:
 
 3. **Per-`(database, user)` pool**. Two users connecting to same database → two separate pools, two separate `default_pool_size` budgets.
 
-4. **`pgbouncer` virtual database** = console. Connect with `psql -p 6432 -d pgbouncer -U admin` (no password if `admin_users` matches). Cannot run regular SQL — only `SHOW`, `RELOAD`, `PAUSE`, `RESUME`, `KILL`, `SHUTDOWN`, `SET` (`SUSPEND` removed in 1.26.0).
+4. **`pgbouncer` virtual database** = console. Connect with `psql -p 6432 -d pgbouncer -U admin`; membership in `admin_users` authorizes console operations but does not bypass configured authentication.
 
 5. **No query parsing**. pgBouncer forwards bytes. Does NOT understand SQL. Cannot rewrite queries, route based on read/write, or load-balance to replicas. For query-aware routing use pgcat / pgpool-II / app-side logic.
 
@@ -211,7 +211,7 @@ Top settings grouped by concern. Default + production-typical value.
 
 | Setting | Default | Effect |
 |---|---|---|
-| `server_reset_query` | `DISCARD ALL` | Run on checkout/return. Resets session state. |
+| `server_reset_query` | `DISCARD ALL` | Run on release in session mode; not normally used in transaction mode unless `server_reset_query_always` is enabled. |
 | `server_check_query` | empty | Optional liveness check before handing server to client. |
 | `server_check_delay` | 30.0 s | Skip check if server used within this window. |
 | `server_fast_close` | 0 | If 1, close server connection at end of in-progress transaction when client disconnects. |
@@ -362,22 +362,21 @@ reporter = pool_mode=session reserve_pool_size=2
 
 Use case: same physical PG database, three logical roles with different mode requirements. Cross-ref [`46-roles-privileges.md`](./46-roles-privileges.md) for per-role server-side baseline (statement_timeout, default_transaction_isolation, etc.) — pgBouncer can override `pool_mode` but cannot set PG-side GUCs.
 
-## Prepared Statements (PG17+)
+## Prepared Statements
 
 Pre-1.21 → SQL `PREPARE` / `EXECUTE` tied to specific backend → broken in transaction mode → big perf miss because every query reparsed.
 
-Since pgBouncer 1.21 (Oct 2023) + libpq 17 (Sep 2024):
+Since pgBouncer 1.21 (Oct 2023):
 
-> [!NOTE] PostgreSQL 17 / pgBouncer 1.21
+> [!NOTE] pgBouncer 1.21
 > *"Add support for protocol-level named prepared statements! This is probably one of the most requested features for PgBouncer. Using prepared statements together with PgBouncer can reduce the CPU load on your system a lot... In synthetic benchmarks this feature was able to increase query throughput anywhere from 15% to 250%, depending on the workload."*[^prepstmt-changelog]
 
 Mechanism: pgBouncer caches the protocol-level prepared statement per server connection. On checkout, sends `Parse` to server only if not cached, else just `Bind` + `Execute`.
 
-Three requirements:
+Requirements:
 
-1. **`max_prepared_statements > 0`** in `pgbouncer.ini`. Default is 200 since 1.24[^prepstmt-default] — already enabled out of the box.
-2. **App driver uses protocol-level prepare** (libpq `PQprepare()` / JDBC `PreparedStatement` / psycopg `prepare()` / pgx `Prepare()`). NOT SQL-level `PREPARE foo AS ...`.
-3. **For full transaction-mode safety, PG 17+ libpq with `PQclosePrepared()` / `PQclosePortal()`** so the protocol-level Close support advertised by pgBouncer is honored.
+1. **`max_prepared_statements > 0`** in `pgbouncer.ini`. Default is 200 since 1.24.[^prepstmt-default]
+2. **App driver uses protocol-level named prepare**, not SQL-level `PREPARE`. PostgreSQL 17 libpq's close functions are optional.
 
 Verify via console:
 
@@ -910,7 +909,7 @@ If clients are leaking (long-lived idle connections from buggy app) — set `cli
 [^pause]: https://www.pgbouncer.org/usage.html — *"PgBouncer tries to disconnect from all servers... The command will not return before all server connections have been disconnected."*
 [^prepstmt-changelog]: https://www.pgbouncer.org/changelog.html — 1.21.0 release notes (2023-10-16): *"Add support for protocol-level named prepared statements! This is probably one of the most requested features for PgBouncer. Using prepared statements together with PgBouncer can reduce the CPU load on your system a lot (both at the PgBouncer side and the PostgreSQL side). In synthetic benchmarks this feature was able to increase query throughput anywhere from 15% to 250%, depending on the workload."*
 [^prepstmt-default]: https://www.pgbouncer.org/config.html — `max_prepared_statements` default is **200** since pgBouncer 1.24.0 (https://github.com/pgbouncer/pgbouncer/releases/tag/pgbouncer_1_24_0); 1.21 introduced the setting with default 0. Setting to 0 disables prepared statement support entirely.
-[^pg17-libpq]: https://www.postgresql.org/docs/17/libpq-exec.html — PG17 added `PQclosePrepared()` and `PQclosePortal()` enabling clean transaction-mode prepared statement use with pgBouncer.
+[^pg17-libpq]: https://www.postgresql.org/docs/17/libpq-exec.html — PG17 added `PQclosePrepared()` and `PQclosePortal()`; they are not required for pgBouncer's protocol-level tracking.
 [^peering]: https://www.pgbouncer.org/changelog.html — 1.23.0 release notes (2024-07-03): *"Add support for peering between PgBouncer processes. This allows configuring PgBouncer such that cancellation requests continue to work when multiple different PgBouncer processes are behind a single load balancer."*
 [^authtype]: https://www.pgbouncer.org/config.html — `auth_type` valid values: `cert`, `md5`, `scram-sha-256`, `plain` (deprecated), `trust`, `any`, `hba`, `ldap` (1.25+), `pam`, `peer`.
 [^exporter]: https://github.com/prometheus-community/pgbouncer_exporter — Prometheus exporter for pgBouncer console metrics.

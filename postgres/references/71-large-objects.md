@@ -59,8 +59,8 @@ Five rules drive every LO decision:
 | Binary blob ≤ ~10 MB, sometimes-read | `bytea` column | Single-type-system, replicates cleanly, no orphan-cleanup, TOAST handles compression |
 | Binary blob > 10 MB, sometimes-streamed | LO | Page-level access, `lo_lseek64` + `lo_read` streaming, no per-statement materialization |
 | Binary blob > 1 GB | External store (S3/GCS/MinIO) | `bytea` capped at 1 GB; LO capped at 4 TB but operationally painful at TB scale |
-| Server-side import from filesystem | `lo_import('/path/file')` | Built-in; superuser-only or `pg_read_server_files` role |
-| Server-side export to filesystem | `lo_export(loid, '/path/file')` | Built-in; superuser-only or `pg_write_server_files` role |
+| Server-side import from filesystem | `lo_import('/path/file')` | Superuser by default; explicit EXECUTE grants are highly privileged |
+| Server-side export to filesystem | `lo_export(loid, '/path/file')` | Superuser by default; explicit EXECUTE grants are highly privileged |
 | Application stores file uploads | External store + `bytea` for metadata | Avoids replication amplification, easier backup |
 | Schema already uses LO, can't migrate | Add `lo_manage` trigger | Auto-unlinks LO on row delete/update |
 | Suspect orphan LO eating disk | Run `vacuumlo` | Removes LOs not referenced by any `oid` or `lo`-domain column |
@@ -171,14 +171,13 @@ Documented in [`lo-funcs.html`](https://www.postgresql.org/docs/16/lo-funcs.html
 | `lo_creat(mode int)` | `oid` | Legacy create; pass `INV_READ | INV_WRITE` (= -1) |
 | `lo_create(loid oid)` | `oid` | Create with specified OID, or 0 for auto-assign |
 | `lo_unlink(loid oid)` | `void` | Delete LO and all its pages |
-| `lo_import(path text)` | `oid` | Import server-side file; **superuser-only or `pg_read_server_files` role** |
+| `lo_import(path text)` | `oid` | Import server-side file; restricted to superusers by default |
 | `lo_import(path text, loid oid)` | `oid` | Import with specified OID |
-| `lo_export(loid oid, path text)` | `void` | Export to server-side file; **superuser-only or `pg_write_server_files` role** |
+| `lo_export(loid oid, path text)` | `integer` | Export to server-side file; restricted to superusers by default |
 | `loread(fd int, len int)` | `bytea` | Server-side variant of libpq `lo_read`; note **no underscore** |
 | `lowrite(fd int, data bytea)` | `int` | Server-side variant of libpq `lo_write`; note **no underscore** |
 
-> [!WARNING] `lo_import` / `lo_export` read or write the **server's** filesystem.
-> The path is relative to the postgres backend process. In most managed environments, `pg_read_server_files` / `pg_write_server_files` roles are unavailable and the directory `lo_import` would read is empty. Use client-side LO API or `bytea` upload paths instead.
+> The server-side functions access the server filesystem as the PostgreSQL OS user. They are restricted to superusers by default. Granting EXECUTE to other roles is highly privileged and can enable superuser escalation.[PG16 documentation](https://www.postgresql.org/docs/16/lo-funcs.html)
 
 ### libpq Client-side LO API
 
@@ -337,38 +336,17 @@ with psycopg.connect("dbname=mydb") as conn:
             while chunk := f.read(8192):
                 conn.execute("SELECT lowrite(%s, %s)", (fd, chunk))
         # No need to close fd explicitly — transaction commit releases it
-    # After commit, store the lo oid in a user table
-    conn.execute("INSERT INTO document(filename, content) VALUES (%s, %s)",
-                 ('large_file.bin', lo))
+        # Store the reference in the same transaction as LO creation.
+        conn.execute("INSERT INTO document(filename, content) VALUES (%s, %s)",
+                     ('large_file.bin', lo))
 ```
 
-> [!WARNING] If the transaction rolls back, the LO is still created.
-> `lo_create` writes to `pg_largeobject_metadata`, which is transactional — so an aborted transaction will roll back the LO. Good. But: any LO created and committed without being inserted into a referencing user table is immediately orphaned.
+> [!WARNING] Committed LOs without references become orphans.
+> `lo_create` is transactional: rollback also rolls back the LO. Create the LO and its table reference in the same transaction.
 
-### 3. Detect orphan LOs without running `vacuumlo`
+### 3. Detect orphan candidates
 
-```sql
--- All LOs that no oid or lo column references
-SELECT m.oid
-FROM pg_largeobject_metadata m
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM pg_attribute a
-    JOIN pg_class c ON c.oid = a.attrelid
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    JOIN pg_type t ON t.oid = a.atttypid
-    WHERE c.relkind = 'r'
-      AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-      AND a.attnum > 0
-      AND NOT a.attisdropped
-      AND (t.typname IN ('oid', 'lo'))
-      -- This is approximate: doesn't actually check column values.
-      -- vacuumlo --dry-run does the real check.
-)
-LIMIT 100;
-```
-
-For an exact orphan list, use `vacuumlo --dry-run --verbose mydb` which scans actual column values.
+Use `vacuumlo --dry-run --verbose mydb` to inspect candidates. It considers only columns whose type is named `oid` or `lo`; it cannot detect references in other domains, JSON, or external systems. Audit every reference format before permitting deletion.
 
 ### 4. Audit LO ownership and ACLs cluster-wide
 
@@ -488,26 +466,9 @@ ALTER TABLE document DROP COLUMN content;
 ALTER TABLE document RENAME COLUMN content_lo TO content;
 ```
 
-### 10. Schedule `vacuumlo` via `pg_cron`
+### 10. Schedule orphan cleanup
 
-```sql
-CREATE EXTENSION IF NOT EXISTS pg_cron;
-
--- Nightly at 03:00 cluster time
-SELECT cron.schedule(
-    'vacuumlo-mydb',
-    '0 3 * * *',
-    $$SELECT lo_unlink(oid)
-      FROM pg_largeobject_metadata m
-      WHERE NOT EXISTS (
-          -- This is approximate; vacuumlo binary is more thorough.
-          -- See vacuumlo CLI for the real algorithm.
-          SELECT 1 FROM document WHERE content = m.oid
-      )$$
-);
-```
-
-For accuracy, schedule the actual `vacuumlo` binary via system cron instead:
+After auditing every reference format, schedule the `vacuumlo` binary through system cron. Start with `vacuumlo --dry-run --verbose mydb` and review its candidates; its `oid` and `lo` column scan cannot detect references stored in other forms.
 
 ```cron
 0 3 * * * /usr/bin/vacuumlo --verbose mydb >> /var/log/vacuumlo.log 2>&1
@@ -577,13 +538,13 @@ Migrate any user-defined domains to the `lo` domain or to a plain `oid` column.
 
 ## Gotchas / Anti-patterns
 
-1. **`oid` column without `lo_manage` trigger → silent orphan growth.** Deleting a row that references an LO does NOT unlink the LO. Either install `lo_manage` (see Recipe 1) or schedule `vacuumlo` (Recipe 10).
+1. **An `oid` column without lifecycle management can leave orphan large objects.** Use `lo_manage` only when each managed LO is referenced by a single row; its deletion behavior can break shared references. Before using `vacuumlo`, audit all reference-column types and take a verified backup.
 2. **`vacuumlo` skips columns of user-defined domains over `oid`.** Verbatim: *"Only types with these names are considered; in particular, domains over them are not considered."* Use `lo` domain or plain `oid`.
 3. **LO descriptors expire at transaction end.** `lo_open` returns an `fd` valid only until `COMMIT` or `ROLLBACK`. Long-running batch jobs that open many LOs across multiple transactions must re-open each one.
 4. **`lo_open INV_WRITE` fails in read-only transactions.** Including transactions on hot standbys. LO writes are primary-only.
 5. **LO API incompatible with libpq pipeline mode.** Verbatim: *"Client applications cannot use these functions while a libpq connection is in pipeline mode."*
 6. **`pg_largeobject` is superuser-only.** Non-superusers cannot `SELECT` from it directly. Use `lo_get` / `lo_open`+`loread` which apply per-LO privilege checks.
-7. **`lo_import` / `lo_export` are superuser-only by default.** They read/write the **server's** filesystem. Granted to `pg_read_server_files` / `pg_write_server_files` predefined roles since PG11.
+7. **Server-side `lo_import` / `lo_export` access the server filesystem.** They are superuser-only by default; execute privilege may be granted explicitly, but doing so is dangerous. The server-file predefined roles do not automatically grant function execution. [PG16 server-side LO functions](https://www.postgresql.org/docs/16/lo-funcs.html)
 8. **LO size limit per single call is `INT_MAX` (~2 GB).** `lo_read`, `lo_write`, `lo_truncate` reject `len > INT_MAX`. Use chunked I/O.
 9. **`lo_lseek` / `lo_tell` cap at 2 GB offset.** Use the 64-bit variants `lo_lseek64` / `lo_tell64` (PG 9.3+) for LOs > 2 GB.
 10. **LOs are pages, not files.** Missing page numbers read as zeros. An LO can be sparse — written at offset 1 GB, the intermediate pages don't exist on disk. `octet_length(lo_get(oid))` returns the full size including sparse zeros, which may differ from the storage footprint.
@@ -592,7 +553,7 @@ Migrate any user-defined domains to the `lo` domain or to a plain `oid` column.
 13. **`pg_dump` always dumps LO contents in full.** No `--data-only` shortcut to skip LO data. PG17+ restores in batches/parallel; pre-PG17 restore can hit transaction-size limits on dumps with many LOs.
 14. **`pg_dump --schema-only` does not skip LO metadata if `-b` (--blobs) is on.** Use `-B` / `--no-blobs` explicitly to omit LOs.
 15. **Logical replication does NOT replicate `pg_largeobject` contents.** Subscriber sees the `oid` reference in user-table columns but the LO data is missing. Workaround: parallel sync of LO pages via separate logic, or migrate to `bytea`.
-16. **`lo_manage` trigger only fires on its attached table.** If two tables reference the same LO, dropping one row leaves the LO orphan-from-the-other-table's-perspective. The extension has no reference counting.
+16. **`lo_manage` has no reference counting.** Deleting or changing its managed reference unlinks the LO even if another row or table still refers to it. Do not use it for shared LOs.
 17. **`vacuumlo --limit` defaults to 1000.** Removes up to 1000 LOs per transaction. For very large orphan populations, run multiple times.
 18. **`vacuumlo` requires connect privilege on every database it scans.** When run against `--all`, must have access everywhere.
 19. **`lo_compat_privileges = on` disables ALL per-LO access checks.** Setting it globally is a security regression. Use sparingly and only with eyes open.

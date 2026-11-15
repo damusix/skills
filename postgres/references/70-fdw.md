@@ -27,8 +27,8 @@ Query external data sources as if they were local tables. `postgres_fdw` for PG-
 
 ## When to Use This Reference
 
-> [!WARNING] Pushdown is opt-in, not automatic
-> `postgres_fdw` defaults to `use_remote_estimate=false`. Planner uses *local* statistics (none, for foreign tables) → typically yanks all rows back, filters locally. Pushdown of WHERE/JOIN/aggregate happens **only** when planner has enough info — usually means `use_remote_estimate=true` (verbatim cost) or explicit `ANALYZE foreign_table` (sampling). Without it `EXPLAIN VERBOSE` shows remote SQL = `SELECT * FROM remote` and local Filter — can cause incorrect query plans and full-table transfers on large remote tables.
+> [!WARNING] Verify remote execution
+> `postgres_fdw` pushes eligible built-in immutable predicates by default. `use_remote_estimate` and `ANALYZE` influence cost estimates; neither makes an unsafe predicate shippable. Inspect `EXPLAIN VERBOSE` and match remote types and collations. [PG16 documentation](https://www.postgresql.org/docs/16/postgres-fdw.html#POSTGRES-FDW-REMOTE-QUERY-OPTIMIZATION).
 
 Use FDW when:
 
@@ -52,7 +52,7 @@ Five rules:
 1. **Four DDL objects required** to query external data. `CREATE FOREIGN DATA WRAPPER` (extension installs it), `CREATE SERVER` (named endpoint), `CREATE USER MAPPING` (auth credentials per role), `CREATE FOREIGN TABLE` (or `IMPORT FOREIGN SCHEMA`). All four must exist before any query works.
 2. **`IMPORT FOREIGN SCHEMA`** bulk-imports remote table definitions. Avoids hand-writing `CREATE FOREIGN TABLE` for every remote table.
 3. **Pushdown** decides what executes remotely vs locally. `EXPLAIN VERBOSE` shows the remote SQL string sent to the foreign server — the canonical "is my filter being pushed down?" diagnostic. Aggregates / joins / ORDER BY / LIMIT pushdown landed gradually across PG versions.
-4. **`postgres_fdw`** is the canonical PG-to-PG FDW (contrib, trusted PG13+). Uses libpq + extended query protocol. Async append (PG14+) parallelizes cross-server scans. Batch insert (PG14+) groups INSERT into N-row batches.
+4. **`postgres_fdw`** is the canonical PG-to-PG FDW. Async append (PG14+) can overlap eligible foreign scans; batch insert groups INSERT into batches.
 5. **`file_fdw`** reads server-side CSV/TSV/binary files via the COPY protocol. Needs `pg_read_server_files` role or superuser — managed environments usually block it.
 
 ## Decision Matrix
@@ -73,8 +73,8 @@ Five rules:
 
 **Smell signals:**
 
-- `EXPLAIN VERBOSE` on a foreign-table query shows `Remote SQL: SELECT ... FROM table` (no filter) — means filter is not pushed down. Run `ANALYZE foreign_table` or set `use_remote_estimate=true`.
-- `pg_stat_activity` on the foreign server shows backends in `idle in transaction` originating from your local cluster — means `keep_connections=on` is leaving idle pinned conns. Tune `idle_session_timeout` on the remote.
+- `EXPLAIN VERBOSE` shows a filter absent from `Remote SQL`: check whether its functions, operators, types, and collations are safe to ship. Statistics affect cost estimates, not shippability.
+- Remote backends `idle in transaction` can indicate that the local transaction remains open. `keep_connections=on` retains connections after transaction end, but does not itself keep the remote transaction open.
 - Bulk `INSERT INTO foreign_t SELECT FROM local_t` is slow — set `batch_size=1000` on the foreign server or table.
 
 ## Syntax / Mechanics
@@ -170,7 +170,7 @@ CREATE FOREIGN TABLE [ IF NOT EXISTS ] table_name (
 
 Per-column `OPTIONS`: `column_name 'remote_name'` (map local col name to a differently-named remote col). Useful when remote schema uses snake_case but local prefers something else, or when you cannot otherwise change the local API.
 
-Table constraints (`PRIMARY KEY`, `FOREIGN KEY`, `UNIQUE`) are **not** enforced for foreign tables — they are declarations the planner uses for join planning. The actual constraint lives (or doesn't) on the remote.
+Foreign tables do not support `PRIMARY KEY`, `UNIQUE`, or `FOREIGN KEY` constraints. `CHECK` and `NOT NULL` constraints can be declared; ensure the remote data satisfies them because PostgreSQL may rely on them when planning.
 
 Foreign tables can be partitions of a partitioned table since PG11. They can also be partitions parent in PG12+ via `INHERITS`.
 
@@ -193,7 +193,7 @@ Bulk-imports all (or `LIMIT TO`/`EXCEPT` filtered) remote table definitions as f
 
 | Option | Default | Effect |
 |---|---|---|
-| `import_collate` | `true` (PG18+) | Include `COLLATE` from remote |
+| `import_collate` | `true` | Include `COLLATE` from remote |
 | `import_default` | `false` | Include column `DEFAULT` expressions |
 | `import_generated` | `true` (PG12+) | Include `GENERATED` column expressions |
 | `import_not_null` | `true` | Include `NOT NULL` constraints |
@@ -237,7 +237,7 @@ Look at `Remote SQL:` — if it shows `SELECT customer_id, sum(total) FROM ... W
 
 ### `postgres_fdw` deep dive
 
-Trusted contrib extension (PG13+). Cross-cluster query for PG-to-PG.
+Contrib extension for PG-to-PG access.
 
 **Server-level options (PG16 baseline):**
 
@@ -556,7 +556,7 @@ CREATE SERVER analytics_db
 
 CREATE USER MAPPING FOR app_user
     SERVER analytics_db
-    OPTIONS (user 'fdw_reader', use_scram_passthrough 'true');  -- PG18+
+    OPTIONS (user 'fdw_reader', password '<remote-password>');
 
 -- Import all tables from remote schema
 IMPORT FOREIGN SCHEMA reporting
@@ -597,12 +597,7 @@ Limit
                           GROUP BY customer_id
 ```
 
-If `Remote SQL` shows only `SELECT * FROM public.orders` with no WHERE / GROUP BY, run:
-
-```sql
-ALTER FOREIGN TABLE orders_remote OPTIONS (SET use_remote_estimate 'true');
-ANALYZE orders_remote;  -- alternative / complement
-```
+If a predicate or aggregate is missing from `Remote SQL`, inspect expression shippability and the chosen plan. `ANALYZE` and `use_remote_estimate` improve estimates but do not make an unsafe expression shippable.[^pg-fdw-16]
 
 ### Recipe 3: bulk migration with batched INSERT
 
@@ -620,7 +615,7 @@ ANALYZE local_orders;
 COMMIT;
 ```
 
-With `batch_size=1000` on the foreign table the remote roundtrips drop dramatically. Watch `pg_stat_activity` on remote for the actual SQL — should see batched INSERTs or COPY-style streaming.
+For reads, `fetch_size` controls rows fetched per round trip. `batch_size` applies to inserts into a foreign table, not to this local-table insert.[^pg-fdw-16]
 
 ### Recipe 4: federated query across two remote clusters
 
@@ -812,7 +807,7 @@ SELECT pg_cancel_backend(<local_pid>);
 
 ## Gotchas / Anti-patterns
 
-1. **Pushdown is opt-in.** Without `use_remote_estimate=true` (or recent `ANALYZE`) planner assumes 1 row from foreign table and picks NestedLoop with foreign as inner. Catastrophic on big remote tables. Always check `EXPLAIN VERBOSE` `Remote SQL:` line.
+1. **Pushdown is not controlled by `use_remote_estimate`.** PostgreSQL ships eligible expressions automatically; remote estimates affect planning cost. Inspect `EXPLAIN VERBOSE` and its `Remote SQL` to see what is shipped.[^pg-fdw-16]
 
 2. **Volatile functions block pushdown.** `WHERE col = random_uuid()` won't push the predicate. Volatile-marked functions stay local even if the value is constant for the query.
 
@@ -824,17 +819,17 @@ SELECT pg_cancel_backend(<local_pid>);
 
 6. **`batch_size` only applies to INSERT.** UPDATE/DELETE go one row at a time. `RETURNING` clauses may force `batch_size=1`.
 
-7. **Foreign tables ignore most constraints.** `PRIMARY KEY` / `UNIQUE` / `FOREIGN KEY` / `CHECK` declared on foreign table are planner hints only — not enforced. Verify constraints live on remote.
+7. **Foreign-table constraints are not generally enforced locally.** Supported CHECK and NOT NULL declarations are assumed true by the planner; inconsistent remote data can yield incorrect query results. Enforce invariants on the remote server. Primary key, unique and foreign key constraints cannot be declared on a foreign table.[^cre-ft]
 
 8. **`IMPORT FOREIGN SCHEMA` is one-shot.** No re-import / merge mode. To refresh after remote DDL, drop and re-import the affected tables.
 
 9. **`file_fdw` requires server-side filesystem access.** Role needs `pg_read_server_files` (or superuser). Managed environments usually deny this.
 
-10. **`dblink_connect_u` is `_u` for unauth.** Bypasses pg_hba's authentication for the role — superuser only on PG10+. Forbidden in managed envs. Use `dblink_connect` (which requires you've configured authentication).
+10. **`dblink_connect_u` permits non-superusers to use authentication methods that can expose the server's identity or credentials.** It is installed with public access revoked; grant it only after evaluating the security risk. Remote `pg_hba.conf` authentication still applies.[^dblink]
 
 11. **`postgres_fdw` doesn't share connections across roles.** Each (local_role, server) pair gets its own pinned connection. Long pg_stat_activity tails on remote when many roles use FDW.
 
-12. **Statement-level FOR UPDATE / FOR SHARE not pushed down.** Per docs: row locks taken on foreign tables are local-only — they don't lock the remote rows. Real lock-aware federation needs application-level coordination.
+12. **`SELECT FOR UPDATE` on a postgres_fdw foreign table locks the remote rows.** Check transaction boundaries and remote lock behavior when coordinating writers; use `EXPLAIN VERBOSE` to inspect the remote SQL.[^pg-fdw-16]
 
 13. **`TRUNCATE` requires `truncatable=true`** on foreign table (default true since PG14). Pre-PG14 there is no `TRUNCATE` for foreign tables — `DELETE FROM foreign_t` instead (much slower).
 
@@ -856,7 +851,7 @@ SELECT pg_cancel_backend(<local_pid>);
 
 22. **`SCRAM passthrough` requires SCRAM at both ends.** If local client uses `md5` or `password` auth, passthrough fails. Audit `pg_hba.conf` on both sides before flipping `use_scram_passthrough=true`.
 
-23. **No DDL replication via FDW.** `ALTER TABLE foreign_t ADD COLUMN ...` works ONLY on the foreign-table definition locally — does not run on remote. Real DDL replication needs logical replication or external tooling (see [`74-logical-replication.md`](./74-logical-replication.md)).
+23. **No DDL replication via FDW or native logical replication.** `ALTER FOREIGN TABLE` changes the local definition, not the remote table. Coordinate schema changes separately.
 
 ## See Also
 

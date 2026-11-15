@@ -83,7 +83,7 @@ Three smell signals that LISTEN/NOTIFY is the wrong tool:
 
 - **Your design requires durability** ("the consumer was down for 5 minutes; it should still process every event that happened during those 5 minutes"). LISTEN/NOTIFY drops messages for any non-LISTENing session. Move the messages to a queue table.
 - **Your payload is approaching 1 KB.** The 8000-byte ceiling is hard. If you are anywhere near it, the design will fail on a slightly larger row. Use the table-stores-data + NOTIFY-the-ID pattern (Recipe 4).
-- **You see `pg_notification_queue_usage()` climbing toward 1.0.** A slow consumer is holding the queue back, which can block every other writer's COMMIT once full. Recipe 9 explains the runbook.
+- **You see `pg_notification_queue_usage()` climbing toward 1.0.** A listening session in a long transaction can prevent queue cleanup. At a full queue, transactions issuing NOTIFY fail at commit; other writers are not generally blocked.[^notify]
 
 
 ## Syntax / Mechanics
@@ -117,7 +117,7 @@ NOTIFY channel [ , payload ]
 
 Verbatim purpose: *"The `NOTIFY` command sends a notification event together with an optional 'payload' string to each client application that has previously executed `LISTEN channel` for the specified channel name in the current database. Notifications are visible to all users."*[^notify]
 
-Note the *"Notifications are visible to all users"* clause — there is no `GRANT` / `REVOKE` for NOTIFY channels. Any role that can connect to the database can send and receive notifications. This is a fact worth surfacing when designing multi-tenant applications: tenant A's NOTIFY on channel `cache_invalidate` is visible to tenant B's LISTENing session. Either use tenant-disambiguated channel names (`cache_invalidate_tenant_42`) or carry the tenant ID in the payload.
+Notifications are visible to all users. Channel names and payloads do not provide access control or confidentiality; any database user can listen or send. Never put secrets in a notification.[^notify]
 
 
 ### UNLISTEN
@@ -175,7 +175,7 @@ Two consequences:
 - **Intra-transaction ordering is preserved.** A transaction that issues `NOTIFY ch, '1'; NOTIFY ch, '2'; NOTIFY ch, '3';` delivers them as `'1'`, `'2'`, `'3'` — never reordered.
 - **Inter-transaction ordering follows commit order.** If transaction A's COMMIT lands before transaction B's COMMIT, A's notifications arrive at listeners before B's. This is **not** the order in which `NOTIFY` was issued by the senders — it is the order in which the transactions completed COMMIT.
 
-There is no guarantee about the order across **channels** within one transaction. `NOTIFY a, 'x'; NOTIFY b, 'y';` may deliver in either order at the listener.
+The ordering guarantee also applies across channels within the same transaction.
 
 
 ### Duplicate suppression
@@ -216,9 +216,7 @@ Both LISTEN and NOTIFY are transactional in the sense that their effects materia
 
 ### Two-phase commit incompatibility
 
-Verbatim: *"A transaction that has executed LISTEN cannot be prepared for two-phase commit."*[^listen-2pc]
-
-This is the same restriction that applies to temp tables, cursors `WITH HOLD`, and a few other session-state surfaces — see [`41-transactions.md`](./41-transactions.md) gotcha #17. If your application uses `PREPARE TRANSACTION` (a federated-write protocol with an external transaction manager), the transactions that issue `PREPARE` cannot also issue `LISTEN`. Use a separate connection for LISTEN duties.
+Transactions that execute `LISTEN`, `UNLISTEN`, or `NOTIFY` cannot be prepared for two-phase commit. Use a separate connection for notifications.[^listen-2pc][^notify]
 
 
 ### libpq client API
@@ -246,14 +244,14 @@ Three GUCs are relevant (the last two are PG17+):
 
 | GUC | Default | Context | Purpose |
 |---|---|---|---|
-| (queue size) | — | — | Pre-PG17 the queue was effectively unbounded by GUC; in practice limited by disk. |
+| (queue size) | 8 GB in a standard installation | fixed before PG17 | Queue exhaustion makes notifying transactions fail at commit.[^notify] |
 | `max_notify_queue_pages` | `1048576` (PG17+) | server-start | *"Specifies the maximum amount of allocated pages for NOTIFY / LISTEN queue. The default value is 1048576. For 8 KB pages it allows to consume up to 8 GB of disk space."*[^max-notify-pages] |
 | `notify_buffers` | `16` (PG17+) | server-start | *"Specifies the amount of shared memory to use to cache the contents of `pg_notify`. If this value is specified without units, it is taken as blocks, that is BLCKSZ bytes, typically 8kB. The default value is 16."*[^notify-buffers] |
 
 > [!NOTE] PostgreSQL 17
 > Both `max_notify_queue_pages` and `notify_buffers` were added in PG17 as part of the broader SLRU-cache configurability work. Verbatim from the PG17 release notes: *"Allow the SLRU cache sizes to be configured (Andrey Borodin, Dilip Kumar, Alvaro Herrera). The new server variables are commit_timestamp_buffers, multixact_member_buffers, multixact_offset_buffers, notify_buffers, serializable_buffers, subtransaction_buffers, and transaction_buffers."*[^pg17-slru] Pre-PG17 the queue's cache size was fixed in source; there was no way to tune it from `postgresql.conf`.
 
-**Backpressure rule:** if the queue fills (one or more listeners is far behind and the queue cannot advance), `NOTIFY` calls on **other** sessions begin to block. This is the canonical "stuck listener jams the whole cluster" failure mode. The diagnostic is `pg_notification_queue_usage()` returning a fraction close to 1.0; the fix is to either kick the stuck listener (cancel/terminate the backend) or raise `max_notify_queue_pages` on PG17+ to buy time. Recipe 9 walks the runbook.
+**Queue-full rule:** transactions that executed `NOTIFY` fail at commit when the queue is full. A listener inside a long transaction can prevent cleanup; the server logs the responsible session once the queue is half full. End that transaction, or terminate the session if necessary.[^notify]
 
 The function `pg_notification_queue_usage()` reports the fraction in `[0.0, 1.0]`:
 
@@ -385,7 +383,7 @@ SELECT pg_notify('change_event', id::text) FROM inserted;
 
 Listener: receive the notification, parse the payload as the integer ID, `SELECT payload FROM change_events WHERE id = $1`. The application-side retention policy (e.g., `DELETE FROM change_events WHERE created_at < now() - interval '7 days'` from a `pg_cron` job — see [`98-pg-cron.md`](./98-pg-cron.md)) prevents unbounded growth.
 
-This pattern also solves the at-most-once-while-LISTENing problem partially: a listener that disconnects and reconnects can read missed `change_events` rows by ID range from the last seen ID, gaining a poor-man's replay. Combine with a `last_processed_id` checkpoint per listener (stored in a separate `listener_state` table) for full reliability.
+An ID-only high-water mark is not a reliable replay cursor: sequence values are allocated before commit, so a lower ID can commit after a higher ID has been checkpointed. Use a durable queue with per-consumer acknowledgment and safe claiming, or logical decoding with a replication slot.
 
 
 ### Recipe 5: Dynamic channel name via pg_notify()
@@ -406,7 +404,7 @@ Tenant-42's listener does `LISTEN tenant_42;` and receives only its own events.
 
 **Anti-pattern note:** doing this with `EXECUTE format('NOTIFY %I, %L', ...)` is unnecessarily heavy and rebuilds a plan on every call. The `pg_notify()` function form is the documented way to construct channel names at runtime.
 
-**Multi-tenant security warning:** see gotcha #6 — there are no privileges on NOTIFY channels. Any role with database connect rights can LISTEN to `tenant_42`. Use the payload to carry a tenant-bound authentication signal if confidentiality matters.
+**Multi-tenant security warning:** channel names do not restrict access. Any role that can connect can listen or send; payload authentication does not make the payload confidential. Keep sensitive data in access-controlled tables.
 
 
 ### Recipe 6: Listener in Python with psycopg
@@ -478,7 +476,7 @@ The `be_pid` field in libpq's `PGnotify` struct (psycopg exposes as `.pid`) is t
 
 ### Recipe 9: Diagnose a stuck notification queue
 
-Symptom: `pg_notify` or `NOTIFY` statements start blocking on `wait_event = NotifyQueue` or COMMITs stall. The queue is filling because a listener is not consuming.
+Symptom: notification queue usage keeps rising or transactions that issued `NOTIFY` fail at commit. A listening session in a long transaction can prevent queue cleanup; check the server's queue warnings for the responsible PID.[^notify]
 
 ```sql
 -- 1. Check current queue usage
@@ -506,13 +504,7 @@ ORDER BY state_change ASC;
 --    backends whose recent queries included LISTEN.
 ```
 
-If a backend appears `idle` and has not made progress for hours, it is likely a stuck or hung consumer. Recovery options:
-
-1. **Cancel the stuck backend:** `SELECT pg_cancel_backend(<pid>);` — cooperative, may not work if the backend is wedged.
-2. **Terminate the stuck backend:** `SELECT pg_terminate_backend(<pid>);` — nuclear option, forces disconnect. The disconnect auto-UNLISTENs the orphaned subscription, freeing the queue tail.
-3. **PG17+ only:** raise `max_notify_queue_pages` to buy time (server restart required).
-
-Prevention: every listening application should have a watchdog that kills its own connection after N minutes of no activity, or use a separate fast-fail connection for LISTEN with idle-session timeouts (see [`41-transactions.md`](./41-transactions.md) Recipe 1 for `idle_session_timeout`).
+Look for the blocking listener named in server warnings once the queue is half full. Ask it to end its long transaction; if necessary, terminate that identified session. An idle listener outside a transaction is not by itself evidence of a stuck queue. Increasing `max_notify_queue_pages` on PG17+ requires restart and does not fix the underlying transaction.
 
 
 ### Recipe 10: Audit current listeners and channels in this session
@@ -561,9 +553,9 @@ SHOW max_notify_queue_pages;
 Both GUCs are server-start-only — they cannot be set per-session, per-role, or with `ALTER SYSTEM` and a reload.
 
 
-### Recipe 13: NOTIFY from a deferred constraint trigger
+### Recipe 13: NOTIFY from a statement trigger with a transition table
 
-A constraint trigger that fires at COMMIT (`DEFERRABLE INITIALLY DEFERRED`) is a clean way to consolidate notifications: instead of one notify per row in a batch, fire one summary notify after the constraint pass.
+A statement-level AFTER trigger can summarize the changed rows once per statement. The notification remains transactional and is delivered only after commit.
 
 ```sql
 CREATE TABLE audit_changes (id bigserial PRIMARY KEY, table_name text, change_count int);
@@ -604,7 +596,7 @@ The `FOR EACH STATEMENT` trigger with a transition table (`REFERENCING NEW TABLE
 
 5. **Duplicate (channel, payload) within one transaction are collapsed to one delivery.** Verbatim docs rule. Counter-style use ("one NOTIFY per event, count at the listener") silently undercounts within a transaction. Either include a unique payload or rely on table state, not notify count.
 
-6. **No privileges or RLS on channels.** Verbatim: *"Notifications are visible to all users."* Any role with `CONNECT` on the database can LISTEN to any channel. Channel names are an open namespace. For multi-tenant isolation, use tenant-disambiguated channel names AND carry an auth/integrity signal in the payload, OR don't put confidential data in the payload at all.
+6. **No privileges or RLS on channels.** Any database user can listen or send. Neither tenant-specific channel names nor payload authentication provides confidentiality; keep sensitive data in access-controlled tables.[^notify]
 
 7. **Same-database scope only.** A notification in database `app` is invisible to a listener in database `analytics` on the same cluster. There is no cross-database delivery. Workers that connect to a different database than the publisher will silently never receive.
 
@@ -618,7 +610,7 @@ The `FOR EACH STATEMENT` trigger with a transition table (`REFERENCING NEW TABLE
 
 12. **Long-running transactions delay in-flight progress notifications.** A 30-minute transaction issuing `NOTIFY progress, '50%'` etc. delivers them all in a burst at the final COMMIT — useless for live progress. Use autonomous-transaction-style writes (separate connection, separate transaction) for live status.
 
-13. **Stuck listener can jam the whole cluster's notify pipeline.** When `pg_notification_queue_usage()` approaches 1.0, new `NOTIFY` calls block on `NotifyQueue` LWLock. Mitigation: kick the stuck backend with `pg_terminate_backend` or, on PG17+, temporarily raise `max_notify_queue_pages` and restart.
+13. **A long transaction in a listening session can prevent queue cleanup.** When the queue fills, transactions that issued `NOTIFY` fail at commit. Find the responsible session in the server warning and end its transaction.[^notify]
 
 14. **Transaction-mode pgBouncer is incompatible with LISTEN.** Session state including LISTEN registrations is lost between transactions in transaction-mode pooling. LISTENing workers must use direct connections or session-mode pooling with `server_reset_query`.
 
@@ -628,7 +620,7 @@ The `FOR EACH STATEMENT` trigger with a transition table (`REFERENCING NEW TABLE
 
 17. **`UNLISTEN` of an unsubscribed channel is silent.** No error, no warning. Misnamed channels in `UNLISTEN` calls fail silently.
 
-18. **No timeout, no error on payload overflow at the listener.** The 8000-byte limit is enforced at the publisher. There is no listener-side hint that earlier payloads were dropped due to a stuck queue or that anything is wrong — the listener just doesn't see them.
+18. **There is no delivery receipt.** An oversized payload errors at the sender, and a full queue causes notifying transactions to fail at commit. A disconnected listener has no way to recover missed notifications.[^notify]
 
 19. **`pg_notify` is a regular SQL function — it can be called from inside SELECT queries.** This is mostly fine but means a trigger-side `pg_notify` runs once per row of the trigger's invocation; combined with statement triggers using transition tables this can produce surprising fan-out. See Recipe 3 vs Recipe 13.
 
@@ -638,7 +630,7 @@ The `FOR EACH STATEMENT` trigger with a transition table (`REFERENCING NEW TABLE
 
 22. **The `notify_buffers` SLRU cache is small by default (128 kB).** A heavy notify workload can cause cache misses on the SLRU, surfacing as `NotifyBuffer` / `NotifySLRU` LWLock waits. On PG17+ raise `notify_buffers` after measuring the wait events; on pre-PG17 there is no tuning knob.
 
-23. **Notify channels are unbounded — there is no `CREATE CHANNEL` or `DROP CHANNEL`.** Any string is a valid channel name. There is no catalog enumerating "the channels in use" beyond inspecting `pg_listening_channels()` per active session. Documenting the channel taxonomy is the application's responsibility.
+23. **There is no `CREATE CHANNEL` or `DROP CHANNEL`.** Channel names must be nonempty and follow identifier length limits; `NOTIFY` uses SQL identifier syntax, while `pg_notify` takes text. See <https://www.postgresql.org/docs/16/sql-notify.html>.
 
 
 ## See Also

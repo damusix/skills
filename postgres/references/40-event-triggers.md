@@ -52,7 +52,7 @@ Five rules that drive every event-trigger decision:
 
 4. **You cannot `ROLLBACK` from inside, but you can `RAISE EXCEPTION` to abort the DDL.** A `ddl_command_start` trigger that raises stops the DDL from executing at all. A `ddl_command_end` trigger that raises causes the DDL effects to roll back (the actions happened, the transaction unwinds).
 
-5. **`CREATE EVENT TRIGGER` is superuser-only.** Verbatim: *"Only superusers can create event triggers."*[^create-et] On PG17+ a buggy event trigger can be bypassed via `SET event_triggers = off` rather than restarting in single-user mode.[^pg17-guc] Pre-PG17, single-user mode is the only escape hatch — verbatim: *"Event triggers are disabled in single-user mode."*[^create-et]
+5. **`CREATE EVENT TRIGGER` is superuser-only.** On PG17+, a superuser can start a session with `event_triggers=off` to bypass even a broken login trigger; existing sessions can set it off. Single-user mode also disables event triggers.[^create-et][^pg17-guc]
 
 > [!WARNING] Login event triggers on standbys must not write
 > A `login` event trigger fires on standby servers too. Any write inside it will fail because standbys are read-only — and that failure will prevent every login. Verbatim: *"To prevent servers from becoming inaccessible, such triggers must avoid writing anything to the database when running on a standby."*[^pg17-login]
@@ -67,7 +67,7 @@ Five rules that drive every event-trigger decision:
 | Detect a full-table rewrite                                       | `table_rewrite` + `pg_event_trigger_table_rewrite_reason()`  | Polling `pg_stat_progress_*`                       | Fires *before* the rewrite begins, with bitmap of the reason (persistence/default/type/AM change)   |
 | Run per-session setup on login (PG17+)                            | `login` event trigger                                        | Client-side connection-init scripts                | Server-side login event runs even for tools that bypass psql's `~/.psqlrc`                          |
 | Emergency-disable a buggy event trigger on PG17+                  | `SET event_triggers = off` (superuser session)               | Restarting in single-user mode                     | GUC-based disable is per-session and avoids cluster downtime                                       |
-| Emergency-disable a buggy event trigger on PG≤16                  | `postgres --single` (single-user mode)                       | Trying to `DROP EVENT TRIGGER` from a live session | The trigger blocks every DDL including its own DROP                                                |
+| Emergency-disable a broken event trigger on PG≤16                 | Disable/drop it from a working privileged session, or use single-user mode | Assuming it blocks its own DROP | Event-trigger DDL itself does not fire event triggers[^et-overview] |
 | Temporarily disable without dropping                              | `ALTER EVENT TRIGGER ... DISABLE`                            | DROP + later recreate                              | Disabled triggers stay in catalog; metadata + ACL preserved                                        |
 | Replicate DDL to a secondary cluster                              | `ddl_command_end` + custom queue table                       | Native logical replication                         | Logical replication has no native DDL replication (see [74](./74-logical-replication.md))           |
 | Cause DDL to fire on a standby's event triggers                   | `ENABLE REPLICA` mode + `session_replication_role = replica` | `ENABLE` (default origin-only)                     | Only ALWAYS / REPLICA modes fire on the replication apply path                                     |
@@ -90,7 +90,7 @@ Event triggers fire on one of five named events.
 | `ddl_command_start`  | Before any `CREATE`/`ALTER`/`DROP`/`SECURITY LABEL`/`COMMENT`/`GRANT`/`REVOKE`/`SELECT INTO` | `TG_TAG` (and `TG_EVENT` for context)                  | PG 9.3          |
 | `ddl_command_end`    | After the same commands; before transaction commit                                 | `pg_event_trigger_ddl_commands()`                         | PG 9.3          |
 | `sql_drop`           | Just before `ddl_command_end` for any DROP; after catalog rows are gone           | `pg_event_trigger_dropped_objects()`                      | PG 9.3          |
-| `table_rewrite`      | Just before an `ALTER TABLE`/`ALTER TYPE`/`ALTER MATERIALIZED VIEW` table rewrite | `pg_event_trigger_table_rewrite_oid()` / `..._reason()`   | PG 9.5          |
+| `table_rewrite`      | Just before certain `ALTER TABLE`/`ALTER TYPE` table rewrites | `pg_event_trigger_table_rewrite_oid()` / `..._reason()` | PG 9.5 |
 | `login`              | After authentication succeeds, before the first client query                       | `current_user`, `pg_stat_activity`, normal SQL            | PG 17           |
 
 > [!NOTE] PostgreSQL 17
@@ -244,7 +244,7 @@ Verbatim synopsis:[^drop-et]
 
     DROP EVENT TRIGGER [ IF EXISTS ] name [ CASCADE | RESTRICT ]
 
-Notable asymmetry with `CREATE EVENT TRIGGER`: only the *owner* (not necessarily a superuser) can drop. Verbatim: *"To execute this command, the current user must be the owner of the event trigger."*[^drop-et] But since only a superuser can create one in the first place, the owner starts out as a superuser — though `ALTER EVENT TRIGGER ... OWNER TO some_role` can hand it off.
+Only the owner can drop an event trigger; `ALTER EVENT TRIGGER ... OWNER TO` requires the new owner to be a superuser. See <https://www.postgresql.org/docs/16/sql-altereventtrigger.html>.
 
 ### Login Event Triggers (PG17+)
 
@@ -337,7 +337,7 @@ The canonical compliance/drift pattern. Use `ddl_command_end` so the audit captu
         ON ddl_command_end
         EXECUTE FUNCTION audit_ddl();
 
-The `SECURITY DEFINER` + pinned `search_path` pattern is required because the trigger fires under whichever role issued the DDL — and may not have INSERT on the audit table. The pinned search_path defeats SQL-injection through schema lookup (see [06-functions.md](./06-functions.md)). For production compliance, [51-pgaudit.md](./51-pgaudit.md) is the better tool — its scope and durability are wider — but this recipe shows the mechanism.
+The `SECURITY DEFINER` + pinned `search_path` pattern lets a role without direct INSERT privilege write the audit table. Inside the function `current_user` is its owner, not the DDL issuer; `session_user` records the login identity, but does not identify a role selected with `SET ROLE`. Audit rows roll back with the transaction. For production compliance, consider [51-pgaudit.md](./51-pgaudit.md).
 
 ### Recipe 2: Capture dropped objects
 
@@ -397,7 +397,7 @@ The `WHERE original` filter excludes cascaded drops — useful when `DROP SCHEMA
         WHEN TAG IN ('DROP TABLE')
         EXECUTE FUNCTION refuse_drop_table();
 
-Operationally: a superuser can still issue `SET event_triggers = off; DROP TABLE foo; SET event_triggers = on;` to bypass this on PG17+. Pre-PG17 the only bypass is single-user mode. This is *defense in depth*, not a security guarantee — anyone with superuser can always bypass.
+Operationally: a superuser can issue `SET event_triggers = off; DROP TABLE foo; SET event_triggers = on;` on PG17+. On older versions, a privileged session can disable or drop the event trigger itself; event-trigger DDL does not fire event triggers. This is defense in depth, not a security guarantee.
 
 ### Recipe 4: Monitor table rewrites for maintenance-window alerting
 
@@ -481,11 +481,7 @@ Pair with an `INSERT` trigger on `rewrite_alerts` that issues `NOTIFY` (see [45-
         ON login
         EXECUTE FUNCTION audit_login();
 
-Three defensive patterns in one recipe:
-
-1. **`pg_is_in_recovery()` guard** prevents the trigger from attempting a write on a standby.
-2. **`EXCEPTION WHEN OTHERS`** prevents any unexpected failure from blocking every login (this is the single most important pattern for any `login` event trigger).
-3. **Pinned `search_path`** prevents schema-search-based privilege escalation.
+The standby guard avoids writes during recovery. `EXCEPTION WHEN OTHERS` avoids many ordinary audit failures blocking login, but does not catch `QUERY_CANCELED` or `ASSERT_FAILURE`; audit records may also be lost. The pinned `search_path` restricts schema lookup. Since this function is `SECURITY DEFINER`, `current_user` records the function owner, not a separately authenticated actor.
 
 ### Recipe 6: PG17 login event — per-session GUC setup
 
@@ -664,7 +660,7 @@ The `NOT in_extension` filter excludes DDL from extension installs (which are ex
 
 ### Recipe 13: Cause an event trigger to fire on a standby's apply path
 
-By default event triggers fire only on origin sessions (the primary). To fire them when logical-replication applies DDL to a subscriber, use `ENABLE REPLICA` or `ENABLE ALWAYS`:
+Event triggers in sessions with `session_replication_role = replica` fire only when enabled for replica or always. Native logical replication does not replicate DDL or apply it through this path:
 
     -- Fire ONLY during replication apply (skip primary sessions)
     ALTER EVENT TRIGGER audit_ddl ENABLE REPLICA;
@@ -672,7 +668,7 @@ By default event triggers fire only on origin sessions (the primary). To fire th
     -- Fire on both primary sessions AND replication apply
     ALTER EVENT TRIGGER audit_ddl ENABLE ALWAYS;
 
-This is the same `session_replication_role` interaction as DML triggers. Note: logical replication doesn't replicate DDL natively — so this only matters if you've built a DDL-replication pipeline (Recipe 10) or are using an out-of-tree tool that emits DDL through replication.
+Use these modes only with a DDL replication tool whose execution session is actually configured with `session_replication_role = replica`.
 
 ## Gotchas and Anti-patterns
 

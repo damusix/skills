@@ -19,10 +19,10 @@ Each topic lives in its own reference file under `references/`. SKILL.md routes 
 When this skill is loaded, follow these steps to answer the user's question:
 
 1. **Identify the topic.** Match the user's question against the **Routing Table** below using the keyword column. For multi-topic questions (e.g. "the locking behavior of REINDEX CONCURRENTLY") select multiple files.
-2. **Load the matched reference file(s).** Use the Read tool against `references/NN-topic.md`. Do not paraphrase from memory — the reference holds the authoritative version notes and source URLs.
+2. **Load the matched reference file(s).** Use the Read tool against `references/NN-topic.md`. Do not paraphrase from memory; use the reference's version notes and primary-source URLs.
 3. **Follow See Also.** Each reference ends with a **See Also** section linking related files. Follow it for cross-cutting questions (e.g. a VACUUM question pulls in MVCC, autovacuum, and wraparound).
 4. **Answer using the file.** Lead with the direct answer or code, then version notes via admonitions, then caveats, then citation URLs.
-5. **Never answer from memory alone** when a reference file exists for the topic. The references are the source of truth for this skill; the model's training data is not version-specific enough.
+5. **Verify high-risk instructions against primary sources.** These references are a working compilation, not a substitute for the matching PostgreSQL manual. Before advising recovery, durability changes, failover, privilege changes, or destructive maintenance, fetch the cited upstream section for the actual server version. Resolve conflicting advice before giving commands; identify anything you could not verify.
 6. **Assume PG16 unless told otherwise.** If the user does not state a version, answer for PG16 and add a one-line note for differences on PG17/PG18 (and PG19, a release candidate until GA). Only ask the user which version they are on if the answer materially changes across supported versions (e.g. wraparound mechanics, planner statistics behavior, archive_command vs archive_library). When the project pins a version (a Docker tag, a CI service image, `SELECT version()`), use that one.
 
 **When the task is to build, not to answer.** Writing a schema, migration, query, index, trigger, function, or ORM model that targets Postgres goes through the same lookup, before any code is written:
@@ -54,7 +54,20 @@ Structure every answer using this skill as follows:
 - **End with source links.** Cite the official PostgreSQL docs pinned to the correct major version (e.g. `https://www.postgresql.org/docs/16/sql-vacuum.html`, not `/docs/current/`).
 - **For longer answers**, use headers matching the reference file's section headings so the user can jump to the source.
 - **For version-sensitive answers**, default to PG16 + add inline `> [!NOTE] PG17` / `> [!NOTE] PG18` / `PostgreSQL 19` deltas. Only ask the user to confirm version when the answer flips between supported majors.
-- **For any performance investigation document or slow-query guide**, always include an explicit section explaining how to read EXPLAIN plans bottom-up: start at the deepest-indented leaf node (scans execute first), work upward through parents (joins, sorts, aggregates), reach the root last. Identify the first node where `actual rows` diverges 10× or more from estimated `rows` — that is the misestimate source; everything above it operates on bad cardinality.
+- **For performance investigations**, explain the plan tree from leaf inputs toward their parents. Compare estimated `rows` with `actual rows` per loop; use `loops` to calculate total work separately. A 10× mismatch is a useful investigation threshold, not proof of a root cause. Account for LIMIT, early termination, and unexecuted nodes. PostgreSQL executes plans on demand, not in a strict deepest-node-first sequence.
+
+
+<constraints>
+
+## Operational Safety
+
+
+- **XID hard stop:** connect to the affected database as a superuser, resolve old transaction and slot horizons, then run ordinary database-wide `VACUUM` outside a transaction block. Do not use `FULL`, `FREEZE`, or routine single-user recovery. `VACUUM FREEZE` and `VACUUM (FREEZE)` are equivalent. Follow the [version-pinned recovery procedure](https://www.postgresql.org/docs/16/routine-vacuuming.html#VACUUM-FOR-WRAPAROUND).
+- **Corruption salvage:** preserve the complete stopped cluster, including external WAL and tablespaces. Work on an isolated copy. `pg_resetwal` is only a last resort for WAL/control corruption that prevents startup, not an XID-exhaustion repair. Its dry run does not prove consistency; use same-major binaries, then dump and restore into a separate new cluster. Do not replace individual live relation files from an old backup.
+- **Destructive decisions:** resolve prepared transactions with their coordinator, confirm a slot's consumer before dropping it, and fence the former primary before failover. State data-loss and rebuild consequences before presenting the operation.
+- **Verification limits:** successful `pg_dump`, `pg_amcheck`, or checksum checks do not prove absence of every corruption class or application inconsistency. Distinguish a documented procedure, a tested example, and an unverified assumption.
+
+</constraints>
 
 
 ## Routing Table

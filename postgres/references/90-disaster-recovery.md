@@ -73,7 +73,7 @@ Five rules to internalize.
 | Marketing site, blog, internal tool | 24h | 4h | Nightly pg_dump → S3, restore manually |
 | Standard SaaS app | 5min | 30min | Streaming replica + WAL archive every 60s + automated failover |
 | Financial transactions | 0 (commit durability) | 30s | Synchronous replication + Patroni/CNPG + cross-AZ |
-| Regulated multi-region | 0 + auditable | 5min | Synchronous in-region + async cross-region + offline immutable archive |
+| Regulated multi-region | Auditable RPO | 5min | Synchronous in-region + async cross-region + offline immutable archive; a regional loss can lose unreplicated commits |
 
 **Operational rule of thumb:** RPO and RTO **independent dials**. Cheap synchronous replication does NOT reduce RTO. Fast restore does NOT reduce RPO. Address each separately.
 
@@ -90,7 +90,7 @@ Five rules to internalize.
 | Logical corruption (bad app deploy) replicated to all replicas | PITR from backup — replicas are useless | [`88-corruption-recovery.md`](./88-corruption-recovery.md) |
 | Ransomware encrypted backup repo + primary | Restore from offline immutable archive (S3 Object Lock / WORM) | [`85-backup-tools.md`](./85-backup-tools.md) |
 | Cross-region failover desired | Promote remote-region async replica → live with replication-lag RPO | Below — Strategy C |
-| Logical replica subscriber needs to become primary | Logical-slot failover (PG17+) | [`75-replication-slots.md`](./75-replication-slots.md) |
+| Logical replica subscriber needs to become primary | Plan an application cutover; PG17 failover slots protect logical subscribers of a promoted physical standby, not promotion of a logical subscriber | [`75-replication-slots.md`](./75-replication-slots.md) |
 | Old primary diverged, want to re-attach as standby | pg_rewind to new primary | [`89-pg-rewind.md`](./89-pg-rewind.md) |
 | Verify restorability without affecting prod | Restore to disposable host, run integrity checks | Below — DR Drills |
 | Want zero data loss during planned failover | Controlled switchover with `pg_switch_wal` + sync replication | [`77-standby-failover.md`](./77-standby-failover.md) Recipe 5 |
@@ -122,8 +122,8 @@ sudo apt-get install postgresql-16
 # 2. Stop any started Postgres on target host
 sudo systemctl stop postgresql
 
-# 3. Wipe data directory (or use fresh empty directory)
-sudo rm -rf /var/lib/postgresql/16/main/*
+# 3. Use a fresh empty target. Preserve the old cluster and unarchived WAL
+#    before removing anything; include external tablespaces in the plan.
 
 # 4. Restore base backup using your backup tool
 #    pgBackRest example:
@@ -133,7 +133,7 @@ sudo -u postgres pgbackrest --stanza=main --type=default restore
 sudo -u postgres tar -xzf /backup/base.tar.gz -C /var/lib/postgresql/16/main/
 
 # 5. Apply WAL archive up to LATEST (no recovery_target_* — full recovery)
-sudo -u postgres tee /var/lib/postgresql/16/main/postgresql.auto.conf <<EOF
+sudo -u postgres tee -a /var/lib/postgresql/16/main/postgresql.auto.conf <<EOF
 restore_command = '/usr/local/bin/wal-fetch %f %p'
 recovery_target_action = 'promote'
 EOF
@@ -214,13 +214,12 @@ psql -c "SELECT pg_current_wal_lsn();"  # confirm writes possible
 #    Cross-reference Post-Failover Bookkeeping below
 ```
 
-> [!WARNING] Replication lag IS the RPO
->
-> Async cross-region replica's RPO equals replication lag at moment of failure. If lag was 8 seconds when primary died, lose ~8 seconds of committed transactions. Monitor `pg_stat_replication.replay_lag` continuously — alert if exceeds RPO budget.
+> [!WARNING] Async replication can lose committed transactions
+> `replay_lag` measures recent write-to-replay delay, not a guaranteed current loss window; it can be NULL on an idle system. Compare durable received/replayed WAL positions and source progress where available, and account for inaccessible WAL after a failure. See <https://www.postgresql.org/docs/16/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW>.
 
-### Strategy D — Logical Replica Failover (PG17+ Slot Sync)
+### Strategy D — Preserve Logical Subscribers Across Physical Failover (PG17+)
 
-**Use when:** logical replica must become primary (cross-version migration target, isolated CDC consumer).
+**Use when:** a physical standby will be promoted and downstream logical subscribers must continue consuming from its synchronized failover slots.
 
 PG17 introduced logical-slot failover via `sync_replication_slots = on` + `failover = true` on `pg_create_logical_replication_slot()`. Cross-reference [`75-replication-slots.md`](./75-replication-slots.md) for full mechanics.
 
@@ -232,11 +231,12 @@ SELECT pg_create_logical_replication_slot(
     failover => true  -- PG17+ only
 );
 
--- On standby that will receive failover, enable slot sync
-ALTER SYSTEM SET sync_replication_slots = on;
-SELECT pg_reload_conf();
-
--- After standby promotion, logical slot survives — subscribers reconnect to new primary
+-- On the standby, configure a physical primary_slot_name, hot_standby_feedback=on,
+-- and a valid dbname in primary_conninfo, then enable sync_replication_slots.
+-- On the primary, list the physical slot in synchronized_standby_slots.
+-- Before promotion, verify the failover slot is persistent and synced;
+-- disable subscribers, fence the old primary, then repoint and re-enable them.
+-- See https://www.postgresql.org/docs/17/logicaldecoding-explanation.html.
 ```
 
 **Pre-PG17 limitation:** logical slots do NOT survive failover. Subscriber re-bootstraps from new primary (lose CDC continuity, may need full re-sync).
@@ -251,7 +251,7 @@ SELECT pg_reload_conf();
 | --- | --- | --- |
 | `pg_promote()` SQL function | `SELECT pg_promote(wait => true, wait_seconds => 60);` | SQL-callable, returns boolean. PG12+. Preferred in automation. |
 | `pg_ctl promote` CLI | `pg_ctl promote -D $PGDATA` | Shell-callable. Useful from cron / orchestration. |
-| `promote` signal file | `touch $PGDATA/promote.signal` | Filesystem-only. Postmaster picks up next loop. |
+| `promote` signal file | Not a supported manual interface | Use `pg_promote()` or `pg_ctl promote`. |
 | ~~`promote_trigger_file` GUC~~ | **REMOVED in PG16** | Cross-reference [`77-standby-failover.md`](./77-standby-failover.md) gotcha #1. Carry-forward configs silently fail. |
 
 > [!NOTE] PostgreSQL 14
@@ -306,14 +306,12 @@ SELECT slot_name, slot_type, active, restart_lsn,
        pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) AS retained_bytes
 FROM pg_replication_slots
 ORDER BY retained_bytes DESC NULLS LAST;
--- Drop slots pointing at the dead old-primary's replicas
-SELECT pg_drop_replication_slot('orphaned_slot_name');
+-- Drop a slot only after confirming it is unused and no consumer will need it.
+-- Removing a needed slot can require a consumer rebootstrap.
 
--- 2. INACTIVE-SLOT AUTO-INVALIDATION (PG18+)
--- Cross-reference 75-replication-slots.md for idle_replication_slot_timeout mechanics
-ALTER SYSTEM SET idle_replication_slot_timeout = '1h';
-SELECT pg_reload_conf();
--- Slots inactive >1h are invalidated automatically
+-- 2. Inspect idle-slot timeout (PG18+); changing it can invalidate
+-- slots needed by temporarily disconnected consumers.
+SHOW idle_replication_slot_timeout;
 
 -- 3. ABANDONED LOGICAL SUBSCRIBERS — if old primary had logical publication
 SELECT subname, subconninfo, subenabled
@@ -333,7 +331,7 @@ If old primary may come back online (network partition + recovery), MUST fence t
 | Method | How |
 | --- | --- |
 | STONITH (Shoot The Other Node In The Head) | Power-cycle / terminate the host |
-| Firewall block | Block replication port from old-primary's IP at network level |
+| Network fencing | Block all client and replication paths to the old primary, and prevent it from becoming writable |
 | Storage detach | Detach disk / EBS volume |
 | Manual `pg_ctl stop` | Coordinator must SSH + stop before re-attaching |
 
@@ -428,9 +426,10 @@ Every PG14-18 contributed substantive DR-relevant items.
 - If primary recoverable (postmaster died, OS reboot needed): restart and re-evaluate
 - If primary not recoverable in <15min: proceed to failover
 
-### Step 3 — Failover
+### Step 3 — Fence and fail over
+- Fence the old primary before promotion so it cannot accept writes.
 - Connect to replica: `psql -h replica.example.com -p 5432`
-- Verify replica lag: `SELECT pg_last_xact_replay_timestamp();`
+- Compare replay and receive positions and assess possible data loss.
 - Promote: `SELECT pg_promote(wait => true, wait_seconds => 60);`
 - Verify: `SELECT pg_is_in_recovery();` (must be `f`)
 
@@ -439,9 +438,8 @@ Every PG14-18 contributed substantive DR-relevant items.
 - Verify: `dig +short db.example.com` returns replica IP
 - Roll application pods: `kubectl rollout restart deployment/app`
 
-### Step 5 — Fence old primary
-- AWS console → EC2 → primary → Stop instance
-- Verify: instance state = `stopped`
+### Step 5 — Verify fencing
+- Confirm the old primary remains fenced before reconnecting applications.
 
 ### Step 6 — Post-failover bookkeeping
 - Drop orphaned slots (see runbook section "Slot Cleanup")
@@ -525,27 +523,18 @@ LAG=$($REPLICA -tAc "SELECT extract(epoch from now() - pg_last_xact_replay_times
 LAG_BYTES=$($REPLICA -tAc "SELECT pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn());")
 REPLAY_LSN=$($REPLICA -tAc "SELECT pg_last_wal_replay_lsn();")
 
-echo "Pre-promotion: lag=${LAG}s, unreplayed_bytes=${LAG_BYTES}, replay_lsn=${REPLAY_LSN}"
+echo "Pre-promotion: last_replay_age=${LAG}s, received_not_replayed=${LAG_BYTES} bytes, replay_lsn=${REPLAY_LSN}"
+echo "These values do not measure WAL never received from the primary."
+# Fence the old primary before promoting. Compare the last known primary
+# durable LSN with the standby's received/replayed LSN where available.
+read -p "Old primary fenced and potential data loss accepted? [y/N] " confirm
+[ "$confirm" = "y" ] || exit 1
 
-if [ "$LAG" -gt 60 ]; then
-    echo "WARNING: replica lag ${LAG}s exceeds RPO budget — proceed only if primary is truly unrecoverable"
-    read -p "Continue? [y/N] " confirm
-    [ "$confirm" = "y" ] || exit 1
-fi
-
-# 2. Promote
 $REPLICA -c "SELECT pg_promote(wait => true, wait_seconds => 120);"
-
-# 3. Verify
 $REPLICA -tAc "SELECT pg_is_in_recovery();"  # must be f
 $REPLICA -tAc "SELECT pg_current_wal_lsn();"
-
-# 4. Capture new timeline ID
 NEW_TIMELINE=$($REPLICA -tAc "SELECT substring(pg_walfile_name(pg_current_wal_lsn()), 1, 8);")
 echo "New timeline: $NEW_TIMELINE"
-
-# 5. Audit: how much was lost
-echo "Data loss window: $LAG seconds, $LAG_BYTES bytes"
 ```
 
 ### Recipe 4 — Detect Orphaned Slots Post-Failover
@@ -569,8 +558,9 @@ FROM pg_replication_slots
 WHERE active = false  -- or filter on retained_bytes threshold
 ORDER BY retained_bytes DESC NULLS LAST;
 
--- Drop slots that pointed at dead old-primary's replicas:
-SELECT pg_drop_replication_slot('orphaned_slot_name');
+-- Investigate each inactive slot's owner and whether the consumer will return.
+-- Drop only a confirmed unneeded slot; deleting a needed logical slot can
+-- require reinitializing its subscriber.
 ```
 
 ### Recipe 5 — Verify Backup Integrity Without Full Restore
@@ -642,7 +632,8 @@ psql -c "SELECT * FROM critical_table WHERE id = 42;"
 psql -c "SELECT pg_wal_replay_resume();"
 psql -c "SELECT pg_promote();"
 
-# If not satisfied, shut down + adjust recovery_target_time
+# If not satisfied and an earlier target is needed, stop and restore the
+# original base backup again before changing recovery_target_time.
 sudo systemctl stop postgresql
 ```
 
@@ -662,27 +653,20 @@ SELECT
     extract(epoch from replay_lag) AS replay_lag_seconds,
     pg_wal_lsn_diff(sent_lsn, replay_lsn) AS unreplayed_bytes
 FROM pg_stat_replication
-WHERE extract(epoch from replay_lag) > 60;  -- 60s RPO budget threshold
+WHERE extract(epoch from replay_lag) > 60 OR replay_lag IS NULL;
 -- Cross-reference 82-monitoring.md Recipe 4
 ```
 
-### Recipe 10 — Document Per-Replica RPO Posture
+### Recipe 10 — Inspect Per-Replica Durability Posture
 
 ```sql
--- Post-deployment audit: every replica's lag posture
-SELECT
-    application_name,
-    sync_state,
-    coalesce(extract(epoch from replay_lag), 0) AS lag_seconds,
-    -- This replica's effective RPO if primary fails RIGHT NOW
-    CASE sync_state
-        WHEN 'sync' THEN 'RPO=0 (committed-and-synced)'
-        WHEN 'quorum' THEN 'RPO=0 (quorum-confirmed)'
-        ELSE 'RPO=' || coalesce(extract(epoch from replay_lag)::text || 's', 'unknown')
-    END AS effective_rpo
+SELECT application_name, sync_state, write_lag, flush_lag, replay_lag,
+       sent_lsn, write_lsn, flush_lsn, replay_lsn
 FROM pg_stat_replication
-ORDER BY sync_state DESC, lag_seconds ASC;
+ORDER BY application_name;
 ```
+
+NULL lag is unknown, not zero. `sync` or `quorum` alone does not prove that a particular promoted replica has every commit: the configured synchronous commit mode, selected standbys, and their flush positions matter. See <https://www.postgresql.org/docs/16/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION-VIEW>.
 
 ### Recipe 11 — Schedule Quarterly Drill via pg_cron
 
@@ -728,7 +712,7 @@ $PSQL "SELECT count(*), max(id), max(updated_at) FROM critical_table;"
 -- Pre-DR test: confirm cross-region replica has all required configuration
 SHOW wal_level;  -- must be 'replica' or 'logical'
 SHOW max_wal_senders;  -- must be >0 (this replica may serve own replicas after promotion)
-SHOW archive_mode;  -- must be 'always' if cross-region replica should archive WAL post-promotion
+SHOW archive_mode;  -- 'always' archives during standby; 'on' also archives after promotion
 SHOW archive_command;  -- or archive_library — must be set
 SHOW restore_command;  -- needed if recovery from archive
 
@@ -744,13 +728,13 @@ SELECT pg_stat_archiver;
 
 2. **Replicas don't protect against logical corruption.** Bad migration deletes data → replicates to every standby in seconds. Replicas are zero help. Cross-reference [`88-corruption-recovery.md`](./88-corruption-recovery.md). **Mitigation:** offline backup + PITR + WORM archive.
 
-3. **`promote_trigger_file` GUC removed in PG16.** Carry-forward configs silently do nothing. Cross-reference [`77-standby-failover.md`](./77-standby-failover.md) gotcha #1. **Mitigation:** use `pg_promote()` or `pg_ctl promote` or `promote.signal` file.
+3. **`promote_trigger_file` was removed in PG16.** Replace it with `pg_promote()` or `pg_ctl promote`; do not rely on manually creating `promote.signal`.
 
-4. **Cross-region async replica RPO equals replication lag at failure moment.** If lag was 30s, lose 30s. Cross-region sync replication crippling for write latency. **Mitigation:** monitor `replay_lag` + alert above RPO budget; tier — sync local + async cross-region.
+4. **Async replica loss is not measured by replay lag alone.** `replay_lag` can be NULL on an idle cluster and excludes WAL never received by the standby. Compare known durable and replayed positions and assess inaccessible WAL before promotion.
 
 5. **Backup retention shorter than your worst-case discovery window.** Logical corruption discovered 2 weeks later → 7-day retention means you cannot PITR before the bug. **Mitigation:** retention = `MAX(SLA_RPO + investigation_time, 30 days)`.
 
-6. **Orphaned replication slots post-failover fill disk.** New primary inherits slot definitions of old primary's replicas — those replicas may never reconnect. Slot retains WAL forever. **Mitigation:** Recipe 4 + PG18+ `idle_replication_slot_timeout`.
+6. **Inactive replication slots can fill disk.** Inspect slots on the promoted server and drop only those confirmed unnecessary; logical slot synchronization is opt-in and does not automatically migrate ordinary physical slots. A PG18+ idle-slot timeout can invalidate disconnected consumers, so choose it deliberately. See <https://www.postgresql.org/docs/17/logicaldecoding-explanation.html#LOGICALDECODING-REPLICATION-SLOTS-SYNCHRONIZATION>.
 
 7. **Connection string updates miss something.** App config updated, but cron jobs / BI tools / backup tool / monitoring still point at dead old-primary. **Mitigation:** maintain single source of truth (DNS / consul / k8s Service) — every consumer reads from it.
 
@@ -772,9 +756,9 @@ SELECT pg_stat_archiver;
 
 16. **PG18 `idle_replication_slot_timeout` operates at checkpoint time.** Not real-time. Slot invalidated at next checkpoint after timeout expires. **Mitigation:** combine with reasonable `checkpoint_timeout` (default 5min OK).
 
-17. **`pg_verifybackup` only verifies manifest checksums — not WAL replay.** Manifest checksum match doesn't mean restore will succeed. **Mitigation:** pair with actual test restore.
+17. **`pg_verifybackup` is not a restore test.** It verifies manifest checksums and, by default for plain backups, parses required WAL, but does not replay it. Pair verification with an actual isolated restore. See <https://www.postgresql.org/docs/16/app-pgverifybackup.html>.
 
-18. **Logical-slot failover (PG17+) requires `failover => true` AT SLOT CREATION.** Existing slots created before PG17 — or without flag — do NOT failover. **Mitigation:** drop + recreate logical slots with flag after upgrade.
+18. **Logical-slot failover (PG17+) is opt-in and requires coordinated slot synchronization.** Verify the slot, subscriber settings and standby prerequisites; do not drop a slot needed by a subscriber without a resynchronization plan. See <https://www.postgresql.org/docs/17/logicaldecoding-explanation.html#LOGICALDECODING-REPLICATION-SLOTS-SYNCHRONIZATION>.
 
 19. **Cross-version restore impossible.** Cannot restore PG16 backup into PG14 server (and vice versa). Cross-reference [`86-pg-upgrade.md`](./86-pg-upgrade.md). **Mitigation:** match PG major version exactly on restore host. For cross-version, use logical backup ([`83-backup-pg-dump.md`](./83-backup-pg-dump.md)).
 
