@@ -550,7 +550,7 @@ SHOW io_workers;
 
 14. **`wal_retrieve_retry_interval` controls the wait between failed WAL retrieval attempts, not a retry limit.** Monitor `pg_stat_wal_receiver` and standby logs for persistent disconnects. [PG16 standby settings](https://www.postgresql.org/docs/16/runtime-config-replication.html)
 
-15. **`pg_stat_replication.replay_lag = NULL` on idle standby is healthy, not a problem.** A standby that has caught up and has no WAL to apply reports NULL for replay lag. The trap is interpreting NULL as "the replica is broken." See [58-performance-diagnostics.md](./58-performance-diagnostics.md) gotcha #14.
+15. **`pg_stat_replication.replay_lag = NULL` proves neither health nor failure.** A fully replayed standby reports NULL after a short idle period, and a logical-decoding plugin that emits no tracking messages always reports NULL. Compare `sent_lsn` with `replay_lsn` and check `reply_time` freshness before calling the standby caught up. See [58-performance-diagnostics.md](./58-performance-diagnostics.md) gotcha #14.
 
 16. **`backend_type = 'startup'` on a primary appears briefly during recovery, then exits.** On a standby it stays forever — it is the WAL-replay process. A primary that shows a `startup` process for more than a few seconds is still recovering from a crash.
 

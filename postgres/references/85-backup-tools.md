@@ -589,11 +589,16 @@ sudo -u postgres pgbackrest --stanza=main info
 Cron (Sunday 2am full, daily 2am incremental):
 
 ```cron
-0 2 * * 0 postgres /usr/bin/pgbackrest --stanza=main --repo=1 --type=full backup && /usr/bin/pgbackrest --stanza=main --repo=2 --type=full backup
-0 2 * * 1-6 postgres /usr/bin/pgbackrest --stanza=main --repo=1 --type=incr backup && /usr/bin/pgbackrest --stanza=main --repo=2 --type=incr backup
+0 2 * * 0 postgres /usr/bin/pgbackrest --stanza=main --repo=1 --type=full backup
+30 2 * * 0 postgres /usr/bin/pgbackrest --stanza=main --repo=2 --type=full backup
+0 2 * * 1-6 postgres /usr/bin/pgbackrest --stanza=main --repo=1 --type=incr backup
+30 2 * * 1-6 postgres /usr/bin/pgbackrest --stanza=main --repo=2 --type=incr backup
 0 4 * * * postgres /usr/bin/pgbackrest --stanza=main check
-0 5 * * 0 postgres /usr/bin/pgbackrest --stanza=main verify
+0 5 * * 0 postgres /usr/bin/pgbackrest --stanza=main --repo=1 verify
+30 5 * * 0 postgres /usr/bin/pgbackrest --stanza=main --repo=2 verify
 ```
+
+Separate entries keep a repo1 failure from skipping the repo2 backup. `verify` checks one repository, the default repo1 unless `--repo` is given, so each repository gets its own entry. The 30-minute offset spreads backup load on the primary; alert on each entry's exit status.
 
 ### Recipe 2 — Barman centralized backup for 10 clusters
 
@@ -691,6 +696,7 @@ sudo -u postgres pgbackrest --stanza=main \
     --type=time \
     --target='2026-05-13 12:00:00 UTC' \
     --target-action=pause \
+    --archive-mode=off \
     restore
 
 # Start PG (it will be in recovery, paused at target)
@@ -700,10 +706,11 @@ sudo systemctl start postgresql@16-drill
 sudo -u postgres psql -p 55432 -c "SELECT pg_is_in_recovery();"
 sudo -u postgres psql -p 55432 -c "SELECT count(*) FROM orders WHERE created_at > '2026-05-13';"
 
-# If data correct, resume and promote the isolated restore
+# If data correct, resume: at a paused recovery target this ends recovery
 sudo -u postgres psql -p 55432 -c "SELECT pg_wal_replay_resume();"
-sudo -u postgres psql -p 55432 -c "SELECT pg_promote();"
 ```
+
+`--archive-mode=off` writes `archive_mode = off` into the restored cluster, so its new timeline's WAL and `.history` files never reach the production stanza. The default, `preserve`, keeps the production `archive_command`. Calling `pg_promote()` after the resume fails, because recovery has already ended.
 
 Same pattern works for Barman (`barman recover --target-time`) and WAL-G (`wal-g backup-fetch` + `restore_command`).
 
@@ -712,7 +719,8 @@ Same pattern works for Barman (`barman recover --target-time`) and WAL-G (`wal-g
 ```bash
 # On a disposable host, configure the backup's stanza and an empty PGDATA.
 # Map every tablespace to a disposable location and isolate production.
-sudo -u postgres pgbackrest --stanza=main --type=immediate restore
+sudo -u postgres pgbackrest --stanza=main --type=immediate \
+    --target-action=promote --archive-mode=off restore
 sudo systemctl start postgresql@16-drill
 
 # Wait for recovery to complete, then query the drill instance explicitly.
@@ -803,14 +811,7 @@ For pgBackRest:
 
 Create a separate repository with the new key and configure backups and WAL archiving to it. Take and test a new full backup. Keep the old repository and its key until its recovery window expires; test restore using each key before removing either. See <https://pgbackrest.org/user-guide.html>.
 
-WAL-G + libsodium:
-
-```bash
-# Generate new key
-# Key rotation requires retaining the old key with its backups.
-# Configure the new key for new backups, test restoration with both keys,
-# and retain the old key until all backups requiring it have expired.
-```
+WAL-G + libsodium: configure the new key for new backups and keep the old key with the backups that need it. Test restoration with both keys, and retain the old key until every backup requiring it has expired.
 
 Barman: encryption is typically filesystem-level (LUKS, ZFS) or via pre-stage encrypt; rotation = standard filesystem-rotate procedure.
 

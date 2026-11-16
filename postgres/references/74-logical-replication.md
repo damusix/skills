@@ -489,7 +489,7 @@ CREATE SUBSCRIPTION sub_from_a
 4. With sequence consumers still stopped, transfer every sequence's actual state, including schema, `last_value`, and `is_called`, and validate the target. Sequence caches and application-side allocations require an application-specific cutover plan.
 5. Repoint applications only after data and sequence validation. Keep the old publisher fenced until the cutover is accepted; drop the subscription and its slot only after they are no longer needed.
 
-PG17+ `pg_createsubscriber` can prepare a same-major logical replica without an initial data copy; it does not support converting a different-major physical standby. Upgrade separately using a supported plan. [PG16 logical replication restrictions](https://www.postgresql.org/docs/16/logical-replication-restrictions.html); [PG17 pg_createsubscriber](https://www.postgresql.org/docs/17/app-pgcreatesubscriber.html).
+PG17+ `pg_createsubscriber` can prepare a same-major logical replica without an initial data copy; it does not support converting a different-major physical standby. For an upgrade built on it, follow [`87-major-version-upgrade.md` Strategy D](./87-major-version-upgrade.md#strategy-d--pg_createsubscriber-pg17). [PG16 logical replication restrictions](https://www.postgresql.org/docs/16/logical-replication-restrictions.html); [PG17 pg_createsubscriber](https://www.postgresql.org/docs/17/app-pgcreatesubscriber.html).
 
 ### Recipe 6 — pg_createsubscriber (PG17+)
 
@@ -632,7 +632,7 @@ SELECT slot_name, active, wal_status, safe_wal_size,
  WHERE slot_type = 'logical';
 ```
 
-`received_lsn` and `latest_end_lsn` describe received WAL and the latest reported publisher WAL position; their difference is not an apply backlog measurement. Investigate publisher-side slot retention, subscriber worker state, and transaction visibility together. See [PG16 subscription statistics](https://www.postgresql.org/docs/16/monitoring-stats.html#MONITORING-PG-STAT-SUBSCRIPTION).
+`received_lsn` is the last WAL location received, and `latest_end_lsn` is the last WAL location reported to the origin WAL sender; their difference is not an apply backlog measurement. Investigate publisher-side slot retention, subscriber worker state, and transaction visibility together. See [PG16 subscription statistics](https://www.postgresql.org/docs/16/monitoring-stats.html#MONITORING-PG-STAT-SUBSCRIPTION).
 
 ### Recipe 13 — Drop subscription when publisher unreachable
 

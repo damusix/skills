@@ -573,7 +573,7 @@ Pre-PG12 code typically maintained the `tsvector` with `tsvector_update_trigger`
 
 > *"The method described in this section has been obsoleted by the use of stored generated columns, as described in Section 12.2.2."*
 
-Adding the stored generated column rewrites the table on PG16 and takes a strong lock. Plan the migration around the rewrite, dependencies, and the index-build window. For large live tables, use an ordinary shadow column maintained by a trigger and backfill before cutover.
+Adding the stored generated column rewrites the table and takes a strong lock. Plan the migration around the rewrite, dependencies, and the index-build window. For large live tables, use an ordinary shadow column maintained by a trigger and backfill before cutover.
 
     -- 1. Add the new generated column with a temporary name
     ALTER TABLE articles
@@ -707,7 +707,7 @@ Test a single token through a single dictionary:
 
     SELECT ts_lexize('english_stem', 'running');   -- => {run}
     SELECT ts_lexize('english_stem', 'the');       -- => {}     (stop word)
-    SELECT ts_lexize('english_stem', 'xyzqq');     -- Snowball recognizes even unknown words
+    SELECT ts_lexize('english_stem', 'xyzqq');     -- => {xyzqq}  (Snowball accepts unknown words)
 
 
 ### Recipe 16: Decision wrapper — FTS vs pg_trgm vs pgvector

@@ -55,7 +55,7 @@ Five rules:
 | Compact binary embeddings (e.g., binary-quantized) | `bit(N)` + HNSW + `bit_hamming_ops` | 64,000 dimensions indexed. Use `binary_quantize(vec)` to convert. |
 | Build first, query later, slower writes acceptable | HNSW | Default. Better speed-recall trade-off. |
 | Faster index build, OK with lower recall | IVFFlat | Smaller index, faster build. Tune `lists` for the dataset. |
-| Filtered ANN with selective `WHERE` predicate | HNSW + `SET LOCAL hnsw.iterative_scan = strict_order` | 0.8.0+. Re-scans until enough rows survive `WHERE`. Pre-0.8.0: partial index per filter value. |
+| Filtered ANN with selective `WHERE` predicate | HNSW + `SET LOCAL hnsw.iterative_scan = strict_order` | 0.8.0+. Re-scans until enough rows survive `WHERE` or a scan limit (`hnsw.max_scan_tuples`) is reached. Pre-0.8.0: partial index per filter value. |
 | Multi-tenant — partition by tenant before ANN | Partial index `WHERE tenant_id = X` per tenant OR partition table | Avoids filtered-ANN problem. |
 | Tune recall vs latency per query | `SET LOCAL hnsw.ef_search = 100` | Default 40. Higher = better recall + higher latency. |
 | Tune IVFFlat recall vs latency per query | `SET LOCAL ivfflat.probes = 10` | Default 1. Higher = scans more lists = better recall + slower. |
@@ -514,7 +514,12 @@ Reciprocal Rank Fusion or simple `WHERE` + ANN:
     ORDER BY distance
     LIMIT 10;
 
-Use `SET LOCAL hnsw.iterative_scan = strict_order` if `created_at` filter is selective.
+If the `created_at` filter is selective, enable iterative scans for the query. `SET LOCAL` only lasts inside a transaction block:
+
+    BEGIN;
+    SET LOCAL hnsw.iterative_scan = strict_order;
+    -- run the hybrid query above
+    COMMIT;
 
 ### 8. Two-stage retrieval — binary quantize then rerank
 

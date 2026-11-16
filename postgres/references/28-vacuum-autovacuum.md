@@ -577,9 +577,9 @@ The downside: trailing empty pages stay until the next non-LAZY operation that r
 
 If `pg_stat_progress_vacuum.index_vacuum_count > 1` during a vacuum, the dead-tuple TID store didn't fit in `maintenance_work_mem` and VACUUM had to round-trip through every index multiple times.
 
-    -- Pre-PG17: capped at 1 GB anyway.
+    -- Pre-PG17: VACUUM uses at most 1 GB of this, so 1GB is the useful ceiling.
     -- PG17+: cap is removed.
-    SET maintenance_work_mem = '512MB';  -- example; budget concurrent memory first
+    SET maintenance_work_mem = '1GB';  -- budget concurrent memory first
     VACUUM (PARALLEL 4, VERBOSE) huge_archive_table;
 
 > [!NOTE] PostgreSQL 17
@@ -591,7 +591,7 @@ A `n_dead_tup`-heavy table with autovacuum running:
 
 1. **Confirm autovacuum is running on this table** — check `pg_stat_user_tables.last_autovacuum` and `autovacuum_count`.
 2. **Check retained XIDs and snapshots** using `age(backend_xid)` and `age(backend_xmin)`, plus replication-slot and prepared-transaction horizons. Do not compare XIDs with ordinary integer subtraction because they wrap.
-3. **Check whether vacuum finishes.** Inspect `pg_stat_progress_vacuum` and cancellation logs. A waiting statement's `lock_timeout` limits its own wait; it does not guarantee that ordinary autovacuum will avoid automatic cancellation.
+3. **Check whether vacuum finishes.** Inspect `pg_stat_progress_vacuum` and cancellation logs. A backend blocked by an ordinary autovacuum cancels it when its deadlock check runs, after `deadlock_timeout`. If routine vacuums keep getting canceled, set `lock_timeout` below `deadlock_timeout` on the offending statement, not on the vacuum, so the statement gives up before it cancels autovacuum.
 4. **Distinguish retained dead tuples from reusable free space.** Recent writes, horizon blockers, cancellations, or insufficient throughput can leave `n_dead_tup` high; lowering a scale factor is not a universal fix.
 5. **If heap is bloated but indexes are not** — `n_dead_tup` is wrong as a proxy; check `pgstattuple_approx(tbl)` for the heap and `pgstatindex(idx)` for each index ([`26-index-maintenance.md`](./26-index-maintenance.md) recipe 10). Decide between routine VACUUM (already running) and online table reorg via `pg_repack` / `pg_squeeze`.
 6. **If pgstattuple says the heap is 80% dead** — switch to a one-time online reorg with `pg_repack`, not `VACUUM FULL`.

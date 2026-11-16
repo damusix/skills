@@ -304,7 +304,6 @@ The internal primary key remains compact, but the unique secondary index on UUID
         created_at   timestamptz NOT NULL DEFAULT now()
     );
 
-
 `public_id` is what the API returns. The internal `id` stays compact and append-only for join and FK efficiency.
 
 ### Recipe 2 — UUIDv7 as the PK (PG18+)
@@ -324,11 +323,28 @@ UUIDv7 inserts are append-mostly at the right edge of the index, the same locali
 
 ### Recipe 3 — Pre-PG18 UUIDv7 alternative
 
-Two options without PG18:
+Three options without PG18:
 
 **Option A — `pg_uuidv7` extension** (third-party; check it's allowed in your environment): install the extension and use its `uuid_generate_v7()` function in the column default.
 
-**Option B — application-side generation:** use a vetted UUIDv7 implementation in the application and pass the value as a parameter. PostgreSQL 16 and 17 can store UUIDv7 values in the `uuid` type even though core generation arrives in PG18.
+**Option B — application-side generation:** use a vetted UUIDv7 implementation in the application and pass the value as a parameter. PostgreSQL 14 through 17 can store UUIDv7 values in the `uuid` type even though core generation arrives in PG18.
+
+**Option C — pure SQL:** overwrite the first 48 bits of a v4 UUID with the Unix epoch in milliseconds, then flip the version nibble from `0100` to `0111`. `set_bit` numbers bits from the least significant bit of the first byte, so bits 52 and 53 are the low two bits of the version nibble in byte 6. The v4 variant bits stay as they are.
+
+    CREATE FUNCTION uuidv7_sql() RETURNS uuid
+    LANGUAGE sql VOLATILE AS $$
+        SELECT encode(
+            set_bit(
+                set_bit(
+                    overlay(uuid_send(gen_random_uuid())
+                            PLACING substring(int8send(floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint) FROM 3)
+                            FROM 1 FOR 6),
+                    52, 1),
+                53, 1),
+            'hex')::uuid;
+    $$;
+
+Values generated in the same millisecond are not ordered among themselves; PG18's `uuidv7()` stores a 12-bit sub-millisecond timestamp fraction in `rand_a` and keeps values monotonic within a backend.
 
 ### Recipe 4 — Single-currency money
 
@@ -454,7 +470,7 @@ This is the canonical online migration when you cannot drop and recreate the tab
 
     COMMIT;
 
-This assumes the default ascending sequence starting at 1. Coordinate other sequence consumers and writes during the migration. `setval` is not rolled back on transaction abort.[^serial] The serial-to-IDENTITY migration recipe is documented in [`14-data-types-builtin.md`](./14-data-types-builtin.md) Recipe 2.
+This assumes the default ascending sequence starting at 1. Coordinate other sequence consumers and writes during the migration. `setval` is not rolled back on transaction abort.[^setval] The serial-to-IDENTITY migration recipe is documented in [`14-data-types-builtin.md`](./14-data-types-builtin.md) Recipe 2.
 
 ### Recipe 11 — IDENTITY on a partitioned table (PG17+)
 
@@ -485,7 +501,9 @@ Before PG17 a parent column default backed by a shared sequence can assign value
     WHERE uuid_extract_timestamp(id) >= now() - interval '1 day'
     ORDER BY id;
 
-A plain index on `id` cannot directly satisfy the function predicate. Use a separately indexed `created_at` column or an expression index if the extraction function is immutable.
+A plain index on `id` cannot satisfy the function predicate. `uuid_extract_timestamp` is immutable, so an expression index can:
+
+    CREATE INDEX orders_id_ts_idx ON orders (uuid_extract_timestamp(id));
 
 ### Recipe 13 — Audit for `money` columns (call for migration)
 
@@ -621,5 +639,7 @@ The bigint PK and the v7 PK will be similar in size and BUFFERS-dirtied; the v4 
 [^money]: PostgreSQL 16 — Monetary Types. *"Since the output of this data type is locale-sensitive, it might not work to load money data into a database that has a different setting of lc_monetary. To avoid problems, before restoring a dump into a new database make sure lc_monetary has the same or equivalent value as in the database that was dumped."* *"Floating point numbers should not be used to handle money due to the potential for rounding errors."* Storage 8 bytes; range (assuming two fractional digits) `-92233720368547758.08 to +92233720368547758.07`. A money value can be cast to numeric without loss of precision. https://www.postgresql.org/docs/16/datatype-money.html
 
 [^serial]: PostgreSQL 16 — Serial Types. *"CREATE TABLE tablename (colname SERIAL); is equivalent to specifying: CREATE SEQUENCE tablename_colname_seq AS integer; CREATE TABLE tablename (colname integer NOT NULL DEFAULT nextval('tablename_colname_seq')); ALTER SEQUENCE tablename_colname_seq OWNED BY tablename.colname;"* *"The type names serial and serial4 are equivalent: both create integer columns. The type names bigserial and serial8 work the same way, except that they create a bigint column. … The type names smallserial and serial2 also work the same way, except that they create a smallint column."* *"Because smallserial, serial and bigserial are implemented using sequences, there may be 'holes' or gaps in the sequence of values which appears in the column, even if no rows are ever deleted."* *"Another way is to use the SQL-standard identity column feature, described at CREATE TABLE."* https://www.postgresql.org/docs/16/datatype-numeric.html
+
+[^setval]: PostgreSQL 16 — Sequence Manipulation Functions. *"Likewise, sequence state changes made by setval are immediately visible to other transactions, and are not undone if the calling transaction rolls back."* https://www.postgresql.org/docs/16/functions-sequence.html
 
 [^identity]: PostgreSQL 16 — CREATE TABLE. *"GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [ ( sequence_options ) ] — This clause creates the column as an identity column. It will have an implicit sequence attached to it and in newly-inserted rows the column will automatically have values from the sequence assigned to it. Such a column is implicitly NOT NULL."* *"In an INSERT command, if ALWAYS is selected, a user-specified value is only accepted if the INSERT statement specifies OVERRIDING SYSTEM VALUE. If BY DEFAULT is selected, then the user-specified value takes precedence."* *"In an UPDATE command, if ALWAYS is selected, any update of the column to any value other than DEFAULT will be rejected. If BY DEFAULT is selected, the column can be updated normally. (There is no OVERRIDING clause for the UPDATE command.)"* *"The optional sequence_options clause can be used to override the parameters of the sequence. The available options include those shown for CREATE SEQUENCE, plus SEQUENCE NAME name, LOGGED, and UNLOGGED, which allow selection of the name and persistence level of the sequence."* https://www.postgresql.org/docs/16/sql-createtable.html

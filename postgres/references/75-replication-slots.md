@@ -239,7 +239,7 @@ PG17+ failover-slots architecture:
 1. **Primary** has a logical slot created with `failover = true` (5th param of `pg_create_logical_replication_slot()`, or `CREATE SUBSCRIPTION ... WITH (failover = true)`).
 2. **Primary** lists each physical standby's slot in `synchronized_standby_slots = 'standby1_slot, standby2_slot'`.
 3. **Standby** has `sync_replication_slots = true`. The slotsync background worker periodically copies logical slot state from primary.
-4. The primary's logical walsender waits for the listed physical slots to confirm WAL receipt before sending decoded changes. Monitor all listed standbys because an unavailable slot can block logical delivery.
+4. Walsenders serving failover-enabled logical slots wait for the listed physical slots to confirm WAL receipt before sending decoded changes; walsenders for other logical slots do not wait. Monitor all listed standbys because an unavailable slot blocks delivery on failover-enabled slots.
 5. Before promotion, verify the intended standby has a synchronized, usable failover slot and the required WAL. Fence the old primary and reconnect consumers only after promotion. Asynchronous failover can still lose commits; consumers must tolerate replay.
 
 Verbatim semantics for `synchronized_standby_slots`: *"Logical WAL sender processes will send decoded changes to plugins only after the specified replication slots confirm receiving WAL. ... Additionally, the replication management functions `pg_replication_slot_advance`, `pg_logical_slot_get_changes`, and `pg_logical_slot_peek_changes`, when used with logical failover slots, will block until all physical slots specified in `synchronized_standby_slots` have confirmed WAL receipt."*[^runtime-config-replication-18]
@@ -357,7 +357,7 @@ Interpretation tree:
 ### Recipe 5 — Drop a confirmed-abandoned slot
 
     -- Step 1: Check activity; inactivity alone does not establish abandonment.
-    SELECT slot_name, active
+    SELECT slot_name, active, inactive_since, now() - inactive_since AS inactive_for  -- inactive_since: PG17+
     FROM pg_replication_slots
     WHERE slot_name = 'old_subscriber_slot';
 
@@ -387,7 +387,7 @@ Inspect both slot horizons. `xmin` can retain ordinary tuples; `catalog_xmin` re
     WHERE catalog_xmin IS NOT NULL OR xmin IS NOT NULL
     ORDER BY greatest(age(catalog_xmin), age(xmin)) DESC NULLS LAST;
 
-Investigate old horizons promptly and restore the consumer where possible. Drop a slot only after identifying its owner and accepting the loss of retained changes or the need to rebuild.
+Investigate any horizon whose age passes `autovacuum_freeze_max_age` (default 200 million, where anti-wraparound autovacuum starts), and restore the consumer where possible. Drop a slot only after identifying its owner and accepting the loss of retained changes or the need to rebuild.
 
 Cross-check against the cluster-wide xmin horizon:
 
@@ -418,7 +418,7 @@ Standby `postgresql.conf` (each standby):
 
     primary_slot_name = 'standby_1_slot'   -- (or standby_2_slot)
     sync_replication_slots = on
-    hot_standby_feedback = on
+    hot_standby_feedback = on              -- required for slot sync
     primary_conninfo = 'host=primary.example.com user=replicator dbname=postgres'
 
 Create the logical slot WITH `failover = true`:

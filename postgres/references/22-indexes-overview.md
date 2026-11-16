@@ -143,7 +143,7 @@ The full PG16 grammar:[^createindex]
 
 Eight orthogonal options apply to most index types:
 
-1. `UNIQUE` — supported by the built-in B-tree access method. PG18 permits suitable non-B-tree unique indexes supplied by extensions in more contexts; equality support alone does not make an access method unique.
+1. `UNIQUE` — supported by the built-in B-tree access method. PG18 lets a non-B-tree unique index (from an extension access method that supports uniqueness) serve as a partition key or a materialized view's unique index; equality support alone does not make an access method unique.[^pg18-nonbtree-unique]
 2. `CONCURRENTLY` — non-blocking build at the cost of a longer build time; see [`26-index-maintenance.md`](./26-index-maintenance.md)
 3. `USING method` — the access method (`btree` is the default if omitted)
 4. `( expression )` — wrap any expression in parentheses to build a functional index
@@ -206,10 +206,10 @@ The predicate must use only columns of the target table and only `IMMUTABLE` ope
 
 *"An index column need not be just a column of the underlying table, but can be a function or scalar expression computed from one or more columns of the table … the index expressions are not recomputed during an indexed search, since they are already stored in the index. Thus, indexes on expressions are useful when retrieval speed is more important than insertion and update speed."*[^expr]
 
-The function in an expression index must be marked `IMMUTABLE` ([`06-functions.md`](./06-functions.md)). The canonical examples:
+The function in an expression index must be marked `IMMUTABLE` ([`06-functions.md`](./06-functions.md)). In the second example `created_at` is `timestamptz`; the three-argument `date_trunc(text, timestamptz, text)` is immutable only on PG16+, so the index fails to build on PG14–15. The canonical examples:
 
     CREATE INDEX users_email_lower ON users (lower(email));
-    CREATE INDEX orders_day ON orders (date_trunc('day', created_at, 'UTC')); -- created_at is timestamptz, PG16+
+    CREATE INDEX orders_day ON orders (date_trunc('day', created_at, 'UTC'));
 
 Match the query's expression *exactly* — `WHERE lower(email) = $1` will use the first index, but `WHERE email ILIKE $1` will not.
 
@@ -253,7 +253,7 @@ A B-tree can be scanned in either direction at the same cost. You need an explic
 
 ### Unique Indexes and NULLS NOT DISTINCT (PG15+)
 
-*"Currently, only B-tree indexes can be declared unique."*[^unique] PG18 permits suitable unique indexes supplied by extensions in additional contexts, but does not make built-in hash or GiST indexes unique.
+*"Currently, only B-tree indexes can be declared unique."*[^unique] PG18 lets a unique index from an extension access method serve as a partition key or a materialized view's unique index, but does not make built-in hash or GiST indexes unique.[^pg18-nonbtree-unique]
 
 *"By default, null values in a unique column are not considered equal, allowing multiple nulls in the column. The `NULLS NOT DISTINCT` option modifies this and causes the index to treat nulls as equal."*[^unique]
 
@@ -372,10 +372,11 @@ This identifies full, valid B-tree indexes whose leading key columns include the
 
 ### Recipe 4 — Audit: duplicate or overlapping indexes
 
-A common bloat source. The query identifies candidate indexes sharing the same set of columns, not necessarily identical prefixes. Review order, operator classes, predicates, included columns, uniqueness, constraints and replica identity before removing anything.
+A common bloat source. The query pairs indexes on the same table whose key-column sets are equal or where one contains the other, ignoring column order and `INCLUDE` columns. Expression columns appear as `0` in `indkey`, so two different expression indexes can match. Review order, operator classes, predicates, included columns, uniqueness, constraints and replica identity before removing anything.
 
     WITH idx AS (
-        SELECT indexrelid, indrelid, indkey::int[] AS keys,
+        SELECT indexrelid, indrelid,
+               (indkey::int[])[0:indnkeyatts - 1] AS keys,
                pg_get_indexdef(indexrelid) AS def
         FROM pg_index
     )
@@ -433,7 +434,7 @@ A read-hot lookup that needs a few payload columns:
     FROM orders
     WHERE user_id = $1 AND status = 'paid';
 
-Verify with `EXPLAIN (ANALYZE, BUFFERS)` that you see `Index Only Scan` and `Heap Fetches: 0`. Non-zero `Heap Fetches` means autovacuum is behind on this table.
+Verify with `EXPLAIN (ANALYZE, BUFFERS)` that you see `Index Only Scan` and `Heap Fetches: 0`. Non-zero `Heap Fetches` means some heap pages are not all-visible: recent writes or a snapshot that delays vacuum, not only autovacuum lag.
 
 ### Recipe 8 — `LIKE 'prefix%'` index under a non-C collation
 
@@ -554,7 +555,7 @@ See [`26-index-maintenance.md`](./26-index-maintenance.md) for the full operatio
 
 11. **Partial-index predicate must use only IMMUTABLE expressions.** `WHERE created_at > now() - interval '7 days'` is not a valid partial-index predicate — `now()` is `STABLE`, not `IMMUTABLE`. Use a fixed timestamp instead, and rebuild the index periodically.
 
-12. **Index-only scan still does heap fetches if VACUUM is behind.** `Heap Fetches: N` in EXPLAIN means the visibility map is stale. Tune autovacuum; see §Index-Only Scans above and [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md).
+12. **Index-only scan still does heap fetches on pages that are not all-visible.** `Heap Fetches: N` in EXPLAIN counts rows whose heap page lacks the all-visible bit, from recent writes, snapshots that delay vacuum, or autovacuum lag. Check for long-running transactions before tuning autovacuum; see §Index-Only Scans above and [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md).
 
 13. **B-tree deduplication requires REINDEX after pg_upgrade from PG12 or earlier.** *"Users upgrading with pg_upgrade will need to use `REINDEX` to make an existing index use this feature."*[^pg13-dedup]
 
@@ -572,9 +573,9 @@ See [`26-index-maintenance.md`](./26-index-maintenance.md) for the full operatio
 
 20. **Building an index without `CONCURRENTLY` takes `SHARE` lock and blocks writes.** Use `CREATE INDEX CONCURRENTLY` in production. See [`26-index-maintenance.md`](./26-index-maintenance.md).
 
-21. **Indexes can prevent HOT updates.** On PG16+, changing only BRIN-indexed columns can still be HOT if the other conditions hold. See [`30-hot-updates.md`](./30-hot-updates.md).
+21. **Indexes can prevent HOT updates.** *"Indexes can also prevent the creation of heap-only tuples. Therefore indexes that are seldom or never used in queries should be removed."*[^intro] A HOT update requires that no column covered by a non-summarizing index be modified, so every extra B-tree, GIN, GiST, or hash index narrows that condition. On PG16+, changing only BRIN-indexed (summarizing) columns can still be HOT if the other conditions hold. See [`30-hot-updates.md`](./30-hot-updates.md).
 
-22. **An invalid index may still cost writes.** Investigate build state, partitioned index attachment, constraints and dependencies before dropping an invalid index.
+22. **An invalid index may still cost writes.** Investigate build state, partitioned index attachment, constraints and dependencies before dropping an invalid index. For one left by a failed `CREATE INDEX CONCURRENTLY`, the docs recommend dropping it and running the concurrent build again, or rebuilding it with `REINDEX INDEX CONCURRENTLY`.
 
 23. **`NULLS NOT DISTINCT` is not allowed on a primary key in PG16+.** Use it on a uniqueness index/constraint that allows the column to be NULL.[^pg16-nnd]
 

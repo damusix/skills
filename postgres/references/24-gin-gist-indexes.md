@@ -719,7 +719,7 @@ ALTER INDEX events_payload_gin SET (fastupdate = off);  -- read-uniform
 ### Recipe 10: Enable parallel GIN build for large initial loads (PG18+)
 
 ```sql
--- PG18+ — parallel GIN builds (the first concurrent scan can also use workers)
+-- PG18+: parallel GIN build
 SET max_parallel_maintenance_workers = 4;
 SET maintenance_work_mem = '2GB';
 CREATE INDEX docs_body_gin ON docs USING gin (body_tsv);
@@ -786,7 +786,7 @@ Typical outcome: `jsonb_path_ops` is 25–50% smaller, scans 30–60% faster on 
 
 4. **`gin_clean_pending_list()` requires `MAINTAIN` (PG17+) or table-owner privileges.** Cannot be called by a regular user. If you need it as part of a scheduled job, either run as a privileged role or grant `MAINTAIN` on the index's table to the job role.
 
-5. **`jsonb_path_ops` creates no entries for empty structures.** Searches for them may require a full-index scan, not incorrect results.[^gin-implementation]
+5. **`jsonb_path_ops` creates no entries for empty structures.** Searches for them may require a full-index scan, not incorrect results.[^jsonb-path-ops-empty]
 
 6. **`inet_ops` is not the default on PG14–18.** A bare `CREATE INDEX ON tbl USING gist (ip);` produces an empty opclass list and fails. You must say `gist (ip inet_ops)` to get the network-containment index.[^gist-inet]
 
@@ -849,6 +849,8 @@ Typical outcome: `jsonb_path_ops` is 25–50% smaller, scans 30–60% faster on 
 
 
 [^gin-implementation]: PostgreSQL 16 Manual, GIN Implementation. *"Internally, a GIN index contains a B-tree index constructed over keys, where each key is an element of one or more indexed items (a member of an array, for example) and where each tuple in a leaf page contains either a pointer to a B-tree of heap pointers (a 'posting tree'), or a simple list of heap pointers (a 'posting list') when the list is small enough to fit into a single index tuple along with the key value."* Also: *"Updating a GIN index tends to be slow because of the intrinsic nature of inverted indexes ... GIN is capable of postponing much of this work by inserting new tuples into a temporary, unsorted list of pending entries."* https://www.postgresql.org/docs/16/gin-implementation.html
+
+[^jsonb-path-ops-empty]: PostgreSQL 16 Manual, JSON Types, jsonb Indexing. *"A disadvantage of the jsonb_path_ops approach is that it produces no index entries for JSON structures not containing any values, such as {"a": {}}. If a search for documents containing such a structure is requested, it will require a full-index scan, which is quite slow."* https://www.postgresql.org/docs/16/datatype-json.html
 
 [^gin-builtin]: PostgreSQL 16 Manual, GIN Built-in Operator Classes (Table 70.1). https://www.postgresql.org/docs/16/gin-builtin-opclasses.html
 

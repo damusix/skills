@@ -575,9 +575,9 @@ The expanded `\d+` output includes a "Rules:" section listing all rules on the r
 
 14. **`pg_get_ruledef()` may return a reconstruction, not the original text.** The catalog stores rules in internal parse-tree form; reconstruction renders cleanly but may rearrange clauses or add explicit casts. Cross-reference [`64-system-catalogs.md`](./64-system-catalogs.md) for `pg_get_*def()` function semantics.
 
-15. **Do not drop a view's `_RETURN` rule.** Drop the view instead.
+15. **Do not drop a view's `_RETURN` rule.** The view depends on it, so `DROP RULE "_RETURN" ON v` fails with a dependency error. Use `DROP VIEW` instead.
 
-16. **Some original statements with `WITH` clauses are unsupported by update rules.** The restriction concerns rewriting those original queries, not a blanket ban on CTEs in every rule action.[^rules-update]
+16. **Data-modifying `WITH` statements cannot target tables with most rules.** Verbatim: *"At present, any table used as the target of a data-modifying statement in WITH must not have a conditional rule, nor an ALSO rule, nor an INSTEAD rule that expands to multiple statements."*[^queries-with] This restricts the original query, not CTEs inside a rule action.
 
 17. **CASCADE rule drops can be surprising.** `DROP RULE r ON t CASCADE` will drop any objects depending on rule `r` — usually nothing, but if other rules reference values computed by `r`, the cascade can be wider than expected. Use `RESTRICT` (the default) and address dependencies explicitly.
 
@@ -637,3 +637,5 @@ The expanded `\d+` output includes a "Rules:" section listing all rules on the r
 [^pg18-release]: PostgreSQL 18.0 release notes — confirmed by direct fetch to contain **zero** rules-system-related items. The rules chapter was renumbered from chapter 41 (PG16) to chapter 39 (PG18) due to broader manual reorganization, but the content is byte-identical. https://www.postgresql.org/docs/release/18.0/
 
 [^create-view-rules]: PostgreSQL 16 documentation, `CREATE VIEW` reference page. Verbatim: *"If the view or any of its base relations has an INSTEAD rule that causes the INSERT or UPDATE command to be rewritten, then all check options will be ignored in the rewritten query, including any checks from automatically updatable views defined on top of the relation with the INSTEAD rule."* and *"You can get the effect of an updatable view by creating INSTEAD OF triggers on the view, which must convert attempted inserts, etc. on the view into appropriate actions on other tables. For more information see CREATE TRIGGER. Another possibility is to create rules (see CREATE RULE), but in practice triggers are easier to understand and use correctly."* https://www.postgresql.org/docs/16/sql-createview.html
+
+[^queries-with]: PostgreSQL 16 documentation, section 7.8.4 "Data-Modifying Statements in WITH". Verbatim: *"At present, any table used as the target of a data-modifying statement in WITH must not have a conditional rule, nor an ALSO rule, nor an INSTEAD rule that expands to multiple statements."* https://www.postgresql.org/docs/16/queries-with.html

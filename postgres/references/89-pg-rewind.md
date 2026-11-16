@@ -486,8 +486,8 @@ grep primary_conninfo /var/lib/postgresql/16/main/postgresql.auto.conf
 ```
 
 Pre-PG18 the `dbname=` part was stripped. PG18+ keeps it — useful for connection-name attribution in logs.
-The generated connection uses `rewind_role`; replace it with credentials authorized for physical replication before starting the standby. See <https://www.postgresql.org/docs/16/warm-standby.html#STREAMING-REPLICATION-AUTHENTICATION>.
 
+The generated connection uses `rewind_role`; replace it with credentials authorized for physical replication before starting the standby. See <https://www.postgresql.org/docs/16/warm-standby.html#STREAMING-REPLICATION-AUTHENTICATION>.
 
 ### 9. PG14+ rewind a standby (not just former primary)
 
@@ -622,7 +622,7 @@ Verbatim docs (`--dry-run`):
 
 22. **PG17+ `--sync-method`** matches `pg_basebackup --sync-method` for tuning fsync behavior at end of rewind. Default `fsync` for durability — only change if you understand tradeoffs.
 
-23. **pg_rewind does not copy source replication slots.** Plan slot recreation or, on PG17+, configure and verify failover-slot synchronization separately. See <https://www.postgresql.org/docs/16/app-pgrewind.html>.
+23. **pg_rewind does not copy source replication slots, and skips `pg_replslot/`, so the target keeps its own stale slots.** After the rejoin, drop stale slots on the target that no longer have a consumer, because they retain WAL. Plan slot recreation or, on PG17+, configure and verify failover-slot synchronization separately. See <https://www.postgresql.org/docs/16/app-pgrewind.html>.
 
 ---
 

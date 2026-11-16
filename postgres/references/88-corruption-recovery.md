@@ -209,8 +209,8 @@ Verbatim `ignore_checksum_failure` docs: *"Setting ignore_checksum_failure to on
 
 **Distinction:**
 
-- `zero_damaged_pages` handles damaged **page headers** by zeroing a buffer in memory. PostgreSQL does not force that zeroed page to disk; recreating the affected relation is needed before returning to normal use.[^zero-damaged]
-- `ignore_checksum_failure` — fires only on **checksum** mismatch; only meaningful when data checksums are enabled. Reads the page anyway and lets the backend continue.
+- `zero_damaged_pages` zeroes, in memory, any page that fails read verification: a damaged page header, or a checksum failure when data checksums are enabled. Every row on that page is lost. PostgreSQL does not force the zeroed page to disk; recreating the affected relation is needed before returning to normal use.[^zero-damaged]
+- `ignore_checksum_failure` fires only on **checksum** mismatch and only when data checksums are enabled. It reads a checksum-failed page anyway when the page header is sane, so the rows on it stay readable; a corrupt header still errors. Try it before `zero_damaged_pages` when the goal is to read such a page rather than discard it.[^ignore-checksum]
 
 **Usage pattern (expert-directed salvage on an isolated copy):**
 
@@ -218,6 +218,8 @@ Verbatim `ignore_checksum_failure` docs: *"Setting ignore_checksum_failure to on
     SET zero_damaged_pages = on;
     \copy public.mytable TO '/tmp/mytable-survivors.csv' WITH (FORMAT csv, HEADER true)
     RESET zero_damaged_pages;
+
+The docs recommend recreating the table before turning `zero_damaged_pages` off, because the zeroed pages exist only in memory. If you rebuild on this salvage copy instead of in a fresh cluster, run `CREATE TABLE ... AS SELECT` from the damaged table in the same session, before `RESET`.[^zero-damaged]
 
 Treat the export as incomplete. If extraction fails, preserve the error and investigate rather than trusting a partially written CSV. Recreate the table or restore into a fresh cluster and reconcile constraints and application data. `SET LOCAL` outside a transaction would not persist to the extraction, and `VACUUM` cannot run inside a transaction block.[^zero-damaged]
 
@@ -405,6 +407,7 @@ Hit during query or VACUUM. Triage:
 
     -- In the database identified by base/16384, map the filenode to a relation.
     -- A filenode is not necessarily the relation's catalog OID.
+    -- Tablespace 0 means the database's default tablespace, which base/ paths use.
     SELECT pg_filenode_relation(0, 24576) AS damaged_relation;
 
     SELECT c.oid::regclass, c.relkind, pg_relation_filepath(c.oid)
@@ -498,7 +501,7 @@ Never write to the post-`pg_resetwal` cluster before dumping — verbatim: *"any
 
 ### Recipe 9 — Recover One Damaged Page (Destructive)
 
-Use this only on an isolated salvage copy after preserving the original cluster and accepting the loss of every row on a damaged page. `zero_damaged_pages` handles a damaged page header, not arbitrary checksum, tuple, or TOAST corruption.[^zero-damaged]
+Use this only on an isolated salvage copy after preserving the original cluster and accepting the loss of every row on a damaged page. `zero_damaged_pages` zeroes pages with a damaged header or, with data checksums on, a checksum failure; it does not repair tuple or TOAST corruption on pages that pass verification. To read a checksum-failed page with a sane header instead of zeroing it, use `ignore_checksum_failure`.[^zero-damaged][^ignore-checksum]
 
     -- In the affected database, identify the relation from the logged path.
     SELECT c.oid::regclass, c.relkind
@@ -509,6 +512,8 @@ Use this only on an isolated salvage copy after preserving the original cluster 
     SET zero_damaged_pages = on;
     \copy public.orders TO '/tmp/orders-survivors.csv' WITH (FORMAT csv, HEADER true)
     RESET zero_damaged_pages;
+
+To rebuild on this salvage copy, create the replacement table with `CREATE TABLE ... AS SELECT` in the same session before `RESET`, as the docs recommend.
 
 Check that the export completed. A partial CSV from a failed COPY is not a valid backup. Zeroed buffers are not forced to disk, so `CHECKPOINT` is not a repair procedure. Restore readable data into a fresh cluster or recreate the affected relation, and reconcile lost rows, foreign keys, uniqueness, and application invariants before reuse.[^zero-damaged]
 

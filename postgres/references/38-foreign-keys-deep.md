@@ -204,7 +204,7 @@ Verbatim per-action from `CREATE TABLE` [^pg16-createtable]:
 ### RESTRICT vs NO ACTION
 
 
-Deferrability is not the only difference: `ON UPDATE RESTRICT` also rejects changing a referenced value to a distinct value that compares equal, while `NO ACTION` can allow it if the final state still satisfies the FK.[^pg16-fk]
+Deferrability is not the only difference: `ON UPDATE RESTRICT` also rejects changing a referenced value to a distinct value that compares equal, while `NO ACTION` can allow it if the final state still satisfies the FK.[^pg18-ddl-fk]
 
 
 | Property | `RESTRICT` | `NO ACTION` (default) |
@@ -458,7 +458,7 @@ PostgreSQL has incrementally improved declarative-partitioning FK support across
 **Lock implication.** `ADD FOREIGN KEY` on a partitioned-table parent takes `SHARE ROW EXCLUSIVE` on the parent *and on every partition*. With many partitions, this can briefly contend with concurrent DDL across the partition tree. `NOT VALID` (PG18+) skips the full scan; `VALIDATE CONSTRAINT` then revalidates each partition under `SHARE UPDATE EXCLUSIVE` per partition.
 
 
-Pre-PG18, creating a parent FK requires validation rather than attaching independently declared leaf FKs as a substitute. Schedule the validation and its write-blocking locks.
+Pre-PG18 workaround: add the FK to each leaf partition with `NOT VALID` (each leaf is a regular table), run `VALIDATE CONSTRAINT` per leaf under `SHARE UPDATE EXCLUSIVE`, then add the FK on the parent. The parent `ADD FOREIGN KEY` attaches an existing leaf FK instead of creating and scanning a new one, but only when the leaf FK matches it (same columns, referenced table, equality operators, `ON UPDATE`/`ON DELETE` actions, match type and deferrability) and is already validated (`tryAttachPartitionForeignKey()` in `src/backend/commands/tablecmds.c`, REL_16_STABLE). A leaf FK that is still `NOT VALID` or differs in any of those attributes gets a new constraint and a full scan. The parent statement still takes `SHARE ROW EXCLUSIVE` on every partition and on the referenced table for its brief duration.
 
 
 **Indexing.** A partitioned-table FK requires an index on the referenced side's PK or unique key, which is automatically present (PK creates a UNIQUE index). On the referencing side, you still need an index per partition for parent-DELETE performance (same rule as non-partitioned).
@@ -555,7 +555,7 @@ Use cases:
 
 > [!WARNING]
 
-> A `NOT ENFORCED` constraint does not check writes. Do not assume existing rows satisfy it when enabling enforcement; consult the target version's `ALTER TABLE` behavior and validate the data before relying on it. See <https://www.postgresql.org/docs/18/sql-altertable.html>.
+> A `NOT ENFORCED` constraint does not check writes, so rows that violate it can accumulate.[^pg18-createtable] On PG18, `ALTER TABLE ... ALTER CONSTRAINT name ENFORCED` on an FK recreates the RI triggers and scans existing rows in the same command, failing if any row violates the constraint; it is not a metadata-only flip. `VALIDATE CONSTRAINT` on a constraint that is still `NOT ENFORCED` raises `cannot validate NOT ENFORCED constraint`.[^pg18-enforce-src] Find and fix violating rows before enabling enforcement.
 
 
     ALTER TABLE orders
@@ -950,7 +950,7 @@ For a CHECK with `NO INHERIT`, see [`37-constraints.md`](./37-constraints.md). F
 4. **A covering index needs FK columns as the leading columns.** An index on `(other_col, fk_col)` does **not** help the FK validation scan — the planner cannot use a non-leading column for an equality probe efficiently. See Recipe 3.
 
 
-5. **`ADD FOREIGN KEY` takes `SHARE ROW EXCLUSIVE` on both tables, not `ACCESS EXCLUSIVE`.** Verbatim *"ADD FOREIGN KEY requires only a SHARE ROW EXCLUSIVE lock. Note that ADD FOREIGN KEY also acquires a SHARE ROW EXCLUSIVE lock on the referenced table"* [^pg16-altertable]. Reads continue on both sides; `FOR UPDATE` / `FOR NO KEY UPDATE` and conflicting DDL block.
+5. **`ADD FOREIGN KEY` takes `SHARE ROW EXCLUSIVE` on both tables, not `ACCESS EXCLUSIVE`.** Verbatim *"ADD FOREIGN KEY requires only a SHARE ROW EXCLUSIVE lock. Note that ADD FOREIGN KEY also acquires a SHARE ROW EXCLUSIVE lock on the referenced table"* [^pg16-altertable]. Reads and row-locking SELECTs (`FOR UPDATE`, `FOR NO KEY UPDATE`, which take `ROW SHARE`) continue on both sides; `INSERT`, `UPDATE` and `DELETE` (which take `ROW EXCLUSIVE`) and conflicting DDL block.
 
 
 6. **`MATCH SIMPLE` (the default) is permissive on multicolumn NULLs.** A row with one NULL FK column passes the constraint without referencing any parent row. For composite FKs where partial NULL is a bug, declare `MATCH FULL`.
@@ -1075,6 +1075,10 @@ For a CHECK with `NO INHERIT`, see [`37-constraints.md`](./37-constraints.md). F
 
 
 [^pg18-notvalid-fk-part]: PostgreSQL 18 release notes, "E.4.3.2.1 Partitioning": *"Allow NOT VALID foreign key constraints on partitioned tables (Amul Sul)."* https://www.postgresql.org/docs/18/release-18.html
+
+[^pg18-ddl-fk]: PostgreSQL 18 docs, "5.5.5. Foreign Keys": *"There is also a noticeable difference between ON UPDATE NO ACTION (the default) and ON UPDATE RESTRICT. The former will allow the update to proceed and the foreign-key constraint will be checked against the state after the update. The latter will prevent the update to run even if the state after the update would still satisfy the constraint. This prevents updating a referenced row to a value that is distinct but compares as equal (for example, a character string with a different case variant, if a character string type with a case-insensitive collation is used)."* https://www.postgresql.org/docs/18/ddl-constraints.html
+
+[^pg18-enforce-src]: PostgreSQL source, `src/backend/commands/tablecmds.c` (REL_18_STABLE). `ATExecAlterConstrEnforceability()` creates the FK triggers when a constraint changes to `ENFORCED` and queues a Phase 3 check *"that the constraint is satisfied by existing rows"*; `ATExecValidateConstraint()` raises *"cannot validate NOT ENFORCED constraint"*. https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/tablecmds.c
 
 
 [^pg18-notenforced]: PostgreSQL 18 release notes: *"Allow CHECK and foreign key constraints to be specified as NOT ENFORCED (Amul Sul). This also adds column pg_constraint.conenforced."* https://www.postgresql.org/docs/18/release-18.html

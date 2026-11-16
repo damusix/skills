@@ -133,7 +133,7 @@ Planner computes total_cost
 The verbatim docs version: *"To determine whether JIT compilation should be used, the total estimated cost of a query ... is used. The estimated cost of the query will be compared with the setting of jit_above_cost. If the cost is higher, JIT compilation will be performed. Two further decisions are then needed. Firstly, if the estimated cost is more than the setting of jit_inline_above_cost, short functions and operators used in the query will be inlined. Secondly, if the estimated cost is more than the setting of jit_optimize_above_cost, expensive optimizations are applied to improve the generated code."*[^jit-decision]
 
 > [!WARNING] Cached plans and JIT settings
-> JIT cost thresholds are evaluated when a plan is built. SQL `PREPARE` parses and rewrites the statement; planning occurs at `EXECUTE`, and PostgreSQL may choose custom or cached generic plans. A cached generic plan retains its cost-based JIT decisions until replanned. Setting `jit = off` also disables JIT at execution time, independently of those decisions. See [PREPARE](https://www.postgresql.org/docs/16/sql-prepare.html) and [When to JIT](https://www.postgresql.org/docs/16/jit-decision.html).
+> JIT cost thresholds are evaluated when a plan is built. SQL `PREPARE` parses and rewrites the statement; planning occurs at `EXECUTE`, and PostgreSQL may choose custom or cached generic plans. A cached generic plan retains its cost-based JIT decisions until replanned. The JIT docs say the settings *"in effect at prepare time"* control a generic plan;[^jit-decision] read that as the settings in effect when the generic plan is built, which happens during an `EXECUTE`, not during SQL `PREPARE`. Setting `jit = off` also disables JIT at execution time, independently of those decisions. See [PREPARE](https://www.postgresql.org/docs/16/sql-prepare.html) and [When to JIT](https://www.postgresql.org/docs/16/jit-decision.html).
 
 To disable JIT for any individual phase, set its cost GUC to `-1`. Setting `jit_above_cost = -1` disables JIT entirely (without setting `jit = off`).[^cost-gucs]
 
@@ -383,10 +383,10 @@ SELECT pg_jit_available();
 
 -- If false, the new LLVM minimum may not be met
 -- PG17 needs LLVM 10+; PG18 needs LLVM 14+
--- Check the server log for "could not load JIT provider"
+-- A missing provider library is logged only at DEBUG1
 ```
 
-If `pg_jit_available()` returns false, check `jit`, the installed PostgreSQL JIT provider package, compatible LLVM runtime dependencies, and server logs. A provider load error can require fixing the installation; installing an arbitrary LLVM development package is not sufficient.
+If `pg_jit_available()` returns false, check `jit`, the installed PostgreSQL JIT provider package, compatible LLVM runtime dependencies, and server logs. A missing provider library raises no error and logs only at `DEBUG1` (*"provider not available, disabling JIT for current session"*), so confirm that `$libdir/llvmjit.so` exists (`pg_config --pkglibdir` prints `$libdir`). A provider load error can require fixing the installation; installing an arbitrary LLVM development package is not sufficient.
 
 
 ### Recipe 9: Configure JIT cost thresholds for an analytic workload
@@ -478,8 +478,9 @@ Each slow query now appears in the server log with its full `JIT:` section, incl
 Prepared statements can use custom plans planned per execution or a cached generic plan. To compare a new threshold with a freshly built plan in a diagnostic session:
 
 ```sql
--- In a diagnostic session, discard cached plans without deallocating statements:
-DISCARD PLANS;
+-- In a diagnostic session that already prepared q. DISCARD PLANS keeps
+-- prepared statements, so re-preparing q would fail; deallocate it instead.
+DEALLOCATE q;
 SET jit_above_cost = 50000;
 PREPARE q(int) AS SELECT count(*) FROM big WHERE x > $1;
 EXPLAIN (ANALYZE, VERBOSE) EXECUTE q(100);

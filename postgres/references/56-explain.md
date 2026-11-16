@@ -369,7 +369,7 @@ Interpretation:
 Three patterns to recognize:
 
 1. **`shared read` dominates `shared hit`** → working set exceeds `shared_buffers`, page cache, or both. Time to scale memory or rewrite the query.
-2. **`temp read/written` non-zero on a `Sort` or `Hash`** → `work_mem` is too small for this query. Raise per-session (`SET work_mem = '256MB'`) or per-role (`ALTER ROLE reporter SET work_mem = '512MB'`); never raise cluster-wide on a connection-heavy server — cross-reference [`54-memory-tuning.md`](./54-memory-tuning.md) gotcha #4.
+2. **`temp read/written` non-zero on a `Sort` or `Hash`** → `work_mem` is too small for this query. Raise per-session (`SET work_mem = '256MB'`) or per-role (`ALTER ROLE reporter SET work_mem = '512MB'`); never raise cluster-wide on a connection-heavy server — cross-reference [`54-memory-tuning.md`](./54-memory-tuning.md) Recipe 3 for per-role overrides and gotchas #3 and #4 for how `work_mem` multiplies across operations and sessions.
 3. **`written` non-zero on a SELECT** → this backend evicted previously dirty buffers during the query. The counter alone does not establish that the checkpointer or background writer is falling behind; investigate workload and writeback metrics.
 
 > [!NOTE] PostgreSQL 16+ I/O timing alternative
@@ -646,7 +646,7 @@ GROUP BY u.email;
 
 Walk the join nodes and investigate large estimate differences, accounting for early termination and per-loop averages. A difference is a clue, not proof of a root cause. For example, if a category filter estimate is wrong, inspect its statistics:
 
-1. `CREATE STATISTICS ON name FROM categories;` — useless, statistics already include name.
+1. Skip `CREATE STATISTICS ON name FROM categories;`: it fails, because extended statistics need two or more columns or one expression, and per-column statistics on `name` already exist.
 2. Inspect with `SELECT * FROM pg_stats WHERE tablename='categories' AND attname='name';` — is `most_common_vals` populated? Is `n_distinct` reasonable?
 3. If `categories` is small (<1000 rows), raise `default_statistics_target` for that column: `ALTER TABLE categories ALTER COLUMN name SET STATISTICS 1000;` then `ANALYZE categories;`
 
@@ -712,7 +712,7 @@ PG18 marks plan nodes that were forced into the plan despite a relevant `enable_
 
 6. **`Heap Fetches: > 0` on an Index Only Scan means visibility map is stale.** The index has all the columns but the planner cannot trust the all-visible bits. `VACUUM` the table; cross-reference [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md).
 
-7. **`Sort Method: external merge` means `work_mem` is too small for this query.** Raise per-session, not cluster-wide; cross-reference [`54-memory-tuning.md`](./54-memory-tuning.md) gotcha #4.
+7. **`Sort Method: external merge` means `work_mem` is too small for this query.** Raise per-session, not cluster-wide; cross-reference [`54-memory-tuning.md`](./54-memory-tuning.md) Recipe 3 for per-role overrides and gotchas #3 and #4 for how `work_mem` multiplies across operations and sessions.
 
 8. **`Batches: > 1` on HashAggregate / Hash Join means hash table spilled.** Same fix as Sort. Use `hash_mem_multiplier` PG13+ to break the symmetric work_mem assumption (default 2.0 since PG15).
 

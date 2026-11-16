@@ -122,10 +122,10 @@ Column-name conflicts merge if the types match, error otherwise[^createtable]: *
 
 ### The ONLY keyword and the trailing *
 
-Two equivalent notations control recursion:
+`ONLY` limits a statement to the named table; the default, or a trailing `*`, includes all descendants:
 
 ```sql
--- Both apply only to the parent, ignoring children
+-- Applies only to the parent, ignoring children
 SELECT * FROM ONLY cities;
 -- ONLY precedes the table name; there is no trailing ONLY form.
 
@@ -570,6 +570,46 @@ Compare to `ALTER TABLE ... DETACH PARTITION` in declarative partitioning ([`35-
 ### Recipe 11: Migrate inheritance-partitioned table to declarative partitioning
 
 Prepare the new parent and partitions, then stop all writers, including direct writes to children, for the entire copy and cutover. Copy every parent and child row while writes are stopped. Check and rebind dependent views, foreign keys, grants, triggers, and sequence ownership; a rename does not move dependencies to the new table. Keep the old hierarchy until the data and dependencies have been verified. For an online migration, use a coordinated change-capture and cutover procedure rather than a one-time copy.
+
+```sql
+-- BEFORE: inheritance partitioning by month
+-- events (parent, no data), events_2026_01, events_2026_02, ...
+
+-- 1. Build the new declarative parent under a different name
+CREATE TABLE events_new (
+    id          bigint GENERATED ALWAYS AS IDENTITY,
+    occurred_at timestamptz NOT NULL,
+    payload     jsonb NOT NULL
+) PARTITION BY RANGE (occurred_at);
+
+CREATE TABLE events_new_2026_01 PARTITION OF events_new
+    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+-- repeat per partition
+
+-- 2. Lock, copy, and rename in one transaction
+BEGIN;
+LOCK TABLE events IN ACCESS EXCLUSIVE MODE;   -- without ONLY, also locks every child
+
+INSERT INTO events_new (id, occurred_at, payload) OVERRIDING SYSTEM VALUE
+    SELECT id, occurred_at, payload FROM ONLY events;
+INSERT INTO events_new (id, occurred_at, payload) OVERRIDING SYSTEM VALUE
+    SELECT id, occurred_at, payload FROM ONLY events_2026_01;
+-- repeat per child
+
+SELECT setval(pg_get_serial_sequence('events_new', 'id'),
+              (SELECT max(id) FROM events_new));
+
+-- compare row counts against the old hierarchy before renaming
+ALTER TABLE events RENAME TO events_old;
+ALTER TABLE events_new RENAME TO events;
+COMMIT;
+
+-- 3. Rebind views, foreign keys, grants, and triggers; verify; only then
+--    DROP TABLE events_old CASCADE;
+```
+
+> [!WARNING]
+> `ACCESS EXCLUSIVE` blocks readers and writers for the whole copy, not only the rename. Schedule a maintenance window sized to the copy.
 
 
 ### Recipe 12: PG18 `VACUUM ONLY` to preserve pre-PG18 cron behavior

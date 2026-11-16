@@ -68,7 +68,7 @@ This file owns: hot standby query rules, the promotion API surface, the controll
 | Convert physical standby to logical subscriber | `pg_createsubscriber` PG17+ | Build logical replica from scratch | Avoids initial COPY for large databases |
 | Detect "am I on standby?" from app | `SELECT pg_is_in_recovery();` OR `SHOW in_hot_standby;` PG14+ | Read `pg_stat_replication` | Direct boolean, no privilege escalation |
 | Pause replay for forensics | `SELECT pg_wal_replay_pause();` + `pg_get_wal_replay_pause_state()` PG14+ | Stop the standby process | Three-state return clarifies pause-requested vs paused |
-| Force WAL flush before failover | Application-side: `SELECT pg_switch_wal();` + wait `pg_wal_lsn_diff` | Manual file copy | Programmatic, drains async standbys |
+| Confirm standby caught up before switchover | Block writers, save `pg_current_wal_flush_lsn()` on the primary, wait until standby `pg_last_wal_replay_lsn()` reaches it | `pg_switch_wal()` and a zero `replay_lsn` diff | The saved barrier proves the standby replayed every committed write |
 
 Smell signals:
 
@@ -276,7 +276,7 @@ Key invariants:
 
 - Step 4 must compare the promoted standby's replay position with the saved primary flush barrier, not merely compare `sent_lsn` with `replay_lsn`. Keep all writers blocked until the old primary is stopped and fenced.
 - Step 5 cleanly stops the old primary; verify it cannot restart as writable before promoting P2.
-- Step 7 (`pg_rewind`) requires `wal_log_hints = on` OR `data_checksums` enabled at initdb time on the OLD primary. Without one of these, `pg_rewind` refuses — fall back to fresh `pg_basebackup`.
+- Step 7 (`pg_rewind`) requires `wal_log_hints = on` OR data checksums (enabled at initdb, or offline with `pg_checksums --enable`) on the OLD primary before divergence. Without one of these, `pg_rewind` refuses — fall back to fresh `pg_basebackup`.
 
 ### Timeline IDs
 
@@ -510,14 +510,12 @@ Tune by either (a) shortening the standby query, (b) lowering `max_standby_strea
 Walkthrough of the canonical procedure for planned primary swap. See the [Controlled switchover procedure](#controlled-switchover-procedure) section above for the full script; this recipe demonstrates the verification queries.
 
 ```sql
--- Step 4 verification: standby caught up?
-SELECT
-  application_name,
-  pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS lag_bytes
-FROM pg_stat_replication
-WHERE application_name = 'p2';
--- Expect: lag_bytes = 0
--- If non-zero, do NOT proceed — issue pg_switch_wal() and re-check
+-- Step 3, on P1 after every writer is blocked: save the barrier
+SELECT pg_current_wal_flush_lsn();       -- e.g. 0/5A000148, saved to /secure/switchover-lsn
+
+-- Step 4, on P2: replayed past the saved barrier?
+SELECT pg_last_wal_replay_lsn() >= '0/5A000148'::pg_lsn AS caught_up;
+-- Expect: t. If f, keep writers blocked and re-check; do not promote a standby that cannot catch up.
 ```
 
 After Step 6 (promotion of P2):
@@ -556,7 +554,15 @@ SELECT
   pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()) AS delay_bytes;
 ```
 
-Pause replay before the unwanted commit is applied and copy needed data from the standby. For an exact cutoff, restore a separate backup using point-in-time recovery. Promotion replays immediately available WAL and removes the configured delay; it is not a way to discard pending WAL.
+To roll back, pause replay before the unwanted commit is applied, then restart the standby with a recovery target just before the bad transaction and `recovery_target_action = 'pause'`:
+
+```ini
+recovery_target_xid = '771234'        # the bad transaction; inclusive = off stops before it
+recovery_target_inclusive = off
+recovery_target_action = 'pause'
+```
+
+Replay stops at the target. Inspect the data, then copy rows back to the primary, or fence the old primary and end recovery with `pg_wal_replay_resume()` to make this standby the new primary. Promoting without a recovery target replays all received WAL and removes the delay, so it applies the unwanted transaction. Recovery target settings take effect only at server start. Full steps: [`73-streaming-replication.md`](./73-streaming-replication.md) Recipe 6.
 
 ### Recipe 7: Pause replay for forensics
 
@@ -702,7 +708,7 @@ SELECT * FROM accounts WHERE id = 1 FOR UPDATE;
 
 4. **`pg_promote()` requires `pg_promote` predefined role or superuser.** Not `pg_monitor` or `pg_signal_backend`. PG14+ added `pg_promote` predefined role; grant to monitoring/automation accounts.
 
-5. **`pg_rewind` requires `wal_log_hints = on` OR `data_checksums` at initdb time.** Cannot enable retroactively to "fix" a cluster mid-incident — those settings must have been active BEFORE the divergence. New clusters: enable both at initdb to keep this option available.
+5. **`pg_rewind` requires `wal_log_hints = on` OR data checksums (set at initdb or offline with `pg_checksums --enable`).** Cannot enable retroactively to "fix" a cluster mid-incident — those settings must have been active BEFORE the divergence. New clusters: enable both at initdb to keep this option available.
 
 6. **`pg_rewind` requires clean shutdown on the target.** A crashed old primary cannot be rewinded directly. Either start it briefly (it will replay its own WAL, reach a consistent state, then stop cleanly), or fall back to `pg_basebackup`.
 

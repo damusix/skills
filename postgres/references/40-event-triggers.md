@@ -90,7 +90,7 @@ Event triggers fire on one of five named events.
 | `ddl_command_start`  | Before any `CREATE`/`ALTER`/`DROP`/`SECURITY LABEL`/`COMMENT`/`GRANT`/`REVOKE`/`SELECT INTO` | `TG_TAG` (and `TG_EVENT` for context)                  | PG 9.3          |
 | `ddl_command_end`    | After the same commands; before transaction commit                                 | `pg_event_trigger_ddl_commands()`                         | PG 9.3          |
 | `sql_drop`           | Just before `ddl_command_end` for any DROP; after catalog rows are gone           | `pg_event_trigger_dropped_objects()`                      | PG 9.3          |
-| `table_rewrite`      | Just before certain `ALTER TABLE`/`ALTER TYPE` table rewrites | `pg_event_trigger_table_rewrite_oid()` / `..._reason()` | PG 9.5 |
+| `table_rewrite`      | Just before certain `ALTER TABLE`/`ALTER TYPE`/`ALTER MATERIALIZED VIEW` table rewrites | `pg_event_trigger_table_rewrite_oid()` / `..._reason()` | PG 9.5 |
 | `login`              | After authentication succeeds, before the first client query                       | `current_user`, `pg_stat_activity`, normal SQL            | PG 17           |
 
 > [!NOTE] PostgreSQL 17
@@ -658,7 +658,7 @@ Combine Recipe 1 (DDL audit) with a scheduled diff to catch unexpected schema ch
 
 The `NOT in_extension` filter excludes DDL from extension installs (which are expected) — only "raw" DDL appears. Alert on DDL outside the maintenance window or by unexpected roles.
 
-### Recipe 13: Cause an event trigger to fire on a standby's apply path
+### Recipe 13: Cause an event trigger to fire in replica-role sessions
 
 Event triggers in sessions with `session_replication_role = replica` fire only when enabled for replica or always. Native logical replication does not replicate DDL or apply it through this path:
 

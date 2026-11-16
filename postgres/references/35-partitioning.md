@@ -291,6 +291,9 @@ UPDATE tenant_events
 > [!NOTE] Row movement
 > An update that moves a row is implemented with a delete and insert; consult trigger and foreign-key rules when designing side effects.[^pg11-rowmove]
 
+> [!NOTE] PostgreSQL 15
+> Foreign-key actions on row movement were normalized in PG15[^pg15-fk]. Previously a partition-key UPDATE ran a `DELETE` action on the source partition and an `INSERT` action on the target, which could fire `ON DELETE` FK actions in surprising ways. PG15+ runs an UPDATE action on the partition root.
+
 Row movement still has cost: the row is physically deleted from the source partition and inserted into the destination, which produces dead tuples in the source. Frequent partition-key UPDATEs negate the locality benefit of partitioning. If row movement is the norm, the partition key is wrong.
 
 
@@ -364,8 +367,8 @@ CREATE TABLE events (
 ) PARTITION BY RANGE (occurred_at);
 ```
 
-> [!NOTE] PostgreSQL 18
-> Exclusion constraints on partitioned tables are supported in PG18, not PG17, when partition-key columns are compared for equality. See <https://www.postgresql.org/docs/18/ddl-partitioning.html>.
+> [!NOTE] PostgreSQL 17
+> Exclusion constraints on partitioned tables are now supported[^pg17-exclude] as long as the exclusion compares partition-key columns for equality. Verbatim: *"Allow exclusion constraints on partitioned tables. As long as exclusion constraints compare partition key columns for equality, other columns can use exclusion constraint-specific comparisons."* Pre-PG17 you could only put exclusion constraints on individual leaf partitions.
 
 > [!NOTE] PostgreSQL 17
 > Identity columns on partitioned tables are allowed since PG17[^pg17-identity]. Verbatim: *"Allow partitioned tables to have identity columns."* Pre-PG17 you had to attach a sequence to a non-identity bigint column.
@@ -483,7 +486,7 @@ See [`39-triggers.md`](./39-triggers.md) (not yet written) for the trigger surfa
 The verbatim limitations list from `ddl-partitioning.html` §5.11.2.3[^limitations]:
 
 1. **Unique / PK constraints must include all partition key columns** (covered above).
-2. **No exclusion constraints spanning the whole partitioned table** before PG18; PG18 allows partition-key-equality cases.
+2. **No exclusion constraints spanning the whole partitioned table** before PG17; PG17 allows partition-key-equality cases (see above).
 3. **BEFORE ROW INSERT triggers cannot change destination partition.**
 4. **Cannot mix temporary and permanent relations in one partition tree.**
 5. **Partition cannot inherit from anything other than its partitioned parent**; no multiple inheritance.
@@ -505,10 +508,10 @@ The verbatim limitations list from `ddl-partitioning.html` §5.11.2.3[^limitatio
 | PG12 | FK referencing partitioned table; partition pruning improvements; `COPY` into partitioned tables faster; reduced lock for ATTACH PARTITION; partition introspection functions (`pg_partition_root`, `pg_partition_ancestors`, `pg_partition_tree`); `\dP` in psql | [^pg12-fk-ref], [^pg12-bounds], [^pg12-attach], [^pg12-intro] |
 | PG13 | More partition pruning cases; partitionwise joins fire with non-matching bounds; BEFORE ROW triggers on partitioned tables; logical replication of partitioned tables (with `publish_via_partition_root`); subscribers can target partitioned tables | [^pg13-pwjoin], [^pg13-trigger], [^pg13-logical] |
 | PG14 | `DETACH PARTITION CONCURRENTLY` + `FINALIZE`; UPDATE/DELETE on partitioned tables much faster; `REINDEX` recurses through partition tree | [^pg14-detach], [^pg14-reindex] |
-| PG15 | Planning and ordered scans of partitions improved; `CLUSTER` on partitioned tables; `ALTER TRIGGER RENAME` recurses | [^pg15-plan], [^pg15-cluster], [^pg15-trigger-rename] |
+| PG15 | Planning and ordered scans of partitions improved; FK actions on row movement run as an UPDATE action on the root; `CLUSTER` on partitioned tables; `ALTER TRIGGER RENAME` recurses | [^pg15-plan], [^pg15-fk], [^pg15-cluster], [^pg15-trigger-rename] |
 | PG16 | RANGE and LIST partition lookup caching | [^pg16-cache] |
-| PG17 | Identity columns; partition pruning for `IS [NOT] UNKNOWN` on booleans; per-table access methods on partitioned tables | [^pg17-identity], [^pg17-bool-prune], [^pg17-am] |
-| PG18 | Exclusion constraints on partitioned tables with partition-key equality; broader partitionwise joins; `VACUUM`/`ANALYZE` with `ONLY`; unlogged partitioned tables disallowed | <https://www.postgresql.org/docs/18/ddl-partitioning.html>, [^pg18-pwjoin], [^pg18-vac-only], [^pg18-unlogged] |
+| PG17 | Identity columns; exclusion constraints (with partition-key equality); partition pruning for `IS [NOT] UNKNOWN` on booleans; per-table access methods on partitioned tables | [^pg17-identity], [^pg17-exclude], [^pg17-bool-prune], [^pg17-am] |
+| PG18 | Non-btree unique indexes allowed as partition keys (index type must support equality); broader partitionwise joins with lower memory; faster planning on many partitions; better partition cost estimates; `VACUUM`/`ANALYZE` with `ONLY`; unlogged partitioned tables disallowed | [^pg18-nonbtree-unique], [^pg18-pwjoin], [^pg18-plan], [^pg18-cost], [^pg18-vac-only], [^pg18-unlogged] |
 
 
 ## Examples / Recipes

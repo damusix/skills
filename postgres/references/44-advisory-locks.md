@@ -55,7 +55,7 @@ Five rules that drive almost every advisory-lock decision:
 
 3. **There are two key spaces — a single `bigint` and a pair of `(int4, int4)` — and they do not overlap.** Verbatim: *"these two key spaces do not overlap."*[^key-spaces] A lock on `pg_advisory_lock(1)` is a **different** lock from `pg_advisory_lock(0, 1)`. Pick one form per application and stick with it. The two-int form is the canonical choice when you have two natural identifiers to combine (e.g., tenant_id + operation_id). The single-bigint form is canonical for hashed string identifiers.
 
-4. **Session-level locks stack — N acquires require N releases by the same backend.** Reacquiring a held lock succeeds even when others wait; it increments the session's acquisition count. `pg_try_advisory_lock` also reacquires and is not an idempotent held-already check.[^stacking][^reentrancy]
+4. **Session-level locks stack: N acquires require N releases by the same backend.** Reacquiring a held lock succeeds even when others wait; it increments the session's acquisition count. `pg_try_advisory_lock` also reacquires and is not an idempotent held-already check.[^stacking][^reentrancy]
 
 5. **Advisory locks consume shared memory from the same pool as row/table locks** — sized by `max_locks_per_transaction × (max_connections + max_prepared_transactions)`. Verbatim: *"Both advisory locks and regular locks are stored in a shared memory pool whose size is defined by the configuration variables `max_locks_per_transaction` and `max_connections`. Care must be taken not to exhaust this memory or the server will be unable to grant any locks at all."*[^shared-pool] On a cluster with `max_locks_per_transaction = 64` and `max_connections = 100`, there is a hard ceiling of roughly 6,400 concurrent locks (advisory + relation + tuple combined). Holding tens of thousands of session-level advisory locks across long-lived connections will drive the pool to exhaustion and break **all** locking — including DDL.
 
@@ -556,7 +556,7 @@ Advisory locks are local to a PostgreSQL server and are not replicated. A promot
 
 3. **The two key spaces do not overlap.** `pg_advisory_lock(1)` and `pg_advisory_lock(0, 1)` are different locks. Workers using different forms will not see each other. Pick one form per application.
 
-4. **Session-level locks stack — N acquires require N releases.** Reacquiring the same key increments its hold count, not a separate visible `pg_locks` row.
+4. **Session-level locks stack: N acquires require N releases.** Reacquiring the same key increments its hold count, not a separate visible `pg_locks` row.
 
 5. **Reentrancy succeeds even when other backends are queued.** Verbatim: *"If a session already holds a given advisory lock, additional requests by it will always succeed, even if other sessions are awaiting the lock."*[^reentrancy] A backend that calls `pg_advisory_lock(K)` and waits for a second backend's reply that calls `pg_advisory_lock(K)` will deadlock — but if the same backend recursively re-acquires its own lock, it succeeds, which can mask logic bugs.
 
@@ -574,7 +574,7 @@ Advisory locks are local to a PostgreSQL server and are not replicated. A promot
 
 12. **Use a consistent key mapping for string identifiers.** `hashtext` returns a 32-bit integer and can collide; prefixing does not eliminate collisions. Coordinate mappings across clients and major upgrades.
 
-13. **Hash collisions are real but rare.** Two semantically distinct lock names hashing to the same `int4` will over-serialize. Mitigate by namespacing keys with a project-distinct prefix.
+13. **Hash collisions are real but rare.** Two semantically distinct lock names hashing to the same `int4` will over-serialize. A prefix does not change that; when collisions are unacceptable, assign keys from a registry table or a sequence instead of hashing names.
 
 14. **Cross-cluster coordination via advisory locks does not work.** Locks are postmaster-local. Replicas do not see the primary's advisory locks. After failover, all advisory locks reset.
 

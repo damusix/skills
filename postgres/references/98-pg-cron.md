@@ -40,13 +40,13 @@ Five rules:
 
 4. **Standard 5-field cron syntax + a `[1-59] seconds` extension.** Five space-separated fields: minute / hour / day-of-month / month / day-of-week. Plus `*` wildcard, `,` list, `-` range, `/` step, and (since v1.6.0) `$` for last-day-of-month. Verbatim: `"to use [1-59] seconds to schedule a job based on an interval. Note, you cannot use seconds with the other time units."` So `'30 seconds'` is legal but `'30 seconds * * * *'` is not.[^1]
 
-5. **Two execution modes — fork-process (default) vs `cron.use_background_workers`.** Default mode forks a new backend per scheduled execution (libpq connect, full process startup). Background-worker mode uses persistent `bgworker` slots — verbatim: `"the number of concurrent jobs is limited by the max_worker_processes setting, so you may need to raise that."` Background-worker mode is faster for sub-minute intervals but competes with parallel workers + autovacuum + logical replication for the `max_worker_processes` budget.[^1]
+5. **Two execution modes — fork-process (default) vs `cron.use_background_workers`.** Default mode forks a new backend per scheduled execution (libpq connect, full process startup). Background-worker mode uses persistent `bgworker` slots — verbatim: `"the number of concurrent jobs is limited by the max_worker_processes setting, so you may need to raise that."` Background-worker mode is faster for sub-minute intervals but competes with parallel workers + logical replication for the `max_worker_processes` budget (autovacuum workers are counted separately, under `autovacuum_max_workers`).[^1]
 
 > [!WARNING] pg_cron is NOT in core PostgreSQL
 > External extension. Requires `shared_preload_libraries = 'pg_cron'` + restart + `CREATE EXTENSION pg_cron` in the database named by `cron.database_name`. Most managed providers either preinstall it or block it entirely — verify before depending on it. Self-host: `apt install postgresql-17-cron` / `yum install pg_cron_17` / build from source. PG14/15/16/17/18 release notes contain **zero** pg_cron items — track upstream `citusdata/pg_cron/releases` for version timeline.
 
 > [!WARNING] Time zone defaults to GMT, not your server time
-> Verbatim README: `"Previously pg_cron could only use GMT time, but now you can adapt your time by setting cron.timezone in postgresql.conf."` Default is **GMT** (not UTC, not your server's `TimeZone` GUC). A nightly `'0 2 * * *'` job runs at **02:00 GMT** — which may be 21:00 / 19:00 / 03:00 / 11:00 local time depending on where you are. Set `cron.timezone = 'UTC'` (or your operational time zone) explicitly in `postgresql.conf`.
+> Verbatim README: `"Previously pg_cron could only use GMT time, but now you can adapt your time by setting cron.timezone in postgresql.conf."` Default is **GMT** (not your server's `TimeZone` GUC). A nightly `'0 2 * * *'` job runs at **02:00 GMT** — which may be 21:00 / 19:00 / 03:00 / 11:00 local time depending on where you are. Set `cron.timezone = 'UTC'` (or your operational time zone) explicitly in `postgresql.conf`.
 
 ## Decision Matrix
 
@@ -293,7 +293,7 @@ Two modes:
 
 **Fork mode (default)** — for each scheduled execution, pg_cron forks a new backend, libpq-connects, runs the SQL, exits. ~5-50ms startup overhead per job. Bounded by `max_connections`.
 
-**Background-worker mode** — `cron.use_background_workers = on` (postgresql.conf, restart). Persistent `bgworker` slots. Verbatim: `"the number of concurrent jobs is limited by the max_worker_processes setting, so you may need to raise that."` Faster for sub-minute schedules. Competes with parallel-query workers (`max_parallel_workers`), autovacuum workers (`autovacuum_max_workers`), logical-replication apply workers, and other extensions for the `max_worker_processes` budget — see [`63-internals-architecture.md`](./63-internals-architecture.md).
+**Background-worker mode** — `cron.use_background_workers = on` (postgresql.conf, restart). Persistent `bgworker` slots. Verbatim: `"the number of concurrent jobs is limited by the max_worker_processes setting, so you may need to raise that."` Faster for sub-minute schedules. Competes with parallel-query workers (`max_parallel_workers`), logical-replication apply workers, and other extensions for the `max_worker_processes` budget — see [`63-internals-architecture.md`](./63-internals-architecture.md).
 
 Concurrent job cap: `cron.max_running_jobs` (default 32). Beyond this, scheduler queues + runs as slots free up.
 
@@ -314,7 +314,7 @@ Operational consequences:
 | GUC | Default | Context | Notes |
 |---|---|---|---|
 | `cron.database_name` | `postgres` | postmaster | DB where extension installs + `cron.job` lives |
-| `cron.timezone` | `GMT` | postmaster | **Default is GMT, not UTC, not server-local** — always set explicitly |
+| `cron.timezone` | `GMT` | postmaster | **Default is GMT, not server-local** — always set explicitly |
 | `cron.use_background_workers` | `off` | postmaster | Use bgworker slots instead of forking; restart required |
 | `cron.max_running_jobs` | `32` | postmaster | Concurrent execution cap |
 | `cron.log_run` | `on` | postmaster | Whether to write to `cron.job_run_details` |
@@ -671,7 +671,7 @@ UPDATE cron.job SET active = true;          -- resume all
 
 16. **`cron.alter_job()` cannot change `jobname`.** Drop + re-add to rename.
 
-17. **A normal logical dump does not preserve pg_cron job definitions automatically.** `cron.job` is an extension table and the v1.6.8 install script does not register it with `pg_extension_config_dump`. Export and recreate schedules explicitly, and test the restore with jobs disabled until safe. `pg_dumpall --globals-only` does not dump database table contents. See <https://github.com/citusdata/pg_cron/blob/v1.6.8/pg_cron.sql> and <https://www.postgresql.org/docs/16/extend-extensions.html#EXTEND-EXTENSIONS-CONFIG-TABLES>.
+17. **`pg_dump` of the cron database carries the job rows, so a restored copy can run production jobs.** The extension upgrade scripts register `cron.job` and `cron.jobid_seq` (1.1 to 1.2) and `cron.job_run_details` and `cron.runid_seq` (1.2 to 1.3) with `pg_extension_config_dump`, so their rows are dumped with the extension. On a restore target that loads pg_cron and names the restored database in `cron.database_name`, every active job fires against that target on its production schedule. Disable jobs before the restore goes live: `UPDATE cron.job SET active = false;` or `SELECT cron.alter_job(jobid, active := false) FROM cron.job;`. pg_cron schedules jobs only from the database named in `cron.database_name`; a restore into a differently named database keeps the rows but runs nothing. `pg_dumpall --globals-only` does not dump table contents. See <https://github.com/citusdata/pg_cron/blob/v1.6.8/pg_cron--1.1--1.2.sql>, <https://github.com/citusdata/pg_cron/blob/v1.6.8/pg_cron--1.2--1.3.sql> and <https://www.postgresql.org/docs/16/extend-extensions.html#EXTEND-EXTENSIONS-CONFIG-TABLES>.
 
 18. **Cron shortcuts are supported.** The v1.6.8 parser recognizes `@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly` and aliases; `@every 5m` is not supported. See <https://github.com/citusdata/pg_cron/blob/v1.6.8/src/entry.c>.
 

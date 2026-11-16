@@ -285,7 +285,7 @@ Verbatim closing rule: *"In short, while an index-only scan is possible given th
 ### Parallel index build (PG11+)
 
 > [!NOTE] PostgreSQL 11
-> Docs: *"Allow parallel building of a btree index."*[^pg11-parallel] `CREATE INDEX` (without `CONCURRENTLY`) parallelizes the sort phase across `max_parallel_maintenance_workers` (default 2 since PG11). On a large table, this is a 2–4× build-time reduction.
+> Docs: *"Allow parallel building of a btree index."*[^pg11-parallel] `CREATE INDEX` parallelizes the sort phase across `max_parallel_maintenance_workers` (default 2 since PG11). On a large table, this is a 2–4× build-time reduction.
 
 `CREATE INDEX CONCURRENTLY` can parallelize its first table scan; its validation scan is not parallel.[^storage]
 
@@ -469,7 +469,7 @@ Without the mixed-direction index, the planner adds a Sort node on top of either
     EXPLAIN (ANALYZE, BUFFERS)
     SELECT id, email, display_name FROM users WHERE id = 42;
 
-If `Heap Fetches: > 0` appears, autovacuum has not yet set the visibility map for the heap pages those rows live on. Force it with `VACUUM users;` and re-EXPLAIN.
+If `Heap Fetches: > 0` appears, the heap pages those rows live on are not all-visible yet, because of recent writes, a snapshot that delays vacuum, or autovacuum lag. Run `VACUUM users;` and re-EXPLAIN; if fetches persist, look for long-running transactions.
 
 ### Recipe 6 — Audit fillfactor on hot-UPDATE tables
 
@@ -647,7 +647,7 @@ Index entries over the limit raise `index row size N exceeds btree version 4 max
 [^multicolumn]: PG 16 docs, "11.3. Multicolumn Indexes". Docs: *"A multicolumn B-tree index can be used with query conditions that involve any subset of the index's columns, but the index is most efficient when there are constraints on the leading (leftmost) columns. The exact rule is that equality constraints on leading columns, plus any inequality constraints on the first column that does not have an equality constraint, will be used to limit the portion of the index that is scanned."* https://www.postgresql.org/docs/16/indexes-multicolumn.html
 [^ios]: PG 16 docs, "11.9. Index-Only Scans and Covering Indexes". Docs: *"PostgreSQL supports index-only scans, which can answer queries from an index alone without any heap access. The basic idea is to return values directly out of each index entry instead of consulting the associated heap entry."* and *"The index type must support index-only scans. B-tree indexes always do."* and *"PostgreSQL tracks, for each page in a table's heap, whether all rows stored in that page are old enough to be visible to all current and future transactions. This information is stored in a bit in the table's visibility map."* https://www.postgresql.org/docs/16/indexes-index-only-scans.html
 [^unique]: PG 16 docs, "11.7. Unique Indexes". Docs: *"Currently, only B-tree indexes can be declared unique."* and *"null values in a unique column are not considered equal, allowing multiple nulls in the column."* and *"A multicolumn unique index will only reject cases where all indexed columns are equal in multiple rows."* https://www.postgresql.org/docs/16/indexes-unique.html
-[^storage]: PG 16 docs, "CREATE INDEX". Docs: *"The fillfactor for an index is a percentage that determines how full the index method will try to pack index pages. ... B-trees use a default fillfactor of 90, but any integer value from 10 to 100 can be selected."* and *"Controls usage of the B-tree deduplication technique. ... The default is ON."* https://www.postgresql.org/docs/16/sql-createindex.html
+[^storage]: PG 16 docs, "CREATE INDEX". Docs: *"The fillfactor for an index is a percentage that determines how full the index method will try to pack index pages. ... B-trees use a default fillfactor of 90, but any integer value from 10 to 100 can be selected."* and *"Controls usage of the B-tree deduplication technique. ... The default is ON."* and *"maintenance_work_mem specifies the maximum amount of memory that can be used by each index build operation as a whole, regardless of how many worker processes were started."* and *"While CREATE INDEX with the CONCURRENTLY option supports parallel builds without special restrictions, only the first table scan is actually performed in parallel."* https://www.postgresql.org/docs/16/sql-createindex.html
 [^pageinspect]: PG 16 docs, "F.25. pageinspect — low-level inspection of database pages". Documents `bt_metap`, `bt_page_stats`, `bt_page_items`, and (PG16+) `bt_multi_page_stats`. https://www.postgresql.org/docs/16/pageinspect.html
 [^pg11-include]: PG 11 release notes. Docs: *"Allow B-tree indexes to include columns that are not part of the search key or unique constraint, but are available to be read by index-only scans (Anastasia Lubennikova, Alexander Korotkov, Teodor Sigaev). This is enabled by the new INCLUDE clause of CREATE INDEX. It facilitates building 'covering indexes' that optimize specific types of queries. Columns can be included even if their data types don't have B-tree support."* https://www.postgresql.org/docs/release/11.0/
 [^pg11-parallel]: PG 11 release notes. Docs: *"Allow parallel building of a btree index (Peter Geoghegan, Rushabh Lathia, Heikki Linnakangas)"* https://www.postgresql.org/docs/release/11.0/

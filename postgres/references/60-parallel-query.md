@@ -150,8 +150,8 @@ The verbatim rules from `when-can-parallel-query-be-used.html`:[^when-parallel]
 2. *"A query which is suspended during its execution. In any situation in which the system thinks that partial or incremental execution might occur, no parallel plan is generated. For example, a cursor created using `DECLARE CURSOR` will never use a parallel plan."* PL/pgSQL `FOR row IN SELECT ... LOOP` is rewritten as a cursor and is therefore never parallel.
 3. *"A query that runs inside of another query that is already parallel."* No nested parallelism — a parallel-safe function called from a parallel worker runs serially in that worker.
 4. The query uses functions marked `PARALLEL RESTRICTED` (forces leader-only) or `PARALLEL UNSAFE` (disables parallel entirely).
-6. The query is `SELECT ... FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` / `FOR KEY SHARE` at the top level — row-locking is incompatible with parallel plans.
-7. The query references a function with side effects on the session (`set_config`, advisory locks acquired during execution, temp-table creation).
+5. The query is `SELECT ... FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` / `FOR KEY SHARE` at the top level — row-locking is incompatible with parallel plans.
+6. The query references a function with side effects on the session (`set_config`, advisory locks acquired during execution, temp-table creation).
 
 > [!NOTE] PostgreSQL 14
 > PL/pgSQL `RETURN QUERY` can now execute its query using parallelism — *"Allow plpgsql's `RETURN QUERY` to execute its query using parallelism (Tom Lane)"*.[^pg14-rq] Previously, `RETURN QUERY` ran serially regardless of plan cost.

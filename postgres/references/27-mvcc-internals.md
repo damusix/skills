@@ -415,16 +415,19 @@ Two psql sessions. Session A:
 Session B (in parallel):
 
     -- session B
-    INSERT INTO orders ...;                        -- new row, commits
+    BEGIN;
+    INSERT INTO orders ...;                        -- new row
+    SELECT pg_current_xact_id();                   -- e.g. 1234; note it
+    COMMIT;
 
-Session A again:
+Session A again, passing B's captured XID:
 
     -- session A (still in transaction)
     SELECT count(*) FROM orders;                   -- still N — RR snapshot is frozen
-    -- To test B's XID, capture B's pg_current_xact_id() before it commits
-    -- and pass that captured xid8 explicitly to pg_visible_in_snapshot.
+    SELECT pg_visible_in_snapshot('1234'::xid8, pg_current_snapshot());  -- f
     COMMIT;
     SELECT count(*) FROM orders;                   -- N+1
+    SELECT pg_visible_in_snapshot('1234'::xid8, pg_current_snapshot());  -- t
 
 This is the experimental demonstration of the visibility rule: the same row is invisible to session A's snapshot but visible to its post-commit state.
 
@@ -517,15 +520,15 @@ The presence of `HEAP_HOT_UPDATED` (on the old) and `HEAP_ONLY_TUPLE` (on the ne
 
 ## Gotchas / Anti-patterns
 
-1. **`SELECT count(*)` is not free.** PostgreSQL must count rows visible to the snapshot, using a table scan or a qualifying index-only scan. `pg_class.reltuples` is only an estimate.
-2. **Idle-in-transaction sessions silently bloat every table.** `idle_in_transaction_session_timeout` should be set to a value short enough to bound bloat — typically 5-10 minutes in OLTP. Without it, a connection-pool client that holds a transaction open while it does external I/O will hold the cluster xmin horizon back for the duration. See `81-pgbouncer.md`.
-3. **`hot_standby_feedback = on` propagates the standby's xmin to the primary.** Long-running standby snapshots can delay cleanup of relevant primary relations. See [`77-standby-failover.md`](./77-standby-failover.md).
+1. **`SELECT count(*)` is not free.** PostgreSQL must count rows visible to the snapshot, using a table scan or a qualifying index-only scan. `pg_class.reltuples` is only an estimate. If you need an exact count cheaply, maintain a counter table with triggers (at the cost of write contention on the counter row).
+2. **Idle-in-transaction sessions silently bloat every table in their database.** `idle_in_transaction_session_timeout` should be set to a value short enough to bound bloat — typically 5-10 minutes in OLTP. Without it, a connection-pool client that holds a transaction open while it does external I/O holds back the horizon for every table in the database it is connected to, and for the shared catalogs (`pg_database`, `pg_authid` and the rest) in every database. Tables in other databases are not affected. See `81-pgbouncer.md`.
+3. **`hot_standby_feedback = on` propagates the standby's xmin to the primary.** A long-running query on a standby with feedback on holds back the primary's horizon as if the query ran on the primary. Keep standby reporting queries short, or turn `hot_standby_feedback` off and accept query cancellations on the standby. See [`77-standby-failover.md`](./77-standby-failover.md).
 4. **An abandoned replication slot is an indefinite bloat accelerator.** Slots have no built-in timeout. The `max_slot_wal_keep_size` GUC (PG13+) prevents unbounded *WAL* retention but does *not* release the slot's xmin pin. Monitor `pg_replication_slots` and drop slots whose consumer is gone. See [`75-replication-slots.md`](./75-replication-slots.md).
 5. **Hint bits dirty pages on first read.** See §Hint bits above. First `SELECT` after a bulk load is expensive; pre-warm or accept the cost — never benchmark on the first scan.
 6. **`VACUUM FULL` is not "VACUUM but more thorough"** — it rewrites the entire table and takes `ACCESS EXCLUSIVE`. Plain VACUUM marks space reusable; `VACUUM FULL` actually shrinks the relation. Use `pg_repack` or `pg_squeeze` for online table-bloat removal (see [`26-index-maintenance.md`](./26-index-maintenance.md)).
 7. **A tuple's `xmax > 0` does not mean it was deleted.** It might be a row lock (`HEAP_XMAX_LOCK_ONLY`). The visibility decision depends on `HEAP_XMAX_INVALID` and the lock-mode bits, not just on `xmax`.
 8. **`HEAP_XMIN_COMMITTED` set with `HEAP_XMIN_INVALID` also set means frozen, not contradictory.** Both bits set is the encoding of `HEAP_XMIN_FROZEN`. This trips inspectors who try to interpret the bits independently.
-9. **Subtransaction overflow is silent.** Once a backend has >64 simultaneous subxids, every subsequent visibility check involving its XIDs hits `pg_subtrans`. The cluster-wide symptom is high `BufferContent` lock contention. Cause: `EXCEPTION` blocks in tight loops (one subxact per iteration; rolling back on exception is what creates the subxact). See [`08-plpgsql.md`](./08-plpgsql.md) gotcha #9.
+9. **Subtransaction overflow is silent.** Once a backend has >64 simultaneous subxids, every subsequent visibility check involving its XIDs hits `pg_subtrans`. The cluster-wide symptom is high `BufferContent` lock contention. Cause: `EXCEPTION` blocks in tight loops whose subtransactions write and complete normally. Each keeps its subxid until the top-level transaction ends; only a rolled-back subtransaction leaves the cache. See [`08-plpgsql.md`](./08-plpgsql.md) gotcha #1 and [`41-transactions.md`](./41-transactions.md) gotcha #5.
 10. **`old_snapshot_threshold` is gone in PG17+.** Code or documentation that recommends setting it to fight bloat from long-running transactions is obsolete. The right answer is timeouts and slot hygiene.[^pg17-ost]
 11. **MultiXact wraparound is separate from XID wraparound.** Monitor `age(datfrozenxid)` and `mxid_age(datminmxid)`. See [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md).
 12. **`pg_visible_in_snapshot` does not consult CLOG.** It tells you whether the XID was outside the snapshot's active-set when the snapshot was taken, not whether it's currently committed. To check commit status, use `pg_xact_status(xid8)`.[^functions-info]
@@ -555,7 +558,7 @@ The presence of `HEAP_HOT_UPDATED` (on the old) and `HEAP_ONLY_TUPLE` (on the ne
 - [`77-standby-failover.md`](./77-standby-failover.md) — `hot_standby_feedback` propagating xmin
 - [`88-corruption-recovery.md`](./88-corruption-recovery.md) — `data_checksums`, `pg_amcheck`
 - [`89-pg-rewind.md`](./89-pg-rewind.md) — WAL logging of hint-bit updates and its interaction with diverged timelines.
-- [`08-plpgsql.md`](./08-plpgsql.md) — subtransaction overflow from `EXCEPTION` blocks in tight loops (gotcha #9).
+- [`08-plpgsql.md`](./08-plpgsql.md) — subtransaction overflow from `EXCEPTION` blocks in tight loops (gotcha #1).
 
 ## Sources
 

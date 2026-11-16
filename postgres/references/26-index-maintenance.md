@@ -46,7 +46,7 @@ Five rules that should drive every decision in this file.
 
 4. **REINDEX rebuilds indexes, not the table heap.** It does not fix heap bloat or guarantee faster queries. Diagnose relation size, free space, and query plans before choosing a rewrite or rebuild. See [`pgstattuple`](#bloat-detection-with-pgstattuple).
 
-5. **The visibility map and FSM track the heap, not the index.** Index-only scans depend on the heap's visibility map being current (see [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md)); a freshly REINDEXed index still requires an UP-TO-DATE visibility map to skip the heap fetch. If you REINDEX and `Heap Fetches` in `EXPLAIN ANALYZE` remains nonzero, the problem is autovacuum lag on the *table*, not the index.
+5. **The visibility map and FSM track the heap, not the index.** Index-only scans depend on the heap's visibility map being current (see [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md)); a freshly REINDEXed index still requires an UP-TO-DATE visibility map to skip the heap fetch. If you REINDEX and `Heap Fetches` in `EXPLAIN ANALYZE` remains nonzero, look at the *table's* visibility map, not the index: recently modified pages and snapshots that delay vacuum leave all-visible bits unset, and autovacuum lag is only one cause.
 
 ## Decision Matrix
 
@@ -58,7 +58,7 @@ Ten rows mapping operational scenario to the right tool. Rows ordered: most comm
 | Rebuild a single bloated index in production            | **`REINDEX INDEX CONCURRENTLY`** (PG12+)[^pg12-rc] | `DROP + CREATE INDEX CONCURRENTLY`     | REINDEX preserves constraints / FK references; drop+create requires temporarily unconstraining.        |
 | Rebuild all indexes on a table                          | **`REINDEX TABLE CONCURRENTLY`** (PG12+)         | per-index loop                         | One command, handles TOAST table indexes, atomic per-index swap.                                       |
 | Drop an old / unused index                              | **`DROP INDEX CONCURRENTLY`**                    | plain `DROP INDEX`                     | Plain form takes `ACCESS EXCLUSIVE`; CONCURRENTLY waits for conflicting transactions instead.          |
-| Clean up an `INVALID` index from a failed CIC           | **`DROP INDEX [CONCURRENTLY]`** + retry CIC      | `REINDEX`                              | See §Failure Recovery below for exact procedure.                                                        |
+| Clean up an `INVALID` index from a failed CIC           | **`DROP INDEX [CONCURRENTLY]`** + retry CIC, or **`REINDEX INDEX CONCURRENTLY`** | retrying before fixing the cause | See §Failure Recovery below for exact procedure.                                                        |
 | Clean up `_ccnew` / `_ccold` from a failed `REINDEX CC` | **`DROP INDEX`** by suffix                       | re-run REINDEX                         | See §`_ccnew` / `_ccold` Suffix Recovery below for decision tree.                                      |
 | Heap bloat from dead-tuple churn                        | **`pg_repack`** or **`pg_squeeze`**              | `REINDEX`, `VACUUM FULL`               | REINDEX fixes only index bloat; `VACUUM FULL` is offline; community tools are online (PG14–18).        |
 | Post-`pg_upgrade` dedup migration (PG12 → ≥PG13)        | **`REINDEX INDEX CONCURRENTLY`** per B-tree      | leave it                               | PG13+ B-tree dedup requires REINDEX after pg_upgrade to take effect[^pg13-dedup-cite].                 |
@@ -70,7 +70,7 @@ Ten rows mapping operational scenario to the right tool. Rows ordered: most comm
 
 Three smell signals for wrong tool:
 
-- **REINDEX did not change query latency.** Almost always means heap bloat, not index bloat. Run `pgstattuple` on the *table* before reaching for REINDEX again.
+- **REINDEX did not change query latency.** Index bloat was not the bottleneck; heap bloat is a common cause. Run `pgstattuple` on the *table* and compare plans before reaching for REINDEX again.
 - **CIC takes 5×+ longer than the plain form.** Almost always means a long-running transaction is blocking the "wait for existing transactions" phase. Check `pg_stat_activity` for `xact_start` older than your CIC start time — kill or wait.
 - **Same `INVALID` unique index keeps reappearing.** Investigate the failure and resolve duplicate data or concurrent conflicting writes before retrying the unique build.
 

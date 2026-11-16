@@ -102,7 +102,7 @@ HOT has no SQL syntax — it's a behind-the-scenes optimization decided per-upda
     -- Reset to default:
     ALTER TABLE events RESET (fillfactor);
 
-`ALTER TABLE ... SET (fillfactor = N)` is metadata-only and does not rewrite existing pages. Plan for an `ACCESS EXCLUSIVE` lock; subsequent inserts and updates follow the new setting.[^createtable] See <https://www.postgresql.org/docs/16/sql-altertable.html>.
+`ALTER TABLE ... SET (fillfactor = N)` is metadata-only and does not rewrite existing pages. It takes `SHARE UPDATE EXCLUSIVE`, which does not block reads or writes; subsequent inserts and updates follow the new setting.[^createtable] See <https://www.postgresql.org/docs/16/sql-altertable.html>.
 
 
 ### The two preconditions for HOT

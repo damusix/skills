@@ -111,8 +111,6 @@ Modify settings via a procedure so writes are auditable:
     )
     LANGUAGE plpgsql AS $$
     BEGIN
-        PERFORM fn_assert_not_in_transaction();
-
         INSERT INTO app_settings(param, val_int, notes, updated_by)
         VALUES (p_param, p_value, COALESCE(p_notes, ''), fn_current_app_user_id())
         ON CONFLICT (param) DO UPDATE SET
@@ -120,11 +118,6 @@ Modify settings via a procedure so writes are auditable:
             notes      = COALESCE(EXCLUDED.notes, app_settings.notes),
             updated_at = clock_timestamp(),
             updated_by = EXCLUDED.updated_by;
-
-        COMMIT;
-    EXCEPTION WHEN OTHERS THEN
-        ROLLBACK;
-        RAISE;
     END;
     $$;
 

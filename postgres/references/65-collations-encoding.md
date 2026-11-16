@@ -212,7 +212,8 @@ Identical pattern for `pg_collation.collversion` — the WARNING fires the first
 
 1. Identify objects depending on each affected collation, including indexes, using the dependency query in [ALTER COLLATION](https://www.postgresql.org/docs/16/sql-altercollation.html). Also assess objects using the database default collation.
 2. Rebuild every affected object, for example with `REINDEX`; coordinate access while inconsistent indexes exist. Resolve any duplicate values exposed by new comparison rules.
-3. After rebuilding, run `ALTER COLLATION ... REFRESH VERSION` for affected collations and `ALTER DATABASE ... REFRESH COLLATION VERSION` for an affected database default.
+3. Verify the rebuilt B-tree indexes with `pg_amcheck` (PG14+) or the `amcheck` function `bt_index_check()`, which check index ordering against the current collation rules.
+4. After verifying, run `ALTER COLLATION ... REFRESH VERSION` for affected collations and `ALTER DATABASE ... REFRESH COLLATION VERSION` for an affected database default.
 
 > [!WARNING] REFRESH VERSION does not validate indexes
 > Verbatim docs: *"Note that this does not actually check whether all affected objects have been rebuilt correctly."* Running `REFRESH VERSION` without reindexing first silences the WARNING but leaves the corruption in place. **Reindex first, refresh second, never the reverse.**[^refresh-no-check]
@@ -496,7 +497,7 @@ An empty result does not rule out changes to individual collations or untracked 
 
 Triggered when `WARNING: collation "..." has version mismatch` appears in logs.
 
-    -- Identify dependents of individually version-mismatched collations.
+    -- 1. Identify dependents of individually version-mismatched collations.
     SELECT pg_describe_object(refclassid, refobjid, refobjsubid) AS collation,
            pg_describe_object(classid, objid, objsubid) AS dependent_object
     FROM pg_depend d
@@ -558,7 +559,28 @@ Any matches = data-integrity hazard. Plan a dump → recreate with UTF8 → rest
 
 ### Recipe 8: Migrate libc cluster to ICU — dump/restore
 
-A live database cannot change its locale provider in place. Dump the source, explicitly create each target database with the desired ICU locale from `template0`, then restore its schema and data. `pg_dumpall` emits database creation settings from the source, so restoring it unchanged does not perform this migration. Validate collation-sensitive uniqueness and ordering before cutover.
+A live database cannot change its locale provider in place. Dump the source, explicitly create each target database with the desired ICU locale from `template0`, then restore its schema and data. `pg_dumpall` emits database creation settings from the source, so restoring it unchanged does not perform this migration. Validate collation-sensitive uniqueness and ordering before cutover. `createdb --locale-provider` and `--icu-locale` need PG15+ client tools. For preparing the globals file, see [`83-backup-pg-dump.md`](./83-backup-pg-dump.md) Recipe 2.
+
+    # 1. Copy roles and tablespaces only. Keep globals.sql unchanged; copy it to
+    #    globals-reviewed.sql and remove the CREATE ROLE for the bootstrap
+    #    superuser (postgres), which already exists on the target; see
+    #    83-backup-pg-dump.md Recipe 2.
+    pg_dumpall -h old-host -U postgres --globals-only -f globals.sql
+    psql -X -v ON_ERROR_STOP=1 -h new-host -U postgres -f globals-reviewed.sql
+
+    # 2. Dump each database in custom format
+    pg_dump -h old-host -U postgres -Fc -d app_db -f app_db.dump
+
+    # 3. Create the target database with ICU from template0 (PG15+ createdb)
+    createdb -h new-host -U postgres -T template0 -E UTF8 \
+        --locale-provider=icu --icu-locale=en-US app_db
+
+    # 4. Restore into the pre-created database (no --create)
+    pg_restore --exit-on-error -h new-host -U postgres -d app_db app_db.dump
+
+    # 5. Verify the provider
+    psql -h new-host -U postgres -d app_db \
+        -c "SELECT datname, datlocprovider FROM pg_database WHERE datname = 'app_db';"
 
 > [!NOTE] Logical replication path
 > For zero-downtime migration, set up logical replication from the libc cluster to a new ICU cluster, then cut over. See [`74-logical-replication.md`](./74-logical-replication.md).

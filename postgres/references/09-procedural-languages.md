@@ -85,7 +85,7 @@ Two corollaries that surprise developers:
 | PL/Rust | External (`plrust`) | `plrust` (sandboxed via WASM-like restrictions) | n/a | Memory-safe Rust bodies; relatively new. |
 
 > [!WARNING] Removed/Deprecated
-> `plpythonu` and `plpython2u` (PL/Python on Python 2) are obsolete. PG13 dropped support for Python 2.5.X and earlier;[^pg13-py25] subsequent releases progressively removed support for the rest of Python 2.x as Python 2 itself reached end of life (Jan 2020) and packagers stopped shipping it. Any documentation or third-party post mentioning `plpython2u` predates the PG13 era. **Use `plpython3u`** — that is the only PL/Python you should be writing today.
+> `plpythonu` and `plpython2u` (PL/Python on Python 2) are obsolete. PG13 dropped support for Python 2.5.X and earlier,[^pg13-py25] and PG15 removed `plpython2u` and `plpythonu` entirely; PG14 is the last release that supports Python 2.[^pg15-py2] Any documentation or third-party post mentioning `plpython2u` predates PG15. **Use `plpython3u`** — that is the only PL/Python you should be writing today.
 
 ### Installing a procedural language
 
@@ -175,7 +175,8 @@ Type mapping (the most-used cells):
 | `float4`, `float8` | `float` |
 | `numeric` | `decimal.Decimal` |
 | `bool` | `bool` |
-| `date`, `timestamp`, `timestamptz`, `jsonb` | `str`; parse explicitly when native Python objects are needed |
+| `date`, `timestamp`, `timestamptz` | `str`; parse explicitly when native Python objects are needed |
+| `jsonb` | `str` by default; with the `jsonb_plpython3u` extension and `TRANSFORM FOR TYPE jsonb` on the function, `dict` / `list` / scalars[^jsonb-plpython] |
 | `array[T]` | `list[python(T)]` |
 | `record` / composite | `dict` |
 | `NULL` | `None` |
@@ -348,7 +349,7 @@ A common case: cleaning user-entered identifiers down to a canonical form.
     SELECT canonical_slug('Café — Niño''s Place!');
     -- => 'cafe-nino-s-place'
 
-This uses the Python stdlib's Unicode NFKD decomposition, which is materially more complete than what `unaccent` (the contrib extension) gives you. Mark `IMMUTABLE STRICT` so the planner can use it in an expression index — `CREATE INDEX ON places ((canonical_slug(name)));` is a viable pattern. Note that `IMMUTABLE` is a *promise* — if you change the body so it stops producing the same output for the same input, indexes built on it silently rot. See [06-functions.md](./06-functions.md#volatility-classes).
+This uses the Python stdlib's Unicode NFKD decomposition, which is materially more complete than what `unaccent` (the contrib extension) gives you. Mark `IMMUTABLE STRICT` so the planner can use it in an expression index — `CREATE INDEX ON places ((canonical_slug(name)));` is a viable pattern. Note that `IMMUTABLE` is a *promise* — if you change the body so it stops producing the same output for the same input, indexes built on it silently rot. See [06-functions.md](./06-functions.md#volatility-volatile--stable--immutable).
 
 ### 3. PL/Python: calling a stdlib library safely
 
@@ -424,7 +425,7 @@ PL/Python exceptions map to PostgreSQL errors via `plpy.SPIError`. To recover fr
             raise
     $py$;
 
-Like in PL/pgSQL, each `with plpy.subtransaction():` block creates a real PostgreSQL subtransaction, consumes a XID, and stresses the `pg_subtrans` SLRU under high write rate. See [08-plpgsql.md](./08-plpgsql.md#exception-handling) for the same gotcha in the SQL-level language.
+Like in PL/pgSQL, each `with plpy.subtransaction():` block creates a real PostgreSQL subtransaction. It is assigned a subxid only when it writes, and subcommitted subxids stay in the 64-entry per-backend cache until the top-level transaction ends (only aborts remove them), so a loop of writing blocks overflows the cache and visibility checks then read `pg_subtrans`. See [08-plpgsql.md](./08-plpgsql.md#exception-handling) for the same gotcha in the SQL-level language.
 
 ### 6. PL/Python: set-returning function
 
@@ -451,7 +452,7 @@ Return rows by `yield`-ing or by returning an iterable:
     --  beta   | 2
     --  gamma  | 1
 
-Compare with `RETURNS TABLE(...)` syntax described in [06-functions.md](./06-functions.md#returns-table-and-out-parameters).
+Compare with `RETURNS TABLE(...)` syntax described in [06-functions.md](./06-functions.md#recipe-4--table-function-with-named-output-columns).
 
 ### 7. PL/Python: trigger function
 
@@ -631,7 +632,7 @@ For a security review or upgrade pre-flight:
                           WHERE c LIKE 'search\_path=%'))
       AND n.nspname NOT IN ('pg_catalog', 'information_schema');
 
-The last query is the same `SECURITY DEFINER` hardening audit recommended in [06-functions.md](./06-functions.md#security-definer-hardening). Every untrusted-PL function flagged is a candidate for review before a PG major upgrade.
+The last query is the same `SECURITY DEFINER` hardening audit recommended in [06-functions.md](./06-functions.md#recipe-11--audit-security-definer-functions-without-a-pinned-search_path). Every untrusted-PL function flagged is a candidate for review before a PG major upgrade.
 
 ## Gotchas / Anti-patterns
 
@@ -645,7 +646,7 @@ The last query is the same `SECURITY DEFINER` hardening audit recommended in [06
 
 5. **PL/Java, PL/R, PL/Lua, PL/Rust are also out-of-tree.** Their PG-version-compatibility matrices lag the core release. Before scheduling a major PG upgrade, check upstream support for every non-core PL you depend on.
 
-6. **`plpython2u` / `plpythonu` are obsolete.** PG13 removed support for Python 2.5 and earlier; current supported PostgreSQL versions use Python 3. Port older functions to `plpython3u`.[^pg13-py25]
+6. **`plpython2u` / `plpythonu` are obsolete.** PG15 removed both languages and Python 2 support; PG14 still supports Python 2. Port older functions to `plpython3u` before upgrading past PG14.[^pg15-py2]
 
 7. **Per-language interpreter state is backend-scoped and grows unbounded.** PL/Python `SD`/`GD`, PL/Perl `$_SHARED`, PL/v8's V8 isolate, and PL/Java's JVM all persist for the lifetime of the backend. Two risks: (a) in transaction-mode pooling (see [81-pgbouncer.md](./81-pgbouncer.md)), the same backend serves many app sessions — cached state from one session can leak into the next; (b) stuffing request data into `GD` leaks memory across calls. Cache only what is invariant (prepared plans, parsed regex, compiled validators). Use session-mode pooling for procedures that rely on per-backend state.
 
@@ -655,11 +656,11 @@ The last query is the same `SECURITY DEFINER` hardening audit recommended in [06
 
 11. **Returning rows from a SETOF PL function: data type must match exactly.** PL/Python returns `dict`s keyed by column name; PL/Perl returns hashrefs keyed by column name; PL/Tcl returns lists matching the column order. Misalignment between body and `RETURNS TABLE(...)` produces a runtime error, not a parse error.
 
-12. **Function replacement and cached plans.** PostgreSQL invalidates dependent cached plans after definition changes; in-flight calls and persistent interpreter state still require rollout care. See [06-functions.md](./06-functions.md#alter-and-replace).
+12. **Function replacement and cached plans.** PostgreSQL invalidates dependent cached plans after definition changes; in-flight calls and persistent interpreter state still require rollout care. See [06-functions.md](./06-functions.md#lock-level-summary-for-function-ddl).
 
 13. **Untrusted-language triggers can perform OS-level side effects.** A trigger function runs as the invoking role by default, or as its owner if declared `SECURITY DEFINER`; the interpreter still has the server process's OS privileges. Audit trigger bodies and execution privileges.
 
-14. **Subtransactions in PL bodies stress `pg_subtrans`** the same way `EXCEPTION` blocks in PL/pgSQL do. `plpy.subtransaction()`, PL/Perl `eval { ... }; spi_rollback`, PL/Tcl `catch { ... }`, PL/v8 `plv8.subtransaction()` — all of these consume XIDs and contribute to subtrans SLRU pressure. Don't put them in tight loops. See [08-plpgsql.md](./08-plpgsql.md#exception-handling-and-subtransactions) for the same gotcha in PL/pgSQL.
+14. **Subtransactions in PL bodies stress `pg_subtrans`** the same way `EXCEPTION` blocks in PL/pgSQL do. `plpy.subtransaction()`, PL/Perl `eval { ... }; spi_rollback`, PL/Tcl `catch { ... }`, PL/v8 `plv8.subtransaction()` all create subtransactions. Each one that writes gets a subxid that stays in the 64-entry per-backend cache until the top-level transaction ends unless it aborts, so writing loops overflow the cache and push visibility checks to `pg_subtrans`. Don't put them in tight loops. See [08-plpgsql.md](./08-plpgsql.md#exception-handling) for the same gotcha in PL/pgSQL.
 
 15. **No way to share types between PLs without going through SQL.** If a PL/Python body returns a Python `dict`, it is serialised through Postgres's wire types into the SQL row; PL/Perl on the other side sees a hashref it built from scratch. There is no shared in-process object.
 
@@ -701,6 +702,10 @@ The last query is the same `SECURITY DEFINER` hardening audit recommended in [06
 [^pg13-trusted-ext]: PostgreSQL 13 Release Notes. Quote: *"Allow extensions to be specified as trusted (Tom Lane). Such extensions can be installed in a database by users with database-level CREATE privileges, even if they are not superusers. This change also removes the `pg_pltemplate` system catalog."* https://www.postgresql.org/docs/release/13.0/
 
 [^pg13-py25]: PostgreSQL 13 Release Notes. Quote: *"Remove support for Python versions 2.5.X and earlier (Peter Eisentraut)."* https://www.postgresql.org/docs/release/13.0/
+
+[^pg15-py2]: PostgreSQL 15 Release Notes. Quote: *"Remove server-side language plpython2u and generic Python language plpythonu (Andres Freund). Python 2.x is no longer supported."* https://www.postgresql.org/docs/release/15.0/
+
+[^jsonb-plpython]: PostgreSQL 16 — Section 8.14.6 "Transforms". Quote: *"The extension for PL/Python is called jsonb_plpython3u. If you use it, jsonb values are mapped to Python dictionaries, lists, and scalars, as appropriate."* https://www.postgresql.org/docs/16/datatype-json.html
 
 [^ext-trusted]: PostgreSQL 16 — Section 38.17.1 "Extension Files", `trusted` control-file parameter. Quote: *"This parameter, if set to true (which is not the default), allows some non-superusers to install an extension that has superuser set to true. Specifically, installation will be permitted for anyone who has CREATE privilege on the current database."* and *"When the user executing `CREATE EXTENSION` is not a superuser but is allowed to install by virtue of this parameter, then the installation or update script is run as the bootstrap superuser, not as the calling user."* https://www.postgresql.org/docs/16/extend-extensions.html
 

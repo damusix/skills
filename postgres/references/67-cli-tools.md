@@ -399,8 +399,11 @@ Common patterns:
     # Pre-upgrade defensive freeze on a hot table
     vacuumdb -d mydb -t events --freeze
 
-> [!NOTE] Database selection
-> `vacuumdb --all` means all databases, not a database-name pattern. Do not append a pattern as its argument. Use the installed utility's documented selection options.[^vacuumdb17-docs]
+> [!NOTE] PostgreSQL 17: `--all` with object patterns
+> `--all` takes no argument; it selects every database. PG17+ lets `vacuumdb`, `reindexdb`, and `clusterdb` combine `--all` with object options such as `-t`, `-n`, `-N` (vacuumdb), `-i` (reindexdb), or `-t` (clusterdb), processing the matching objects in every database. Earlier releases reject the combination, for example *"cannot vacuum specific table(s) in all databases"*.[^pg17-all-pattern][^vacuumdb17-docs]
+
+    # PG17+: vacuum public.events in every database; fails if one lacks the table
+    vacuumdb --all -t public.events
 
 > [!NOTE] PostgreSQL 18 — `vacuumdb --missing-stats-only`
 > Verbatim release-note: *"Add vacuumdb option `--missing-stats-only` to compute only missing optimizer statistics (Corey Huinker, Nathan Bossart). This option can only be run by superusers and can only be used with options `--analyze-only` and `--analyze-in-stages`."* Useful when restoring a logical dump (which doesn't carry stats) or when extended statistics objects were added but never ANALYZEd.
@@ -495,7 +498,7 @@ Used in: pre-restore validation, pg_rewind preflight, disaster-recovery diagnosi
 | **PG14** | `\dt+`/`\di+`/`\dm+` add access-method column;[^pg14-am-col] `\dt`/`\di` show TOAST tables and indexes;[^pg14-toast] new `\dX` for extended-stats objects;[^pg14-dx] `vacuumdb` `--no-process-toast`.[^pg14-vacuumdb] |
 | **PG15** | New `\dconfig` for server vars;[^pg15-dconfig] new `\getenv`;[^pg15-getenv] `\watch` gets a pager option;[^pg15-watch-pager] all results from multi-statement queries displayed.[^pg15-multi-results] |
 | **PG16** | `\bind` for extended-query protocol;[^pg16-bind] `\watch` `count` + `interval` options + `0` allowed;[^pg16-watch-count][^pg16-watch-zero] `SHELL_ERROR`/`SHELL_EXIT_CODE` variables;[^pg16-shell-vars] `\drg` for role memberships;[^pg16-drg] `\dpS`/`\zS` show system objects;[^pg16-dps] `\df+` no longer shows source;[^pg16-df-source] `xheader_width` `\pset` option;[^pg16-xheader] vacuumdb `--schema`/`--exclude-schema`;[^pg16-vacuumdb-schema] vacuumdb `--no-process-main`;[^pg16-vacuumdb-main] vacuumdb `--buffer-usage-limit`;[^pg16-vacuumdb-bul] createuser `--valid-until`/`--bypassrls`/`--member-of` (deprecates `--role`).[^pg16-createuser-options][^pg16-createuser-deprecate] |
-| **PG17** | `\dp` shows `(none)` for empty privileges;[^pg17-dp-none] backslash commands honor `\pset null`;[^pg17-pset-null] `\watch` adds `min_rows`;[^pg17-watch-minrows] connection attempts cancelable with Ctrl-C;[^pg17-cancel-connect] broader `FETCH_COUNT` support for result-returning commands.[^pg17-fetch-count] |
+| **PG17** | `\dp` shows `(none)` for empty privileges;[^pg17-dp-none] backslash commands honor `\pset null`;[^pg17-pset-null] `\watch` adds `min_rows`;[^pg17-watch-minrows] connection attempts cancelable with Ctrl-C;[^pg17-cancel-connect] broader `FETCH_COUNT` support for result-returning commands;[^pg17-fetch-count] `vacuumdb`/`reindexdb`/`clusterdb` accept `--all` together with object patterns.[^pg17-all-pattern] |
 | **PG18** | New `\parse`/`\bind_named`/`\close_prepared`;[^pg18-prep] full pipeline-mode meta-commands `\startpipeline`/`\sendpipeline`/`\syncpipeline`/`\endpipeline`/`\flushrequest`/`\flush`/`\getresults`;[^pg18-pipeline] `%P` prompt char + `PIPELINE_*` variables;[^pg18-pipeline-vars] connection service name in prompt;[^pg18-svc-prompt] `\conninfo` reformatted to tabular with more info;[^pg18-conninfo] `x` suffix for expanded mode on list commands;[^pg18-x-suffix] `WATCH_INTERVAL` variable;[^pg18-watch-interval] leakproof in `\df+`/`\do+`/`\dAo+`/`\dC+`;[^pg18-leakproof] `default_version` in `\dx`;[^pg18-dx-default] vacuumdb `--missing-stats-only`.[^pg18-missing-stats] |
 
 ## Examples / Recipes
@@ -841,7 +844,7 @@ Or grep the binary for documented options:
 
 [^pg17-fetch-count]: PostgreSQL 17 release notes. <https://www.postgresql.org/docs/release/17.0/>. Quoted: *"Allow psql to honor `FETCH_COUNT` for non-`SELECT` queries (Daniel Vérité)."*
 
-[^pg17-all-pattern]: PostgreSQL 17 vacuumdb: `--all` selects all databases and does not take a database pattern. <https://www.postgresql.org/docs/17/app-vacuumdb.html>
+[^pg17-all-pattern]: PostgreSQL 17 release notes. <https://www.postgresql.org/docs/release/17.0/>. Quoted: *"Allow reindexdb, vacuumdb, and clusterdb to process objects in all databases matching a pattern (Nathan Bossart). The new option `--all` controls this behavior."*
 
 [^pg18-prep]: PostgreSQL 18 release notes. <https://www.postgresql.org/docs/release/18.0/>. Quoted: *"Allow psql to parse, bind, and close named prepared statements (Anthonin Bonnefoy, Michael Paquier). This is accomplished with new commands `\parse`, `\bind_named`, and `\close_prepared`."*
 

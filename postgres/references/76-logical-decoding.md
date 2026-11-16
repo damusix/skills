@@ -190,7 +190,7 @@ Build via PGXS (`72-extension-development.md`). Install to `$libdir`. Use plugin
 
 Before PG14, plugins received `change_cb` calls only after COMMIT. Large transactions buffered in memory until commit, spilled to `pg_replslot/` past `logical_decoding_work_mem`. PG14+ adds `stream_*` callbacks so plugins receive changes incrementally — subscriber can apply or discard before commit.
 
-Streaming requires the plugin's streaming callbacks and a compatible client request. Native subscribers opt in with `streaming = on` or `streaming = parallel` (PG16+) on `CREATE SUBSCRIPTION`.
+Streaming requires the plugin's streaming callbacks and a compatible client request. Native subscribers set `streaming = on` or `streaming = parallel` (PG16+) on `CREATE SUBSCRIPTION`. The default is `off` through PG17 and `parallel` from PG18 ([PG18 CREATE SUBSCRIPTION](https://www.postgresql.org/docs/18/sql-createsubscription.html)).
 
 ### Two-phase commit decoding
 

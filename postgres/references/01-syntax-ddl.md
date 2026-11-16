@@ -75,7 +75,7 @@ DROP SCHEMA IF EXISTS analytics CASCADE;
 > [!WARNING] `pg_` is reserved
 > Schema names starting with `pg_` are reserved for the system. Use `_pg`, `app_pg`, or another prefix if you need a private prefix that *looks* like a namespace marker.
 
-**Resolution: `search_path`.** Unqualified references resolve against the per-session GUC `search_path` (default `"$user", public`). An unqualified creation targets the first existing schema in the path; it fails if the caller lacks `CREATE` there, rather than searching for a writable schema.[^ddl-schemas]
+**Resolution: `search_path`.** Unqualified references resolve against the per-session GUC `search_path` (default `"$user", public`). An unqualified creation targets the first existing schema in the path that the caller has `USAGE` on; schemas without `USAGE` are skipped. It fails if the caller lacks `CREATE` on that schema, rather than searching for a writable one.[^ddl-schemas-path]
 
 ```sql
 SHOW search_path;
@@ -317,6 +317,14 @@ CREATE TABLE app.batches (
 
 **Reset the underlying sequence after a bulk load:** Quiesce writers and sequence consumers first. For a nonempty table with a positive ascending sequence, advance the sequence only after comparing the loaded maximum with the current sequence state; never move it backward. `setval` is not rolled back on transaction abort.
 
+```sql
+-- Advances to the larger of the loaded max and the current position; no-op on an empty table.
+SELECT setval('app.batches_id_seq', greatest(m.max_id, s.last_value))
+FROM (SELECT max(id) AS max_id FROM app.batches) AS m,
+     app.batches_id_seq AS s
+WHERE m.max_id IS NOT NULL;
+```
+
 **Promote a `SERIAL` column to `IDENTITY`** (recommended migration):
 
 For a worked migration that creates and advances a new identity sequence, see [`14-data-types-builtin.md`](./14-data-types-builtin.md#recipe-2-migrating-serial-to-identity). `ADD GENERATED` creates a new sequence; it does not reuse the serial sequence.
@@ -490,7 +498,7 @@ Per-table knobs that shadow the global GUCs. The full list:[^create-table]
 | Parameter | Type | Effect |
 |---|---|---|
 | `fillfactor` | int 10–100 | Reserve `100-fillfactor`% free space per page for HOT updates — drop to ~80 on hot-update-heavy tables |
-| `toast_tuple_target` | int 128–8160 | Minimum tuple length before TOASTing kicks in |
+| `toast_tuple_target` | int 128–8160 | Size TOAST reduces a row to once toasting starts; the trigger is the compile-time `TOAST_TUPLE_THRESHOLD` (about 2 KB). See [`31-toast.md`](./31-toast.md) |
 | `parallel_workers` | int | Override parallel-scan worker count for this table |
 | `autovacuum_enabled` | bool | Per-table autovacuum on/off |
 | `autovacuum_vacuum_threshold` / `_scale_factor` | numeric | Per-table trigger thresholds (see [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md)) |
@@ -700,16 +708,19 @@ ALTER TABLE app.orders DROP CONSTRAINT IF EXISTS chk_priority_range;
 The naive `ALTER TABLE … ADD COLUMN … NOT NULL` requires every row to be backfilled before the column can be flagged not-null. The split-step approach:
 
 ```sql
--- 1. Add a nullable column without a default so existing rows can be selected for backfill.
+-- 1. Add a nullable column without a default so existing rows stay NULL and can be
+--    selected for backfill, then set the default so new rows arrive populated.
 ALTER TABLE app.big ADD COLUMN tier int;
+ALTER TABLE app.big ALTER COLUMN tier SET DEFAULT 0;
 
--- 2. Backfill in batches if the default isn't sufficient (e.g. derived from another column).
+-- 2. Backfill existing rows in batches. coalesce keeps a NULL from compute_tier()
+--    from leaving the row selectable forever.
 DO $$
 DECLARE
     rows_updated int;
 BEGIN
     LOOP
-        UPDATE app.big SET tier = compute_tier(customer_id)
+        UPDATE app.big SET tier = coalesce(compute_tier(customer_id), 0)
         WHERE ctid IN (
             SELECT ctid FROM app.big WHERE tier IS NULL LIMIT 10000 FOR UPDATE SKIP LOCKED
         );
@@ -723,8 +734,12 @@ END$$;
 ALTER TABLE app.big ADD CONSTRAINT big_tier_notnull CHECK (tier IS NOT NULL) NOT VALID;
 ALTER TABLE app.big VALIDATE CONSTRAINT big_tier_notnull;
 ALTER TABLE app.big ALTER COLUMN tier SET NOT NULL; -- valid CHECK avoids another scan
-ALTER TABLE app.big ALTER COLUMN tier SET DEFAULT 0;
--- On PG18, a named NOT NULL constraint can also be added NOT VALID and validated.
+ALTER TABLE app.big DROP CONSTRAINT big_tier_notnull;
+
+-- 3 (PG18+ alternative). Add a NOT NULL constraint NOT VALID, then validate it.
+ALTER TABLE app.big ADD CONSTRAINT big_tier_not_null NOT NULL tier NOT VALID;
+ALTER TABLE app.big VALIDATE CONSTRAINT big_tier_not_null;
+
 -- Run the DO block as a top-level statement, not inside an explicit transaction.
 ```
 `SKIP LOCKED` can leave rows behind when all remaining candidates are locked. Repeat and verify no NULLs remain before validation; ensure concurrent writers populate `tier`.
@@ -767,7 +782,6 @@ DROP TABLE archive.measurements_2024q4;
 
 
 ### Recipe: clone a table's structure, exclude its identity
-
 
 
 ```sql
@@ -844,7 +858,7 @@ CREATE INDEX IF NOT EXISTS orders_status_idx ON app.orders (status);
 - **`SET DEFAULT now()` does not retroactively populate** existing rows — `DEFAULT` applies only to future inserts. Backfill explicitly.
 - **`DROP COLUMN` doesn't reclaim space.** The column becomes dropped-in-place metadata; storage stays until a table rewrite (`VACUUM FULL`, `CLUSTER`, or `pg_repack`).
 - **Temporary tables aren't autovacuumed.** Long-lived sessions with frequently-mutated temp tables can build serious bloat; manual `VACUUM` in the session.
-- **`UNLOGGED` table data is not replicated.** Its definition is present on physical standbys, but its data is not replicated. It is truncated after crash recovery; store only reconstructible data.
+- **`UNLOGGED` table data is not replicated.** Its definition is present on physical standbys, but its data is not. It is truncated after crash recovery; store only reconstructible data.
 - **Generated columns can't be indexed using a different expression**: the generated value *is* what's indexed. To index a different transformation of the same source columns, use an expression index on the source instead.
 - **`ALTER TABLE` rolls back atomically — but at full cost.** A multi-action `ALTER TABLE` that rewrites the heap and fails halfway will not have committed any of the work, but you'll still have paid the I/O. Plan time accordingly.
 - **`ON DELETE CASCADE` chains** can fan out unexpectedly far on large schemas. Use `EXPLAIN` on the equivalent SELECT to check before relying on cascading deletes for bulk cleanup.
@@ -882,7 +896,7 @@ CREATE INDEX IF NOT EXISTS orders_status_idx ON app.orders (status);
 [^alter-table]: PostgreSQL 16 docs — `ALTER TABLE`. <https://www.postgresql.org/docs/16/sql-altertable.html>
 [^create-sequence]: PostgreSQL 16 docs — `CREATE SEQUENCE`. <https://www.postgresql.org/docs/16/sql-createsequence.html>
 [^ddl-schemas]: PostgreSQL 16 docs — Chapter 5.9, Schemas. <https://www.postgresql.org/docs/16/ddl-schemas.html>
-[^ddl-schemas-path]: PostgreSQL 16 docs — `CREATE SCHEMA`. <https://www.postgresql.org/docs/16/sql-createschema.html>
+[^ddl-schemas-path]: PostgreSQL 16 docs — Client Connection Defaults, `search_path`. <https://www.postgresql.org/docs/16/runtime-config-client.html#GUC-SEARCH-PATH>
 [^ddl-identity]: PostgreSQL 16 docs — Chapter 5, Data Definition (Identity Columns section is part of `CREATE TABLE` documentation). <https://www.postgresql.org/docs/16/ddl.html>
 [^ddl-generated]: PostgreSQL 16 docs — Generated Columns (Section 5.3). <https://www.postgresql.org/docs/16/ddl-generated-columns.html>
 [^ddl-partitioning]: PostgreSQL 16 docs — Table Partitioning (Section 5.11). <https://www.postgresql.org/docs/16/ddl-partitioning.html>

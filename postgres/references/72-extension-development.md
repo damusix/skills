@@ -1183,8 +1183,6 @@ Avoids picking up whatever `pg_config` is in `$PATH`. Critical when packaging fo
 
 [^bgworker]: PG16 docs, "Background Worker Processes." [https://www.postgresql.org/docs/16/bgworker.html](https://www.postgresql.org/docs/16/bgworker.html)
 
-[^fdw-handler]: PG16 docs, "Writing a Foreign Data Wrapper." [https://www.postgresql.org/docs/16/fdwhandler.html](https://www.postgresql.org/docs/16/fdwhandler.html)
-
 [^output-plugin]: PG16 docs, "Logical Decoding Output Plugins." [https://www.postgresql.org/docs/16/logical-replication-output-plugin.html](https://www.postgresql.org/docs/16/logical-replication-output-plugin.html)
 
 [^archive-modules]: PG16 docs, "Archive Modules." [https://www.postgresql.org/docs/16/archive-modules.html](https://www.postgresql.org/docs/16/archive-modules.html)

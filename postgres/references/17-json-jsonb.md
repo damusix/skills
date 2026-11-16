@@ -479,7 +479,7 @@ The trade-off: each functional index targets one access pattern. A single `jsonb
     CREATE INDEX webhook_payload_gin ON webhook_events USING GIN (payload);
     CREATE INDEX webhook_type_btree ON webhook_events (event_type);
 
-Why this shape: `event_type` is hoisted into a generated column with a B-tree because every query filters by it; the GIN-on-jsonb is the fallback for ad-hoc containment queries; the `IS JSON OBJECT` CHECK refuses malformed inputs at write time.
+Why this shape: `event_type` is hoisted into a generated column with a B-tree because every query filters by it; the GIN-on-jsonb is the fallback for ad-hoc containment queries; the `IS JSON OBJECT` CHECK refuses non-object inputs at write time. `IS JSON` is PG16+; on PG14–15 write `CHECK (jsonb_typeof(payload) = 'object')` instead.
 
 ### 2. Containment query with GIN
 
@@ -657,12 +657,14 @@ The `::jsonb` cast is the normalization step. Run it on a copy first if you depe
 
 ### 14. Catch malformed payloads at write time
 
-    -- BEFORE PG16: function-based check
+    -- PG14-15: the jsonb type already rejects malformed input; check the shape.
     ALTER TABLE webhook_events
-      ADD CONSTRAINT payload_valid
-      CHECK (payload IS NOT NULL);
+      ADD CONSTRAINT payload_is_object
+      CHECK (jsonb_typeof(payload) = 'object');
 
-    -- Validate raw text before casting to jsonb, which discards duplicate keys.
+    -- PG16+: keep the raw text and validate it before casting to jsonb,
+    -- which discards duplicate keys.
+    ALTER TABLE webhook_events ADD COLUMN raw_payload text;
     ALTER TABLE webhook_events
       ADD CONSTRAINT raw_payload_valid_object
       CHECK (raw_payload IS JSON OBJECT WITH UNIQUE KEYS);
@@ -672,7 +674,7 @@ Apply this check to the original text or `json`, not an already-normalized `json
 ## Gotchas / Anti-patterns
 
 1. **`->` returns JSON; `->>` returns text.** `WHERE doc->'email' = 'alice@example.com'` attempts to parse the untyped literal as JSON and errors because it is not a JSON string literal. Use `->>` or `doc->'email' = '"alice@example.com"'::jsonb`.
-2. **Containment respects nested structure, with a primitive-in-array exception.** An array can contain a primitive; match nested object paths explicitly and test the exact predicate against representative documents.[^jsonb-numbers]
+2. **The array-contains-primitive exception applies only at the top level.** `'["a","b"]' @> '"a"'` is `t`, and `'{"tags":["a","b"]}' @> '{"tags":["a"]}'` is `t` (array sub-containment), but `'{"tags":["a","b"]}' @> '{"tags":"a"}'` is `f`. Below the top level, the RHS must mirror the LHS shape at the matched path.[^jsonb-containment]
 3. **`@>` is type-strict.** `'{"a":1}' @> '{"a":"1"}'` is `f`. Numbers and strings are different JSON types even when they print identically.
 4. **GIN on the document does NOT accelerate `->>` equality.** `WHERE doc->>'email' = 'x'` is not indexable by `jsonb_ops` or `jsonb_path_ops`. Use a functional B-tree on `(doc->>'email')`, or hoist to a generated column.
 5. **`jsonb_set` returns `target` unchanged when an earlier path step is missing.** *"All earlier steps in the path must exist, or the target is returned unchanged."*[^jsonb-set] Combined with `create_if_missing => true`, this means `jsonb_set('{}', '{a,b}', '1')` returns `{}` — `a` is missing so its child `b` is too. Build intermediate objects first or use subscripting (which builds them for you).
@@ -716,6 +718,8 @@ Apply this check to the original text or `json`, not an already-normalized `json
 [^json-primitives]: PostgreSQL 16 documentation — Table 8.23. JSON Primitive Types and Corresponding PostgreSQL Types. https://www.postgresql.org/docs/16/datatype-json.html
 
 [^jsonb-numbers]: PostgreSQL 16 documentation — JSON Types. *"`jsonb` will reject numbers that are outside the range of the PostgreSQL `numeric` data type, while `json` will not… `jsonb` will preserve trailing fractional zeroes, as seen in this example, even though those are semantically insignificant for purposes such as equality checks."* https://www.postgresql.org/docs/16/datatype-json.html
+
+[^jsonb-containment]: PostgreSQL 16 documentation — JSON Types, "jsonb Containment and Existence". *"As a special exception to the general principle that the structures must match, an array may contain a primitive value."* https://www.postgresql.org/docs/16/datatype-json.html
 
 [^extraction]: PostgreSQL 16 documentation — Table 9.45. `jsonb` Operators (`->`, `->>`, `#>`, `#>>`). https://www.postgresql.org/docs/16/functions-json.html
 

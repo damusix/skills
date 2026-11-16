@@ -151,6 +151,7 @@ Quoted from upstream release notes overview. Lists are illustrative, NOT exhaust
 - **`UNIQUE NULLS NOT DISTINCT`** — treat NULL as duplicate for uniqueness checks. See [37-constraints.md](./37-constraints.md).
 - **`ICU` collation provider** can now be cluster-wide (introduced in PG10 per-database).
 - **PUBLIC schema CREATE revoked from PUBLIC** — new clusters require explicit `GRANT CREATE ON SCHEMA public TO ...`. See [46-roles-privileges.md gotcha #3](./46-roles-privileges.md#gotchas--anti-patterns).
+- **`GRANT ... ON PARAMETER`** — grant a non-superuser `SET` or `ALTER SYSTEM` on individual server parameters; `has_parameter_privilege()` reports it. See [53-server-configuration.md](./53-server-configuration.md).
 
 ### PostgreSQL 16 (2023-09-14, EOL 2028-11-09)
 
@@ -166,6 +167,7 @@ Quoted from upstream release notes overview. Lists are illustrative, NOT exhaust
 - **`pg_hba.conf` regex matching** on database and user columns.
 - **CREATEROLE narrowed** — non-superuser with CREATEROLE can no longer trivially grant SUPERUSER or BYPASSRLS to other roles. See [46-roles-privileges.md](./46-roles-privileges.md).
 - **HOT updates with BRIN-only indexed column** — PG16 relaxes the HOT-disabled rule for BRIN-only updates. See [30-hot-updates.md](./30-hot-updates.md).
+- **`promote_trigger_file` removed** — promote a standby with `pg_ctl promote` or `pg_promote()`. See [77-standby-failover.md](./77-standby-failover.md).
 
 ### PostgreSQL 17 (2024-09-26, EOL 2029-11-08)
 
@@ -238,7 +240,7 @@ Quoted from upstream release notes overview. Lists are illustrative, NOT exhaust
 | Wait event `BufferPin` | type `BufferPin` | type `Buffer`, event `BufferCleanup`; `BufferContent` split into `BufferShared` / `BufferShareExclusive` / `BufferExclusive` |
 | `pg_stat_subscription_stats.sync_error_count` | present | renamed `sync_table_error_count`; `sync_seq_error_count` added |
 | Default `inet`/`cidr` GiST opclass | btree_gist | core GiST; `pg_upgrade` refuses clusters with btree_gist `inet`/`cidr` indexes |
-| FTS and pg_trgm character classification | PG18 changed to database locale provider; reindex affected indexes when upgrading to PG18 | check PG19 release notes for additional changes |
+| FTS and pg_trgm character classification | libc (PG18 moved FTS configuration-file and dictionary reading to the default collation provider, which can change FTS and pg_trgm behavior on non-libc clusters; PG18 recommends reindexing FTS and pg_trgm indexes after `pg_upgrade`) | database locale provider; after `pg_upgrade`, reindex FTS and pg_trgm indexes and recompute stored `tsvector` values |
 | `json_array()` over zero rows | `NULL` | empty JSON array |
 | C compiler for extensions | C99 | C11 |
 
@@ -614,7 +616,7 @@ If unsure when feature X arrived:
 
 [^5]: PostgreSQL 17 Release Notes. https://www.postgresql.org/docs/17/release-17.html (verified 2026-05-14). Headline features: VACUUM memory-management rewrite (1GB cap removed); JSON_TABLE + SQL/JSON completion; streaming I/O for sequential reads; multi-value B-tree index search; pg_createsubscriber; logical slots preserved through pg_upgrade; logical-slot failover; sslnegotiation=direct; pg_basebackup --incremental + pg_combinebackup; COPY ON_ERROR ignore; MAINTAIN privilege + pg_maintain role; pg_stat_checkpointer view; transaction_timeout GUC; old_snapshot_threshold removed.
 
-[^6]: PostgreSQL 18 Release Notes. https://www.postgresql.org/docs/18/release-18.html (verified 2026-05-14). Headline features: asynchronous I/O subsystem + io_method GUC + pg_aios view; pg_upgrade preserves optimizer statistics; B-tree skip scan; uuidv7() in core; virtual generated columns as default; OAuth 2.0 authentication; RETURNING OLD ... NEW ... clause; temporal constraints (WITHOUT OVERLAPS); PG_UNICODE_FAST + casefold(); parallel GIN index builds; data checksums on by default at initdb; idle_replication_slot_timeout; pg_stat_io extended; pg_stat_checkpointer.num_done; AFTER triggers fire as queue-time role; promote_trigger_file removed.
+[^6]: PostgreSQL 18 Release Notes. https://www.postgresql.org/docs/18/release-18.html (verified 2026-05-14). Headline features: asynchronous I/O subsystem + io_method GUC + pg_aios view; pg_upgrade transfers most optimizer statistics (extended statistics are not transferred); B-tree skip scan; uuidv7() in core; virtual generated columns as default; OAuth 2.0 authentication; RETURNING OLD ... NEW ... clause; temporal constraints (WITHOUT OVERLAPS); PG_UNICODE_FAST + casefold(); parallel GIN index builds; data checksums on by default at initdb; idle_replication_slot_timeout; pg_stat_io extended; pg_stat_checkpointer.num_done; AFTER triggers fire as queue-time role.
 
 [^7]: "PostgreSQL 18 Released" announcement. https://www.postgresql.org/about/news/postgresql-18-released-3142/ (verified 2026-05-14). Source of release-summary quotes including AIO subsystem and uuidv7() callouts.
 

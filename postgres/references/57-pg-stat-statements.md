@@ -531,8 +531,10 @@ Interpretation tiers:
 Capture two snapshots. PG17+ `stats_since` helps detect an entry reset or eviction; it does not contain the previous counters needed to compute a delta.
 
 ```sql
+-- PG17+. On PG16 and earlier, drop stats_since from both statements.
 CREATE TABLE pss_baseline AS
-SELECT userid, dbid, toplevel, queryid, calls, total_exec_time, total_plan_time,
+SELECT userid, dbid, toplevel, queryid, stats_since,
+       calls, total_exec_time, total_plan_time,
        shared_blks_hit, shared_blks_read, wal_bytes,
        now() AS captured_at
 FROM pg_stat_statements;
@@ -540,17 +542,17 @@ FROM pg_stat_statements;
 -- After the deploy + sample period
 SELECT
     s.queryid,
-    s.calls - coalesce(b.calls, 0) AS calls_delta,
-    s.total_exec_time - coalesce(b.total_exec_time, 0) AS exec_delta,
+    s.calls - b.calls AS calls_delta,
+    s.total_exec_time - b.total_exec_time AS exec_delta,
     substr(s.query, 1, 100) AS query
 FROM pg_stat_statements s
-JOIN pss_baseline b USING (userid, dbid, toplevel, queryid)
+JOIN pss_baseline b USING (userid, dbid, toplevel, queryid, stats_since)
 WHERE s.calls >= b.calls AND s.total_exec_time >= b.total_exec_time
-ORDER BY (s.total_exec_time - coalesce(b.total_exec_time, 0)) DESC
+ORDER BY s.total_exec_time - b.total_exec_time DESC
 LIMIT 20;
 ```
 
-Reject intervals with resets or evictions; on PG17+ also require matching `stats_since` values saved in both snapshots. A counter increase alone cannot prove continuity after an eviction and reappearance.
+Reject intervals with resets or evictions. Joining on `stats_since` (PG17+) drops every entry that was reset or evicted and re-created since the baseline, because its `stats_since` changes. A counter increase alone cannot prove continuity after an eviction and reappearance.
 
 ### Recipe 13: Find regressed queries after deploy
 

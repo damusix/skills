@@ -267,7 +267,7 @@ When to reach for `FORCE`:
 
 When *not* to reach for `FORCE`:
 
-- Do not assume all maintenance commands are row-filtered; evaluate each operation and its privileges separately.
+- Maintenance scripts that move rows with ordinary DML as the owner (for example `INSERT ... SELECT` during partition rotation). `FORCE` filters them like any other query; run them as a role with `BYPASSRLS` instead. Whole-table operations such as `TRUNCATE` are not subject to row security,[^ddl-rls] and utility commands such as `REINDEX` and `VACUUM` do not read rows through policies, so `FORCE` does not change them.
 
 
 ### row_security GUC and pg_dump
@@ -774,7 +774,7 @@ Pre-PG18 you must edit the dump SQL by hand or restore everything and `DROP POLI
 
 ## Sources
 
-[^ddl-rls]: PostgreSQL 16 documentation, *5.9. Row Security Policies*. Verbatim: *"In addition to the SQL-standard privilege system available through GRANT, tables can have row security policies that restrict, on a per-user basis, which rows can be returned by normal queries or inserted, updated, or deleted by data modification commands."* And: *"Superusers and roles with the BYPASSRLS attribute always bypass the row security system when accessing a table. Table owners normally bypass row security as well, though a table owner can choose to be subject to row security with ALTER TABLE ... FORCE ROW LEVEL SECURITY."* And on `row_security`: *"This does not in itself bypass row security; what it does is throw an error if any query's results would get filtered by a policy."* https://www.postgresql.org/docs/16/ddl-rowsecurity.html
+[^ddl-rls]: PostgreSQL 16 documentation, *5.9. Row Security Policies*. Verbatim: *"In addition to the SQL-standard privilege system available through GRANT, tables can have row security policies that restrict, on a per-user basis, which rows can be returned by normal queries or inserted, updated, or deleted by data modification commands."* And: *"Operations that apply to the whole table, such as TRUNCATE and REFERENCES, are not subject to row security."* And: *"Superusers and roles with the BYPASSRLS attribute always bypass the row security system when accessing a table. Table owners normally bypass row security as well, though a table owner can choose to be subject to row security with ALTER TABLE ... FORCE ROW LEVEL SECURITY."* And on `row_security`: *"This does not in itself bypass row security; what it does is throw an error if any query's results would get filtered by a policy."* https://www.postgresql.org/docs/16/ddl-rowsecurity.html
 
 [^createpolicy-syn]: PostgreSQL 16 documentation, *CREATE POLICY*. Verbatim full synopsis preserved in the [CREATE POLICY Grammar](#create-policy-grammar) section. https://www.postgresql.org/docs/16/sql-createpolicy.html
 

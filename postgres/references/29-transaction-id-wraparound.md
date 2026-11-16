@@ -594,7 +594,7 @@ Budget enough time for the oldest relations to finish vacuuming before failsafe 
 
 14. **Use ordinary VACUUM at the wraparound hard stop.** `FULL` requires an XID, while `FREEZE` does more work than recovery needs. `VACUUM FREEZE` and `VACUUM (FREEZE)` are equivalent spellings; neither is the emergency command.[^routine]
 
-15. **`pg_resetwal` discards data integrity.** It clears WAL and resets control file values. Use only when the server won't start; *immediately* `pg_dumpall`, `initdb`, and restore. Do not run DML between `pg_resetwal` and the dump.
+15. **`pg_resetwal` discards data integrity.** It clears WAL and resets control file values. It is not a wraparound fix. Run it only on an isolated salvage copy, with same-major binaries, when WAL or `pg_control` corruption prevents startup and no valid backup exists, then dump and restore into a separate new cluster. See Recipe 10.[^pg-resetwal]
 
 16. **Anti-wraparound vacuum on a 500GB table can take many hours.** Allow enough time before age thresholds are reached. Earlier scheduled vacuum or lower per-table freeze ages can spread maintenance over time, but do not guarantee that each pass scans fewer pages.
 

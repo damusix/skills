@@ -81,7 +81,7 @@ Policies need to know "who is the current app user?" Define a `SECURITY DEFINER`
         v_id := current_setting('app.user_id', TRUE);
         IF v_id IS NULL OR v_id = '' THEN
             RAISE EXCEPTION 'app.user_id session variable not set'
-                USING ERRCODE = 'P0004';
+                USING ERRCODE = 'Z0004';
         END IF;
         RETURN v_id::user_id;
     END;

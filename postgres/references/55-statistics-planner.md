@@ -42,7 +42,7 @@ Five rules that govern everything else:
 
 4. **Extended statistics (PG10+) handle correlations the per-column model misses.** Per-column statistics assume column-independence; when columns are correlated (`(state, country)`, `(day_of_week, is_weekend)`, etc.) the planner under-estimates filter selectivity unless you `CREATE STATISTICS`. Three kinds since PG12: `ndistinct`, `dependencies`, `mcv`.[^pg10-extstats] [^pg12-mcv]
 
-5. **Statistics are sampled, not complete.** The sample size depends on column and extended-statistics targets and the table size; estimates remain approximate even after ANALYZE.[^planner-stats]
+5. **Statistics are sampled, not complete.** `ANALYZE` samples 300 × the largest statistics target among the analyzed columns (30,000 rows at the default of 100), or every row of a smaller table. Estimates remain approximate even after ANALYZE.[^planner-stats]
 
 ## Decision Matrix
 
@@ -189,11 +189,17 @@ ALTER TABLE events ALTER COLUMN event_type SET STATISTICS -1;
 Per-column statistics assume columns are independent. Extended statistics (PG10+) capture correlations explicitly:
 
 ```
-CREATE STATISTICS [ IF NOT EXISTS ] statistics_name
+CREATE STATISTICS [ [ IF NOT EXISTS ] statistics_name ]
+    ON ( expression )
+    FROM table_name
+
+CREATE STATISTICS [ [ IF NOT EXISTS ] statistics_name ]
     [ ( statistics_kind [, ... ] ) ]
-    ON { column_name | ( expression ) } [, ...]
+    ON { column_name | ( expression ) }, { column_name | ( expression ) } [, ...]
     FROM table_name
 ```
+
+The first form (PG14+) collects univariate statistics on a single expression and takes no statistics kinds. The second form needs at least two columns or expressions; a single bare column is rejected.
 
 *"CREATE STATISTICS will create a new extended statistics object tracking data about the specified table, foreign table or materialized view."*[^sql-createstatistics]
 
@@ -343,8 +349,8 @@ SELECT
     avg_width,
     n_distinct,
     array_length(most_common_vals, 1) AS n_mcv,
-    most_common_vals AS common_values,
-    most_common_freqs[1:5] AS top_5_freqs,
+    most_common_vals AS mcv_values,
+    most_common_freqs AS mcv_freqs,
     array_length(histogram_bounds, 1) AS histogram_buckets,
     correlation
 FROM pg_stats
@@ -583,9 +589,9 @@ Use this on inherited schemas to inventory existing extended-stats objects, iden
 
 4. **`default_statistics_target` cluster-wide changes affect every ANALYZE.** Raising it from 100 → 1000 makes ANALYZE 10× slower (sample size grows linearly) on every table. Use per-column overrides instead.
 
-5. **`SET STATISTICS 0` disables collection for a column.** Existing statistics are not automatically a substitute for fresh collection; evaluate the impact before disabling it.
+5. **`SET STATISTICS 0` disables collection for a column.** `ANALYZE` skips the column, so its existing statistics stop updating and go stale as the data changes.
 
-6. **Extended statistics on expressions did not exist before PG14.** Before PG14, `CREATE STATISTICS ... ON (lower(email), country) FROM users` errored. The workaround was a functional index — which also provides stats but adds storage cost.
+6. **Extended statistics on expressions did not exist before PG14.** Before PG14, `CREATE STATISTICS ... ON (lower(email)), country FROM users` errored. The workaround was a functional index — which also provides stats but adds storage cost.
 
 7. **`pg_stats` view filters MCV/histogram by SELECT privilege.** A role that can't SELECT a column will see NULL in `most_common_vals` and `histogram_bounds` for that column. This is a security feature, not a bug — the underlying `pg_statistic` catalog requires the role to have privileges on each column it wants to inspect statistics for.
 
@@ -637,7 +643,7 @@ Use this on inherited schemas to inventory existing extended-stats objects, iden
 
 ## Sources
 
-[^planner-stats]: PostgreSQL 16 documentation, "Statistics Used by the Planner". https://www.postgresql.org/docs/16/planner-stats.html — *"Entries in `pg_statistic` are updated by the `ANALYZE` and `VACUUM ANALYZE` commands, and are always approximate even when freshly updated."*
+[^planner-stats]: PostgreSQL 16 documentation, "Statistics Used by the Planner". https://www.postgresql.org/docs/16/planner-stats.html — *"Entries in `pg_statistic` are updated by the `ANALYZE` and `VACUUM ANALYZE` commands, and are always approximate even when freshly updated."* The sample size of 300 rows per unit of statistics target is set in `std_typanalyze()` in `src/backend/commands/analyze.c`.
 
 [^pg-stats-view]: PostgreSQL 16 documentation, "pg_stats" system view. https://www.postgresql.org/docs/16/view-pg-stats.html — *"The view `pg_stats` provides access to the information stored in the `pg_statistic` catalog."*
 
@@ -666,7 +672,5 @@ Use this on inherited schemas to inventory existing extended-stats objects, iden
 [^pg18-pgupgrade-stats]: PostgreSQL 18 release notes, Section E.4.3.7.2 pg_upgrade. https://www.postgresql.org/docs/release/18.0/ — *"Allow pg_upgrade to preserve optimizer statistics (Corey Huinker, Jeff Davis, Nathan Bossart). Extended statistics are not preserved. Also add pg_upgrade option `--no-statistics` to disable statistics preservation."*
 
 [^pg18-stats-functions]: PostgreSQL 18 release notes, Section E.4.3.2 Utility Commands. https://www.postgresql.org/docs/release/18.0/ — *"Add functions to modify per-relation and per-column optimizer statistics (Corey Huinker). The functions are `pg_restore_relation_stats()`, `pg_restore_attribute_stats()`, `pg_clear_relation_stats()`, and `pg_clear_attribute_stats()`."*
-
-[^pg16-pgupgrade]: PostgreSQL 16 documentation, pg_upgrade reference. https://www.postgresql.org/docs/16/pgupgrade.html — *"Because optimizer statistics are not transferred by `pg_upgrade`, you will be instructed to run a command to regenerate that information at the end of the upgrade."*
 
 [^pg17-pgupgrade]: PostgreSQL 17 documentation, pg_upgrade reference. https://www.postgresql.org/docs/17/pgupgrade.html — *"Because optimizer statistics are not transferred by `pg_upgrade`, you will be instructed to run a command to regenerate that information at the end of the upgrade."* — (this language is unchanged from PG16; preservation lands in PG18, not PG17)

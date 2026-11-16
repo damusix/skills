@@ -52,15 +52,19 @@ The partial index makes claim queries cheap — they only scan claimable rows.
 
 ## Status State Machine
 
-A shared reference table defines the vocabulary so every queue table speaks the same language:
+A shared enum defines the vocabulary so every queue table speaks the same language, and a reference table carries per-status metadata. The table takes a different name from the type because `CREATE TABLE` also creates a composite type named after the table, and a table named `queue_status` fails with `type "queue_status" already exists`:
 
-    CREATE TABLE queue_status (
+    CREATE TYPE queue_status AS ENUM (
+        'pending', 'in_progress', 'retry', 'done', 'failed', 'cancelled'
+    );
+
+    CREATE TABLE queue_status_ref (
         status      queue_status PRIMARY KEY,
         is_terminal boolean NOT NULL,
         is_claimable boolean NOT NULL
     );
 
-    INSERT INTO queue_status VALUES
+    INSERT INTO queue_status_ref VALUES
         ('pending',     FALSE, TRUE),
         ('in_progress', FALSE, FALSE),
         ('retry',       FALSE, TRUE),
@@ -73,7 +77,7 @@ Helper function:
 
     CREATE OR REPLACE FUNCTION fn_queue_status_is_terminal(p_status queue_status)
     RETURNS boolean LANGUAGE sql STABLE AS $$
-        SELECT is_terminal FROM queue_status WHERE status = p_status;
+        SELECT is_terminal FROM queue_status_ref WHERE status = p_status;
     $$;
 
 ## Atomic Claim with FOR UPDATE SKIP LOCKED
@@ -154,8 +158,6 @@ After processing, the worker reports outcome via a procedure that enforces the s
         v_current_status queue_status;
         v_current_attempt smallint;
     BEGIN
-        PERFORM fn_assert_not_in_transaction();
-
         SELECT status, attempt_num
             INTO v_current_status, v_current_attempt
         FROM notification_queue WHERE notification_id = p_notification_id
@@ -163,20 +165,20 @@ After processing, the worker reports outcome via a procedure that enforces the s
 
         IF NOT FOUND THEN
             RAISE EXCEPTION 'notification % not found', p_notification_id
-                USING ERRCODE = 'P0002';
+                USING ERRCODE = 'Z0002';
         END IF;
 
         -- Optimistic concurrency: caller must have the attempt they claimed
         IF v_current_attempt <> p_attempt_num THEN
             RAISE EXCEPTION 'attempt mismatch: caller has %, current is %',
                     p_attempt_num, v_current_attempt
-                USING ERRCODE = 'P0013';
+                USING ERRCODE = 'Z0013';
         END IF;
 
         IF v_current_status <> 'in_progress' THEN
             RAISE EXCEPTION 'cannot report result for non-running job (status=%)',
                     v_current_status
-                USING ERRCODE = 'P0005';
+                USING ERRCODE = 'Z0005';
         END IF;
 
         UPDATE notification_queue
@@ -192,11 +194,6 @@ After processing, the worker reports outcome via a procedure that enforces the s
                 ELSE scheduled_for
             END
         WHERE notification_id = p_notification_id;
-
-        COMMIT;
-    EXCEPTION WHEN OTHERS THEN
-        ROLLBACK;
-        RAISE;
     END;
     $$;
 

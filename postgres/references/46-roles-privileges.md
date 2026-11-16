@@ -403,7 +403,7 @@ Continues the iteration-41/42 per-role-baseline pattern. Set timeouts and isolat
 See [`41-transactions.md`](./41-transactions.md) Recipe 1 for timeouts, [`42-isolation-levels.md`](./42-isolation-levels.md) Recipe 7 for isolation.
 
 
-### Recipe 3 — Soft revocation via REVOKE CONNECT
+### Recipe 3 — Soft revocation via NOLOGIN
 
 To block a role from connecting, account for privileges inherited from `PUBLIC` and group roles. `CONNECT` is granted to `PUBLIC` by default, so revoking only a direct grant normally does not lock the role out. For a role-wide lockout, disable login and terminate its existing sessions:
 
@@ -541,8 +541,8 @@ A privileged session can simulate a less-privileged user without disconnecting:
 
 ### Recipe 12 — Per-database password policy via VALID UNTIL
 
-    -- Force rotation in 90 days
-    ALTER ROLE app_user VALID UNTIL '2027-02-01 00:00:00+00'; -- choose the actual 90-day deadline
+    -- Force rotation at a fixed deadline
+    ALTER ROLE app_user VALID UNTIL '2027-02-01 00:00:00+00';
 
     -- Audit roles whose password expires soon:
     SELECT rolname, rolvaliduntil
@@ -550,6 +550,8 @@ A privileged session can simulate a less-privileged user without disconnecting:
     WHERE rolvaliduntil IS NOT NULL
       AND rolvaliduntil < CURRENT_DATE + INTERVAL '14 days'
     ORDER BY rolvaliduntil;
+
+`VALID UNTIL` takes a timestamp literal, not an expression, so compute the 90-day deadline before running the statement.
 
 After expiration the role cannot authenticate via password — but already-connected sessions stay alive. Pair with a session-aging GUC like `idle_session_timeout` to actually kick stale sessions.
 

@@ -177,7 +177,8 @@ Documented in [`lo-funcs.html`](https://www.postgresql.org/docs/16/lo-funcs.html
 | `loread(fd int, len int)` | `bytea` | Server-side variant of libpq `lo_read`; note **no underscore** |
 | `lowrite(fd int, data bytea)` | `int` | Server-side variant of libpq `lo_write`; note **no underscore** |
 
-> The server-side functions access the server filesystem as the PostgreSQL OS user. They are restricted to superusers by default. Granting EXECUTE to other roles is highly privileged and can enable superuser escalation.[PG16 documentation](https://www.postgresql.org/docs/16/lo-funcs.html)
+> [!WARNING] `lo_import` / `lo_export` read or write the **server's** filesystem.
+> The server-side functions access the server filesystem as the PostgreSQL OS user. They are restricted to superusers by default. Granting EXECUTE to other roles is highly privileged and can enable superuser escalation. [PG16 documentation](https://www.postgresql.org/docs/16/lo-funcs.html)
 
 ### libpq Client-side LO API
 

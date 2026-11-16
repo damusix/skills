@@ -516,12 +516,15 @@ If your loop body relies on `REPEATABLE READ`, use `COMMIT AND CHAIN` so the nex
     LANGUAGE plpgsql
     AS $$
     BEGIN
+        COMMIT;  -- CALL already ran a query in the caller's transaction
         SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
         INSERT INTO export_log(message) VALUES ('first batch');
         COMMIT AND CHAIN;
         INSERT INTO export_log(message) VALUES ('second batch');
     END;
     $$;
+
+`SET TRANSACTION ISOLATION LEVEL` as the first statement of the body fails with *"SET TRANSACTION ISOLATION LEVEL must be called before any query"*, because `CALL` has already taken a snapshot in the current transaction. The opening `COMMIT` starts a fresh transaction, which requires a top-level `CALL` outside an explicit transaction block.[^plpgsql-tx-test]
 
 Each transaction receives a fresh snapshot. `COMMIT AND CHAIN` preserves the isolation level, not one consistent snapshot across transactions.
 
@@ -574,7 +577,36 @@ A clean architecture is: pure functions do the read-only / scalar work; one proc
 
 Combine with [`pg_cron`](./98-pg-cron.md) for nightly scheduling. Each operation gets its own transaction so a crash mid-rotation leaves a clean state:
 
-`DETACH PARTITION CONCURRENTLY` cannot execute inside a transaction block, including a procedure body. Run it as a top-level client command, then verify the detached partition before archiving or dropping it. See [`01-syntax-ddl.md`](./01-syntax-ddl.md#recipe-rotate-a-partition-into-the-archive).
+    CREATE PROCEDURE rotate_orders_partitions(retention_days int DEFAULT 90)
+    LANGUAGE plpgsql AS $$
+    DECLARE
+        next_day date := (current_date + interval '1 day')::date;
+        old_day  date := (current_date - retention_days * interval '1 day')::date;
+        new_part text := format('orders_%s', to_char(next_day, 'YYYYMMDD'));
+        old_part text := format('orders_%s', to_char(old_day, 'YYYYMMDD'));
+    BEGIN
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS %I PARTITION OF orders FOR VALUES FROM (%L) TO (%L)',
+            new_part, next_day, next_day + 1
+        );
+        COMMIT;
+
+        IF to_regclass(old_part) IS NOT NULL THEN
+            -- Plain DETACH: CONCURRENTLY cannot run inside a procedure body.
+            EXECUTE format('ALTER TABLE orders DETACH PARTITION %I', old_part);
+            COMMIT;
+            EXECUTE format('DROP TABLE %I', old_part);
+            COMMIT;
+        END IF;
+    END;
+    $$;
+
+Schedule with pg_cron:
+
+    SELECT cron.schedule('rotate-orders', '5 2 * * *',
+                         $$CALL rotate_orders_partitions(90)$$);
+
+A plain `DETACH PARTITION` takes `ACCESS EXCLUSIVE` on `orders` until its transaction commits. `DETACH PARTITION CONCURRENTLY` cannot execute inside a transaction block, including a procedure body. To avoid the stronger lock, drop the detach and drop steps from the procedure and schedule `ALTER TABLE orders DETACH PARTITION … CONCURRENTLY` as its own pg_cron job, which runs as a top-level statement. See [`01-syntax-ddl.md`](./01-syntax-ddl.md#recipe-rotate-a-partition-into-the-archive).
 
 
 ### Recipe 8 — Idempotent CREATE OR REPLACE PROCEDURE boilerplate
@@ -645,7 +677,7 @@ Procedures live in `pg_proc` like functions, distinguished by `prokind = 'p'`. (
       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
     ORDER BY 1, 2;
 
-For the audit script that finds every `SECURITY DEFINER` procedure missing a pinned `search_path`, see [`06-functions.md`](./06-functions.md#recipe-11--pin-search_path-on-every-security-definer-and-index-used-function) — the same query works against `prokind IN ('f','p')` to cover both.
+For the audit script that finds every `SECURITY DEFINER` procedure missing a pinned `search_path`, see [`06-functions.md`](./06-functions.md#recipe-11--audit-security-definer-functions-without-a-pinned-search_path) — the same query works against `prokind IN ('f','p')` to cover both.
 
 
 ## Gotchas / Anti-patterns
@@ -712,6 +744,8 @@ For the audit script that finds every `SECURITY DEFINER` procedure missing a pin
 [^alterproc]: PostgreSQL 16, `ALTER PROCEDURE` reference page. Documents the supported actions: `RENAME TO`, `OWNER TO`, `SET SCHEMA`, `SECURITY DEFINER`/`INVOKER`, `SET configuration_parameter`, `RESET`, `DEPENDS ON EXTENSION`. https://www.postgresql.org/docs/16/sql-alterprocedure.html
 
 [^plpgsql-tx]: PostgreSQL 16, *"43.8. Transaction Management"* (PL/pgSQL chapter). Includes the verbatim restrictions *"Transaction control is only possible in `CALL` or `DO` invocations from the top level or nested `CALL` or `DO` invocations without any other intervening command."*, *"A transaction cannot be ended inside a block with exception handlers."*, *"Transaction commands are not allowed in cursor loops driven by commands that are not read-only (for example `UPDATE ... RETURNING`)."*, and the holdable-cursor materialization note *"a cursor created as part of a loop like this is automatically converted to a holdable cursor by the first `COMMIT` or `ROLLBACK`. That means that the cursor is fully evaluated at the first `COMMIT` or `ROLLBACK` rather than row by row."* https://www.postgresql.org/docs/16/plpgsql-transactions.html
+
+[^plpgsql-tx-test]: PostgreSQL 16 regression test `src/pl/plpgsql/src/expected/plpgsql_transaction.out`: `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ` as the first statement of a PL/pgSQL block raises *"SET TRANSACTION ISOLATION LEVEL must be called before any query"*; the same statement after a `COMMIT` succeeds. https://github.com/postgres/postgres/blob/REL_16_STABLE/src/pl/plpgsql/src/expected/plpgsql_transaction.out
 
 [^xproc]: PostgreSQL 16, *"38.4. User-Defined Procedures"*. Includes the verbatim function/procedure distinctions *"A procedure can commit or roll back transactions during its execution (then automatically beginning a new transaction), so long as the invoking `CALL` command is not part of an explicit transaction block. A function cannot do that."* and *"Certain function attributes, such as strictness, don't apply to procedures. Those attributes control how the function is used in a query, which isn't relevant to procedures."* https://www.postgresql.org/docs/16/xproc.html
 

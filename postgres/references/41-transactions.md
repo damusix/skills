@@ -77,7 +77,7 @@ Five rules drive every transaction decision:
 Three smell signals that you reached for the wrong tool:
 
 - **Per-row `BEGIN`/`COMMIT` inside a single business operation** — each statement that needs to commit-or-rollback together belongs in one transaction. Repeatedly committing midway through fragments atomicity and quadruples WAL volume.
-- **Catching `unique_violation` per row in a PL/pgSQL loop** incurs subtransaction overhead. Sequentially completed blocks do not imply 1000 simultaneously open subxids. Prefer set-based `INSERT ... ON CONFLICT DO NOTHING` where appropriate.
+- **Catching `unique_violation` per row in a PL/pgSQL loop** — each `EXCEPTION` block starts a subtransaction. One that writes and completes without error keeps its subxid in the backend's 64-entry cache until the top-level transaction ends; only a rolled-back subtransaction leaves the cache. A 1000-row loop where most inserts succeed overflows it, and visibility checks against this backend's XIDs then read `pg_subtrans`.[^subxacts] Move to set-based `INSERT ... ON CONFLICT DO NOTHING`, see [`08-plpgsql.md`](./08-plpgsql.md) Recipe 1.
 - **Setting `statement_timeout` in `postgresql.conf`** — it kills pg_dump, REINDEX CONCURRENTLY, autovacuum, and every legitimate long-running maintenance. Use per-role or `SET LOCAL` instead.
 
 ## Syntax and Mechanics
@@ -178,14 +178,14 @@ Verbatim from the internals chapter: *"Subtransactions are started inside transa
 
 **Subxids only consume resources if they write.** Verbatim: *"Read-only subtransactions are not assigned subxids, but once they attempt to write, they will be assigned one. This also causes all of a subxid's parents, up to and including the top-level transaction, to be assigned non-virtual transaction ids."*[^subxacts]
 
-**The 64-subxact threshold.** This is the canonical operational rule. Verbatim: *"The more subtransactions each transaction keeps open (not rolled back or released), the greater the transaction management overhead. Up to 64 open subxids are cached in shared memory for each backend; after that point, the storage I/O overhead increases significantly due to additional lookups of subxid entries in pg_subtrans."*[^subxacts]
+**The 64-subxact threshold.** This is the canonical operational rule. Verbatim: *"The more subtransactions each transaction keeps open (not rolled back or released), the greater the transaction management overhead. Up to 64 open subxids are cached in shared memory for each backend; after that point, the storage I/O overhead increases significantly due to additional lookups of subxid entries in pg_subtrans."*[^subxacts] A released (subcommitted) subxid still counts: it stays in the backend's cache until the top-level transaction ends, because `XidCacheRemoveRunningXids()` is called only from `RecordTransactionAbort()` (`src/backend/access/transam/xact.c`, REL_16_STABLE).
 
 Operational consequences:
 
-- More than 64 *active* subxids per backend pushes lookups into the `pg_subtrans` SLRU. SLRU contention shows up as `SubtransSLRU` wait events in `pg_stat_activity.wait_event`.
+- More than 64 cached subxids per backend pushes lookups into the `pg_subtrans` SLRU. SLRU contention shows up as `SubtransSLRU` wait events in `pg_stat_activity.wait_event`.
 - The threshold is per-backend, not cluster-wide; the SLRU is shared so contention from many backends compounds.
-- Releasing or rolling back a savepoint frees its subxid. The threshold counts *active* subxids, not lifetime created.
-- PL/pgSQL `EXCEPTION` blocks always create subxacts — even when they catch no exception in a particular iteration — so a loop of 1000 iterations with an EXCEPTION block creates 1000 subxids in sequence (released as each iteration completes the inner BEGIN block).
+- Only rolling back a savepoint frees its subxid from the cache. `RELEASE` keeps it until the top-level transaction ends, so the threshold counts every XID-assigned subtransaction that was not rolled back, not only those still open.
+- PL/pgSQL `EXCEPTION` blocks always create subxacts — even when they catch no exception in a particular iteration — so a loop of 1000 iterations with an EXCEPTION block creates 1000 subtransactions. Each one that writes and completes normally keeps its subxid cached until the top-level transaction ends, so the loop overflows the cache.
 
 > [!NOTE] PostgreSQL 16
 > PG16 added `pg_stat_get_backend_subxact()` to report per-backend subxid usage live. Verbatim release note: *"Add function pg_stat_get_backend_subxact() to report on a session's subtransaction cache (Dilip Kumar)."*[^pg16-subxact] Pre-PG16 the only way to detect overflow was watching SubtransSLRU wait events.
@@ -575,7 +575,7 @@ ORDER BY name;
 
 4. **`RELEASE` cannot run when the transaction is in an aborted state.** Verbatim: *"It is not possible to release a savepoint when the transaction is in an aborted state; to do that, use ROLLBACK TO SAVEPOINT."*[^release] You must roll back to the savepoint first, then release.
 
-5. **A PL/pgSQL `EXCEPTION` block in a tight loop adds subtransaction overhead.** The 64-entry cache threshold concerns open writing subtransactions, not the cumulative number of sequential iterations.[^subxacts]
+5. **A PL/pgSQL `EXCEPTION` block in a tight loop can overflow the 64-entry subxid cache.** The count that matters is subtransactions that were assigned an XID (they wrote) and were not rolled back. A subcommitted subxid stays in the backend's `PGPROC` cache until the top-level transaction commits or aborts (`XidCacheRemoveRunningXids()` runs only on subtransaction abort, `src/backend/access/transam/xact.c`, REL_16_STABLE). So 1000 iterations whose blocks write and complete normally overflow the cache even though each block finished before the next began. Wait events tell the story: `SubtransSLRU`. Move to set-based DML or `INSERT ... ON CONFLICT DO NOTHING`. Cross-reference [`08-plpgsql.md`](./08-plpgsql.md) gotcha #1.[^subxacts]
 
 6. **`idle_in_transaction_session_timeout = 0` (default) is dangerous for OLTP.** A client that hangs (network drop, client deadlock, debugger) keeps a transaction open forever; `xmin` is pinned; VACUUM can't reclaim dead tuples. Set this. Always.
 

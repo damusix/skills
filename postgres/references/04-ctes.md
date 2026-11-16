@@ -136,7 +136,7 @@ When to use each:
 
 In practice, write CTEs without either keyword by default and add one explicitly only when you've confirmed via `EXPLAIN` that the default decision is wrong. `MATERIALIZED` is the more common explicit choice because the "compute once" semantics are what people typically reach for CTEs to get.
 
-`NOT MATERIALIZED` only applies to **non-recursive, side-effect-free** CTEs. It is ignored for a recursive or non-side-effect-free CTE; the presence of `WITH RECURSIVE` alone does not make every CTE recursive.[^queries-with]
+`NOT MATERIALIZED` only applies to **non-recursive, side-effect-free** CTEs. It is ignored if the CTE is recursive or is not side-effect-free; the presence of `WITH RECURSIVE` alone does not make every CTE recursive.[^queries-with]
 
 
 ### WITH RECURSIVE: shape, evaluation order, termination
@@ -506,7 +506,7 @@ Compute total raw-material quantities for a finished product whose parts have su
     GROUP BY component_id
     ORDER BY total_qty DESC;
 
-This walks the assembly tree multiplying quantities as it descends. The anti-join keeps items that are *not themselves assembled* — i.e., raw materials.
+This walks the assembly tree multiplying quantities as it descends. The anti-join keeps items that are *not themselves assembled*, i.e., raw materials.
 
 
 ### 8. Graph reachability with CYCLE detection

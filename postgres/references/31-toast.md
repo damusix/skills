@@ -34,7 +34,7 @@ PostgreSQL's TOAST mechanism transparently compresses and/or moves wide column v
 
 ## Five-rule Mental Model
 
-1. **TOAST is triggered by the size of the whole tuple.** The default threshold is about 2 KB; `toast_tuple_target` adjusts the per-table threshold and target.[^toast-target]
+1. **TOAST is triggered by the size of the whole tuple.** Toasting starts when a row exceeds the compile-time `TOAST_TUPLE_THRESHOLD` (about 2 KB). The per-table `toast_tuple_target` sets only the size toasting reduces the row to; lowering it does not lower the trigger point.[^toast-target]
 2. **There are four storage strategies; `EXTENDED` is the default for almost every variable-length type.** PLAIN forbids both compression and out-of-line storage (fixed-length types). EXTENDED tries compression first, then out-of-line. EXTERNAL skips compression and goes straight out-of-line. MAIN tries compression and keeps in-line as long as possible [^four-strategies].
 3. **Compression default is `pglz` on PG14–18 (PG19 changes it to `lz4`); `lz4` is faster and almost always better but only present if PostgreSQL was built `--with-lz4`.** Set per-column with `ALTER TABLE ... ALTER COLUMN ... SET COMPRESSION lz4` (PG14+) or cluster-wide via `default_toast_compression` GUC [^pg14-lz4] [^default-toast].
 4. **Every TOAST-eligible table has a sidecar `pg_toast.pg_toast_<oid>` relation.** It is autovacuumed independently, has its own index, and can become bloated independently of the main table. Read it through `pg_class` (relkind `t`) [^toast-naming].
@@ -70,7 +70,7 @@ The TOAST machinery is triggered when an entire row exceeds `TOAST_TUPLE_THRESHO
 
 > The TOAST management code is triggered only when a row value to be stored in a table is wider than `TOAST_TUPLE_THRESHOLD` bytes (normally 2 kB). The TOAST code will compress and/or move field values out-of-line until the row value is shorter than `TOAST_TUPLE_TARGET` bytes (also normally 2 kB, adjustable) [^toast-threshold].
 
-Both thresholds are per row, not per column. The per-table `toast_tuple_target` changes the threshold as well as the target; small columns may also move out-of-line when a wide row requires it.[^toast-target]
+Both thresholds are per row, not per column. The per-table `toast_tuple_target` changes only the target. The insert and update paths in `heapam.c` still compare the row against the compile-time `TOAST_TUPLE_THRESHOLD`, so lowering `toast_tuple_target` does not make narrower rows toast; it makes rows that already crossed the threshold shrink further once toasting runs. Small columns may also move out-of-line when a wide row requires it.[^toast-target]
 
 The order of operations when a row exceeds the threshold:
 
@@ -239,7 +239,7 @@ The verbatim docs [^toast-target]:
 
 > The `toast_tuple_target` specifies the minimum tuple length required before we try to compress and/or move long column values into TOAST tables, and is also the target length we try to reduce the length below once toasting begins. … Valid values are between 128 bytes and the (block size - header), by default 8160 bytes. … By default this parameter is set to allow at least 4 tuples per block, which with the default block size will be 2040 bytes.
 
-Lower the value to push TOAST to engage sooner (smaller rows in the main heap, more aggressive offloading). Raise it to keep more in-line.
+The first clause of that quote does not match the source (see the footnote): lowering the value does not make TOAST engage sooner, because rows still trigger toasting only above `TOAST_TUPLE_THRESHOLD`. Lowering it makes rows that cross the threshold shrink further once toasting runs. Raising it above the threshold keeps more in-line.
 
 For TOAST-table-specific storage parameters, prefix with `toast.` [^toast-prefix]:
 
@@ -312,8 +312,9 @@ For a JSONB event payload with mixed structured content:
     ALTER TABLE events
         ALTER COLUMN payload SET COMPRESSION lz4;
 
-    -- For low-frequency wide reads, lower the toast_tuple_target
-    -- to keep heap tuples narrow (cheap seqscan + index scan)
+    -- For low-frequency wide reads, lower toast_tuple_target so rows that
+    -- exceed TOAST_TUPLE_THRESHOLD (~2 kB) are shrunk to ~1 kB in the heap;
+    -- rows under the threshold are not toasted either way
     ALTER TABLE events SET (toast_tuple_target = 1024);
 
 For a `bytea` column storing JPEG images (already compressed):
@@ -599,7 +600,7 @@ Trade-offs:
 
 [^alter-storage]: PostgreSQL 16 docs, ALTER TABLE — SET STORAGE / SET COMPRESSION. Verbatim: *"This form sets the storage mode for a column. This controls whether this column is held inline or in a secondary TOAST table, and whether the data should be compressed or not. … Note that `ALTER TABLE ... SET STORAGE` doesn't itself change anything in the table; it just sets the strategy to be pursued during future table updates. … This form sets the compression method for a column, determining how values inserted in future will be compressed (if the storage mode permits compression at all). The supported compression methods are `pglz` and `lz4`. In addition, _compression_method_ can be `default`, which selects the default behavior of consulting the `default_toast_compression` setting at the time of data insertion to determine the method to use."* https://www.postgresql.org/docs/16/sql-altertable.html
 
-[^toast-target]: PostgreSQL 16 docs, CREATE TABLE — toast_tuple_target. Verbatim: *"The `toast_tuple_target` specifies the minimum tuple length required before we try to compress and/or move long column values into TOAST tables, and is also the target length we try to reduce the length below once toasting begins. … Valid values are between 128 bytes and the (block size - header), by default 8160 bytes. … By default this parameter is set to allow at least 4 tuples per block, which with the default block size will be 2040 bytes."* https://www.postgresql.org/docs/16/sql-createtable.html
+[^toast-target]: PostgreSQL 16 docs, CREATE TABLE — toast_tuple_target. Verbatim: *"The `toast_tuple_target` specifies the minimum tuple length required before we try to compress and/or move long column values into TOAST tables, and is also the target length we try to reduce the length below once toasting begins. … Valid values are between 128 bytes and the (block size - header), by default 8160 bytes. … By default this parameter is set to allow at least 4 tuples per block, which with the default block size will be 2040 bytes."* https://www.postgresql.org/docs/16/sql-createtable.html The source disagrees with the first clause: `heap_insert` and `heap_update` in `src/backend/access/heap/heapam.c` (REL_16_STABLE) call the toaster only when `t_len > TOAST_TUPLE_THRESHOLD`, and `heaptoast.c` uses `RelationGetToastTupleTarget()` only as the reduction target. A value above the threshold does raise the effective trigger, because the toaster leaves a row already under its target alone.
 
 [^toast-prefix]: PostgreSQL 16 docs, CREATE TABLE — toast.* storage parameters. Verbatim: *"For many of these parameters, as shown, there is an additional parameter with the same name prefixed with `toast.`, which controls the behavior of the table's secondary TOAST table, if any. If a table parameter value is set and the equivalent `toast.` parameter is not, the TOAST table will use the table's parameter value."* https://www.postgresql.org/docs/16/sql-createtable.html
 

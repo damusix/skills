@@ -124,7 +124,7 @@ Four families. The relevant ones[^brin-opclasses]:
 | --- | --- | --- |
 | **`*_minmax_ops`** (default) | Append-mostly with strong physical correlation. One `(min, max)` per range. | `int2`/`4`/`8`, `float4`/`8`, `numeric`, `text`, `bpchar`, `bytea`, `date`, `time`/`timetz`, `timestamp`/`timestamptz`, `interval`, `inet`, `macaddr`/`macaddr8`, `oid`, `pg_lsn`, `tid`, `uuid`, `bit`, `varbit`, `char`, `name` |
 | **`*_minmax_multi_ops`** (PG14+)[^pg14-minmax-multi] | Mostly-monotone with occasional reorder/outliers. `values_per_range` sets a budget of stored values (default 32, 8–256), not a count of min/max pairs. | Numeric, temporal, network and other supported scalar types. |
-| **`*_bloom_ops`** (PG14+)[^pg14-bloom] | Equality lookup on data that isn't physically correlated. Each range stores a Bloom filter. Tune `n_distinct_per_range` and `false_positive_rate`. | Supported scalar types include text and inet; consult the operator-class table for the complete list.[^brin-opclasses] |
+| **`*_bloom_ops`** (PG14+)[^pg14-bloom] | Equality lookup on data that isn't physically correlated. Each range stores a Bloom filter. Tune `n_distinct_per_range` (default `-0.1`, 10% of the maximum tuples per range, minimum 16) and `false_positive_rate` (default `0.01`, range 0.0001 to 0.25). | Supported scalar types include text and inet; consult the operator-class table for the complete list.[^brin-opclasses] |
 | **`*_inclusion_ops`** | Range/box/inet types where a single "bounding" value contains all per-range values. | `box`, `inet`, `anyrange`. |
 
 > [!NOTE] PostgreSQL 14

@@ -37,7 +37,7 @@ PostgreSQL functions, mutability, parallel safety, security context, polymorphic
     - [Recipe 8 — Set-returning SQL function used in FROM](#recipe-8--set-returning-sql-function-used-in-from)
     - [Recipe 9 — Idempotent function migration boilerplate](#recipe-9--idempotent-function-migration-boilerplate)
     - [Recipe 10 — Convert SQL function to BEGIN ATOMIC body (PG14+)](#recipe-10--convert-sql-function-to-begin-atomic-body-pg14)
-    - [Recipe 11 — Pin search_path on every SECURITY DEFINER and index-used function](#recipe-11--pin-search_path-on-every-security-definer-and-index-used-function)
+    - [Recipe 11 — Audit SECURITY DEFINER functions without a pinned search_path](#recipe-11--audit-security-definer-functions-without-a-pinned-search_path)
 - [Gotchas / Anti-patterns](#gotchas--anti-patterns)
 - [See Also](#see-also)
 - [Sources](#sources)
@@ -267,7 +267,7 @@ Default for all **user-defined** functions is `UNSAFE`[^parallel-safety]. The pl
 **Default to `UNSAFE`. Promote to `SAFE` only when you can prove every branch is safe.** A wrong `SAFE` label produces incorrect results or crashes; a wrong `UNSAFE` label only forces serial execution.
 
 > [!NOTE] PL/pgSQL exception blocks
-> A PL/pgSQL `EXCEPTION` block creates a subtransaction. Functions that change transaction state must be marked `PARALLEL UNSAFE`.[^parallel-safety]
+> A PL/pgSQL function with an `EXCEPTION` block must be marked `PARALLEL UNSAFE`: the block creates a subtransaction, which changes transaction state even if only temporarily.[^parallel-safety]
 
 
 ### SECURITY DEFINER vs SECURITY INVOKER
@@ -357,9 +357,12 @@ Mark a function `STRICT` when you mean it — it changes behavior, not just perf
 The setting applies on function entry and is restored on exit[^create-function]. Most common uses:
 
 - **`SET search_path = ...`** — mandatory for every `SECURITY DEFINER` and any function used in an index expression (PG17+ — see above).
-- **`SET statement_timeout`** — set it on the client session before issuing the call; changing it inside a running statement does not arm a new timeout for that statement.
 - **`SET jit = off`** — disable JIT for short fast functions that pay the JIT planning cost without benefit ([`61-jit-compilation.md`](./61-jit-compilation.md)).
-- **`SET row_security = off`** — does not bypass RLS: it raises an error if a policy would filter rows. Only roles with applicable bypass rights bypass RLS.
+
+Function-level `SET` clauses that do not do what they suggest:
+
+- **`statement_timeout`**: set it on the client session before issuing the call. Changing it inside a running statement does not arm a new timeout for that statement.
+- **`row_security = off`**: does not bypass RLS. It raises an error if a policy would filter rows; only roles with applicable bypass rights bypass RLS.
 
 `SET LOCAL` is restored at function exit only when the function has an attached `SET` clause for the same parameter; otherwise it lasts until transaction end.[^create-function]
 
@@ -648,7 +651,7 @@ New (`BEGIN ATOMIC` — parsed at definition time, dependency on `posts` recorde
 > Available since PG14[^pg14-sql-body]. Prefer this for any SQL function that references stable tables you don't want a colleague to silently drop.
 
 
-### Recipe 11 — Pin search_path on every SECURITY DEFINER and index-used function
+### Recipe 11 — Audit SECURITY DEFINER functions without a pinned search_path
 
 
 Audit first; do not bulk-change paths. Each function may require different trusted schemas, and putting a writable schema on a definer's path permits object shadowing.

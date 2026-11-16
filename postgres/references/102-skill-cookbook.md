@@ -69,7 +69,7 @@ Five rules:
 | Autovacuum can't keep up | Recipe 8 (Autovacuum Tuning) | [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md) + [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md) |
 | "too many connections" errors | Recipe 9 (Connection Storm) | [`80-connection-pooling.md`](./80-connection-pooling.md) + [`81-pgbouncer.md`](./81-pgbouncer.md) |
 | Picking the right index | Recipe 1 (Index Decision Flowchart) | [`22-indexes-overview.md`](./22-indexes-overview.md) |
-| Adding/changing schema online | Recipe 11 (Online DDL) | [`26-index-maintenance.md`](./26-index-maintenance.md) + [`37-constraints.md`](./37-constraints.md) |
+| Adding/changing schema online | Recipe 11 (DDL with Shorter Blocking Windows) | [`26-index-maintenance.md`](./26-index-maintenance.md) + [`37-constraints.md`](./37-constraints.md) |
 | Need to rotate partitions | Recipe 10 (Partition Rotation) | [`35-partitioning.md`](./35-partitioning.md) + [`99-pg-partman.md`](./99-pg-partman.md) + [`98-pg-cron.md`](./98-pg-cron.md) |
 | Need to drop a role / clean orphans | Recipe 12 (Role Inventory) | [`46-roles-privileges.md`](./46-roles-privileges.md) |
 | What's running right now | Catalog Exploration §1 | [`58-performance-diagnostics.md`](./58-performance-diagnostics.md) |
@@ -245,7 +245,7 @@ FROM pg_stat_progress_vacuum v
 JOIN pg_stat_activity a USING (pid);
 ```
 
-Repeated index-vacuum cycles can indicate an undersized dead-item store. Budget memory before changing `maintenance_work_mem` (manual VACUUM) or `autovacuum_work_mem` (autovacuum); there is no per-table memory override.
+Repeated index-vacuum cycles can indicate an undersized dead-item store. PG16 and earlier cap that store at 1GB whatever the memory setting; PG17+ has no cap. Budget memory before changing `maintenance_work_mem` (manual VACUUM) or `autovacuum_work_mem` (autovacuum); there is no per-table memory override.
 
 **Step 4 — Is autovacuum being canceled?** Temporarily enable `log_autovacuum_min_duration = 0` and inspect cancellation logs. Anti-wraparound autovacuum is not automatically canceled by conflicting lock requests, but can still be explicitly canceled.
 
@@ -301,7 +301,7 @@ FROM pg_replication_slots
 ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC NULLS LAST;
 ```
 
-On PG17+, optionally add `inactive_since` and `invalidation_reason`. `lost` means the slot is unusable. `unreserved` means needed WAL is no longer protected by that slot and may be removed at the next checkpoint; it does not prove the files are already absent. Check archives and the recovery procedure before rebuilding.
+On PG17+, optionally add `inactive_since` and `invalidation_reason`. `lost` means the slot is unusable. `unreserved` means needed WAL is no longer protected by that slot and may be removed at the next checkpoint; it does not prove the files are already absent. `extended` means retained WAL exceeds `max_wal_size` but the slot or `wal_keep_size` still keeps it. Check archives and the recovery procedure before rebuilding.
 
 **Step 3 — Replay blocked by standby query?**
 
@@ -355,8 +355,11 @@ RECOVERY_SOCKET=$(mktemp -d /tmp/pg-recovery.XXXXXX)
 RECOVERY_PORT=5433
 
 # 4. Restore base backup
+# --archive-mode=off keeps the recovered cluster from pushing its new timeline
+# into the production repository after promotion.
 pgbackrest --stanza=main --pg1-path=/var/lib/postgresql/18/data \
-  --type=time --target="$RECOVERY_TARGET" --target-action=pause restore
+  --type=time --target="$RECOVERY_TARGET" --target-action=pause \
+  --archive-mode=off restore
 
 # 5. Inspect pgBackRest's generated recovery configuration before startup.
 # Confirm restore_command, the time target, target-action=pause, and recovery.signal.
@@ -364,7 +367,7 @@ pgbackrest --stanza=main --pg1-path=/var/lib/postgresql/18/data \
 
 # 6. Start with no TCP listener and a private Unix socket.
 pg_ctl -D /var/lib/postgresql/18/data \
-  -o "-k $RECOVERY_SOCKET -p $RECOVERY_PORT -c listen_addresses=''" start
+  -o "-k $RECOVERY_SOCKET -p $RECOVERY_PORT -c listen_addresses='' -c archive_mode=off" start
 
 # 7. Verify before promoting
 psql -h "$RECOVERY_SOCKET" -p "$RECOVERY_PORT" -d postgres \
@@ -429,7 +432,7 @@ SELECT rolname, rolsuper, rolreplication, rolbypassrls
 FROM pg_roles WHERE NOT rolname LIKE 'pg_%' ORDER BY rolname;
 ```
 
-Initialize the new cluster with compatible locale and checksum settings and install matching extension binaries first. Preserve a tested independent backup. With `--link`, starting the new cluster changes shared files and makes the old cluster unsafe to start; prefer `--clone` where supported if an independent old copy is needed.
+Initialize the new cluster with compatible locale and checksum settings and install matching extension binaries first. PG18 `initdb` enables data checksums by default, and `pg_upgrade` requires both clusters to match, so pass `--no-data-checksums` when the PG16 source has checksums off. Preserve a tested independent backup. With `--link`, starting the new cluster changes shared files and makes the old cluster unsafe to start; prefer `--clone` where supported if an independent old copy is needed.
 
 **pg_upgrade --link workflow:**
 
@@ -502,7 +505,7 @@ If one query dominates, focus there. If many small queries dominate, the issue i
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) <the slow query>;
 ```
 
-`EXPLAIN ANALYZE` executes the statement. `BEGIN` followed by `ROLLBACK` can undo transactional table changes, but does not prevent locks, sequence consumption, trigger execution, or external effects. Use a disposable clone for statements with irreversible effects.
+`EXPLAIN ANALYZE` executes the statement. `BEGIN` followed by `ROLLBACK` can undo transactional table changes, but does not prevent locks, sequence consumption, trigger execution, or external effects. Use a disposable clone for statements with irreversible effects. PG18+ includes `BUFFERS` output in `EXPLAIN ANALYZE` by default.
 
 **Step 3 — Read the plan tree from inputs toward parents.**
 
@@ -577,8 +580,8 @@ ALTER TABLE events SET (
   autovacuum_vacuum_cost_limit = 2000       -- example; budget total I/O first
 );
 ```
-`autovacuum_naptime` is a cluster configuration setting, not a table storage parameter. Tune it separately only when launcher scheduling, rather than worker capacity or blockers, is the limiting factor.
 
+`autovacuum_naptime` is a cluster configuration setting, not a table storage parameter. Tune it separately only when launcher scheduling, rather than worker capacity or blockers, is the limiting factor.
 
 Per-table overrides win over cluster GUCs. Verify:
 
@@ -756,8 +759,15 @@ SELECT id FROM users WHERE email IS NULL;
 -- 3. Validate (SHARE UPDATE EXCLUSIVE, doesn't block reads/writes)
 ALTER TABLE users VALIDATE CONSTRAINT users_email_not_null;
 
--- 4. PG16+: validated CHECK lets SET NOT NULL skip the scan, but a brief strong lock remains.
+-- 4. PG12+: validated CHECK lets SET NOT NULL skip the scan, but a brief strong lock remains.
 ALTER TABLE users ALTER COLUMN email SET NOT NULL;   -- now fast because CHECK guarantees it
+
+-- 5. The CHECK is now redundant.
+ALTER TABLE users DROP CONSTRAINT users_email_not_null;
+
+-- PG18+ alternative to steps 1, 3 and 4: a NOT VALID not-null constraint, no CHECK.
+ALTER TABLE users ADD CONSTRAINT users_email_not_null NOT NULL email NOT VALID;
+ALTER TABLE users VALIDATE CONSTRAINT users_email_not_null;
 ```
 
 **Pattern B — Add a foreign key without long lock:**
@@ -939,6 +949,7 @@ SELECT
   pg_get_constraintdef(c.oid) AS definition
 FROM pg_constraint c
 WHERE contype = 'f'
+  AND c.conparentid = 0   -- skip per-partition clones of a partitioned FK
   AND NOT EXISTS (
     SELECT 1 FROM pg_index i
     JOIN pg_class idx ON idx.oid = i.indexrelid

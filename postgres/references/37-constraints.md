@@ -353,8 +353,9 @@ A row passes if, for every pair compared, at least one of `room_id = other.room_
 
 **btree_gist is only required when mixing operators.** A pure-range EXCLUDE — `EXCLUDE USING gist (period WITH &&)` — works without `btree_gist`. You need the extension only when mixing B-tree-only operators (`=`, `<`, `>`) with range/geometric operators in the same EXCLUDE clause. See [`24-gin-gist-indexes.md`](./24-gin-gist-indexes.md) for the GiST deep dive.
 
-> [!NOTE] PostgreSQL 18
-> Exclusion constraints on partitioned tables are supported in PG18 with partition-key equality. See <https://www.postgresql.org/docs/18/ddl-partitioning.html>.
+> [!NOTE] PostgreSQL 17
+>
+> Verbatim release-note quote: *"Allow exclusion constraints on partitioned tables (Paul A. Jungwirth). As long as exclusion constraints compare partition key columns for equality, other columns can use exclusion constraint-specific comparisons."* [^pg17-exclude-part] The partition-key-equality requirement is the same shape as the unique-constraint-must-include-partition-key rule.
 
 
 ### NOT VALID + VALIDATE CONSTRAINT
@@ -506,7 +507,7 @@ Cross-reference: [`43-locking.md`](./43-locking.md) has the full lock-conflict m
 | **PG14** | No end-user constraint feature changes. Only internal: PK/UNIQUE/FK added to system catalogs. | [^pg14-syscat] |
 | **PG15** | `UNIQUE NULLS NOT DISTINCT` for constraints and indexes. `ON DELETE SET (col_list)` for FKs. | [^pg15-nulls] [^pg15-fk-cols] |
 | **PG16** | `NULLS NOT DISTINCT` disallowed for primary keys. | [^pg16-pk-nulls] |
-| **PG17** | Identity columns on partitioned tables. |
+| **PG17** | Exclusion constraints on partitioned tables (with partition-key-equality requirement). | [^pg17-exclude-part] |
 | **PG18** | **Major rewrite of NOT NULL:** stored in `pg_constraint`, explicit names, `NO INHERIT`, table-constraint syntax, `NOT VALID` for NOT NULL. `NOT ENFORCED` for CHECK and FK. **Virtual generated columns** (default). **Temporal constraints:** `WITHOUT OVERLAPS` and `PERIOD`. `ALTER CONSTRAINT [NO] INHERIT` for NOT NULL. `NOT VALID` FK on partitioned tables. `DROP CONSTRAINT ONLY` on partitioned tables. PK/FK collation determinism rule. | [^pg18-notnull-store] [^pg18-notnull-notvalid] [^pg18-notenforced] [^pg18-virtual] [^pg18-temporal] [^pg18-notnull-inherit] [^pg18-notvalid-fk-part] [^pg18-drop-only] [^pg18-collations] |
 
 
@@ -855,7 +856,7 @@ Foreign keys without a covering index on the child side (delete-on-parent will b
 - [`23-btree-indexes.md`](./23-btree-indexes.md) — `NULLS NOT DISTINCT` mechanics at the index level
 - [`24-gin-gist-indexes.md`](./24-gin-gist-indexes.md) — EXCLUDE with GiST and `btree_gist`
 - [`26-index-maintenance.md`](./26-index-maintenance.md) — `CREATE INDEX CONCURRENTLY` + `ADD CONSTRAINT ... USING INDEX` pattern
-- [`35-partitioning.md`](./35-partitioning.md) — partition-key-must-be-in-PK rule; PG18 EXCLUDE on partitioned tables
+- [`35-partitioning.md`](./35-partitioning.md) — partition-key-must-be-in-PK rule; PG17 EXCLUDE on partitioned tables
 - [`36-inheritance.md`](./36-inheritance.md) — what propagates through inheritance (CHECK and NOT NULL) vs what doesn't
 - [`38-foreign-keys-deep.md`](./38-foreign-keys-deep.md) — referential actions, MATCH modes, FK-on-partitioned, FK-referencing-partitioned, circular FKs
 - [`39-triggers.md`](./39-triggers.md) — when triggers are appropriate alternatives to CHECK (cross-table rules)

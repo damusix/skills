@@ -274,7 +274,7 @@ Verbatim definition of `recovery_target_action`[^recovery-action]:
 | `promote` | Recovery completes; server promotes to primary; accepts writes; timeline incremented | Production rollback decisions |
 | `shutdown` | Recovery stops; server shuts down | Inspect data dir offline before deciding |
 
-Workflow: pause at the target, inspect through a read-only connection, then resume if correct. If the target is wrong, stop the server and restore the base backup again before replaying to a different target; replay cannot undo changes already applied. <https://www.postgresql.org/docs/16/continuous-archiving.html>
+Workflow: pause at the target, inspect through a read-only connection, then resume if correct. For a later target, shut down, set the later target, and restart. For an earlier target, stop the server and restore the base backup again before replaying; replay cannot undo changes already applied. <https://www.postgresql.org/docs/16/continuous-archiving.html>
 
 ### Incremental backups (PG17+)
 
@@ -431,6 +431,9 @@ Procedure:
     recovery_target_time = '2026-05-13 14:31:00+00'
     recovery_target_inclusive = on
     recovery_target_action = pause
+    # The restored config still points at the production archive.
+    # Keep the new timeline's WAL and .history files out of it.
+    archive_mode = off
     EOF
 
     # 5. Create recovery.signal to enter archive recovery
@@ -450,7 +453,7 @@ If correct, promote:
 
     psql -c "SELECT pg_wal_replay_resume();"
 
-If recovery state is wrong, stop the server, restore the base backup again, and replay WAL with the corrected `recovery_target_time`. Restarting the already-recovered data directory cannot undo replayed WAL.
+If the target is too early, shut down, set a later `recovery_target_time`, and restart. If it is too late, stop the server, restore the base backup again, and replay WAL with the earlier target. Restarting the already-recovered data directory cannot undo replayed WAL. Before this cluster archives to any repository, point `archive_command` at a separate archive.
 
 ### Recipe 3: Named restore point before risky DDL
 
@@ -697,7 +700,7 @@ Useful for "restore last full backup with no point-in-time twist" — server pro
 
 12. **`pg_basebackup` to local disk uses local disk.** No magic — if the backup destination is the same disk as `$PGDATA`, you've doubled disk usage and an `fsync` storm. Mount backup-destination disk separately.
 
-13. **`pg_basebackup` from a standby has extra prerequisites.** Enable `full_page_writes` on the primary; ensure required backup WAL remains available. A promotion during the backup causes it to fail. See <https://www.postgresql.org/docs/16/app-pgbasebackup.html>.
+13. **`pg_basebackup` from a standby has extra prerequisites.** The standby must accept replication connections: set `max_wal_senders` and `hot_standby`, and allow the replication connection in its `pg_hba.conf`. Enable `full_page_writes` on the primary; ensure required backup WAL remains available. A promotion during the backup causes it to fail. See <https://www.postgresql.org/docs/16/app-pgbasebackup.html>.
 
 14. **`max_slot_wal_keep_size` default is `-1` (unlimited).** Set to a finite size in production to prevent abandoned replication slots from filling `pg_wal/`. See [`75-replication-slots.md`](./75-replication-slots.md).
 

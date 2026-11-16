@@ -39,7 +39,7 @@ Reach for this file when:
 - Using `string_agg` or `array_agg` and the output order matters.
 - Reading an `EXPLAIN` plan that contains `HashAggregate` / `GroupAggregate` / `Partial Aggregate` / `Finalize Aggregate` / `MixedAggregate`.
 - Defining a `CREATE AGGREGATE` (state-machine transition function, optional final function, optional combine function for parallel).
-- Diagnosing why `count(DISTINCT col)` is slow (it disables parallel aggregation).
+- Diagnosing why `count(DISTINCT col)` is slow (it disables partial aggregation).
 
 Aggregates used as **window functions** (`sum(x) OVER (...)`) are covered in [`11-window-functions.md`](./11-window-functions.md). Most of the mechanics here (DISTINCT inside, ORDER BY inside, FILTER) **do** apply, with the additional restriction that `DISTINCT` and `ORDER BY` inside the aggregate are illegal when the aggregate is a window call (see Gotcha 9).
 
@@ -127,7 +127,7 @@ This is strictly preferable to `CASE WHEN ... END` for almost every conditional-
 - `sum(CASE WHEN refunded IS FALSE THEN amount END)` — works but loops through every row materializing a `CASE` expression.
 - `sum(amount) FILTER (WHERE refunded IS FALSE)` — the planner can short-circuit; signals intent clearly.
 
-`CASE` is needed when substituting a value rather than just excluding rows. Mind empty-input and NULL differences: `sum(CASE WHEN ok THEN amount ELSE 0 END)` and `coalesce(sum(amount) FILTER (WHERE ok), 0)` are not equivalent for every input.
+`CASE` is needed when substituting a value rather than just excluding rows. Mind empty-input and NULL differences: on a group with no rows, or one where every `CASE` result is NULL, `sum(CASE WHEN ok THEN amount ELSE 0 END)` returns NULL while `coalesce(sum(amount) FILTER (WHERE ok), 0)` returns 0.
 
 `FILTER` works with all aggregate classes (general, statistical, ordered-set, hypothetical-set). When an aggregate is used as a window function, `FILTER` is **legal for true aggregates** (`sum`, `count`, …) but **illegal for pure window functions** (`row_number`, `rank`, `lag`, …) — see [`11-window-functions.md`](./11-window-functions.md) Gotcha 8.
 
@@ -141,7 +141,7 @@ All entries below support `FILTER`, `DISTINCT`, and `ORDER BY` (the last is only
 | `count(expr)` | → `bigint` | Counts rows where `expr IS NOT NULL`. |
 | `sum(expr)` | numeric/int/interval/money | Returns NULL (not 0) on empty input. |
 | `avg(expr)` | numeric inputs | Returns NULL on empty input. |
-| `min(expr)` / `max(expr)` | supported sortable types | Skip NULLs. PG16 supports arrays of supported element types; PG18 adds composite-type support. See [PG16 aggregate functions](https://www.postgresql.org/docs/16/functions-aggregate.html). |
+| `min(expr)` / `max(expr)` | supported sortable types | Skip NULLs. PG14–17 accept numeric, string, date/time, enum, `inet`, `interval`, `money`, `oid`, `pg_lsn`, `tid`, `xid8`, and arrays of those types. PG18 adds `bytea`, arrays of any sortable type, and composite types.[^pg18-minmax-arrays] |
 | `any_value(expr)` | same as input | Returns an arbitrary non-NULL value. Useful when grouping by a key and you want one row's worth of context columns. > [!NOTE] PostgreSQL 16 — *"Add aggregate function `ANY_VALUE()` which returns any value from a set."*[^pg16-any-value] |
 | `bool_and(b)` / `every(b)` | boolean | `every` is the SQL-standard synonym for `bool_and`. PG does **not** ship `any`/`some` as aggregates (parser ambiguity with subquery `any`/`some`).[^agg-builtin] |
 | `bool_or(b)` | boolean | |
@@ -570,7 +570,7 @@ Useful for "what percentile is this candidate's expected salary in each departme
 
 ### Recipe 11 — Faster count-distinct via pre-deduplication
 
-`count(DISTINCT x)` disables parallel aggregation. For high-cardinality columns this can be a 5–10× speedup:
+`count(DISTINCT x)` disables partial aggregation, so the aggregate cannot be split across parallel workers. Pre-deduplicating with `SELECT DISTINCT` lets the planner use a parallel or hash plan for the dedup step:
 
     -- DISTINCT prevents partial aggregation, though scans may be parallel.
     SELECT day, count(DISTINCT user_id) AS dau
@@ -665,7 +665,7 @@ The `()` empty grouping set produces the grand total row. `ORDER BY GROUPING(sta
 
 4. **`string_agg` / `array_agg` without `ORDER BY` is nondeterministic.** Tests that pass today may fail tomorrow when the planner picks a hash aggregate instead of a sort-based plan, or when parallel workers reorder rows. Always spell the order out for order-sensitive aggregates.
 
-5. **`count(DISTINCT col)` disables parallel aggregation.** For high-cardinality columns this can be the difference between a 3-second and a 30-second query. See [Recipe 11](#recipe-11-faster-count-distinct-via-pre-deduplication).
+5. **`count(DISTINCT col)` disables partial aggregation.** Parallel scans may still run, but the aggregate itself runs in one process. See [Recipe 11](#recipe-11-faster-count-distinct-via-pre-deduplication).
 
 6. **`ORDER BY` placement is grammar-sensitive.** `string_agg(a, ',' ORDER BY a)` is correct; `string_agg(a ORDER BY a, ',')` parses the `ORDER BY a, ','` as a two-key sort and produces a different result (sometimes silently).
 
@@ -687,7 +687,7 @@ The `()` empty grouping set produces the grand total row. `ORDER BY GROUPING(sta
 
 15. **Multiple `DISTINCT` aggregates can be costly.** They prevent partial aggregation; distinct keys may require separate work. Compare plans before rewriting.
 
-16. **Sorting aggregate results.** Use a SELECT-list alias for readability, or inspect `EXPLAIN` when evaluating aggregate cost; do not assume repeating an identical aggregate in `ORDER BY` requires a second aggregate computation.
+16. **Sorting by an aggregate does not compute it twice.** `ORDER BY total DESC` (the SELECT-list alias) and `ORDER BY sum(amount) DESC` both reuse the select-list result, because identical aggregate calls in one query level share one transition state. Prefer the alias for readability.
 
 ## See Also
 
@@ -725,7 +725,7 @@ The `()` empty grouping set produces the grand total row. `ORDER BY GROUPING(sta
 
 [^pg17-groupby-reorder]: PostgreSQL 17.0 Release Notes, "Optimizer". *"Allow GROUP BY columns to be internally ordered to match ORDER BY (Andrei Lepikhov, Teodor Sigaev). This can be disabled using server variable enable_group_by_reordering."* https://www.postgresql.org/docs/release/17.0/
 
-[^pg18-minmax-arrays]: PostgreSQL 18 release notes, MIN/MAX changes: https://www.postgresql.org/docs/release/18.0/. PostgreSQL 16 already supports arrays of supported types: https://www.postgresql.org/docs/16/functions-aggregate.html.
+[^pg18-minmax-arrays]: PostgreSQL 18.0 Release Notes. *"Allow MIN()/MAX() aggregates on arrays and composite types (Aleksander Alekseev, Marat Buharov)."* https://www.postgresql.org/docs/release/18.0/. PostgreSQL 18 documentation, "Aggregate Functions", `max`: *"Available for any numeric, string, date/time, or enum type, as well as bytea, inet, interval, money, oid, pg_lsn, tid, xid8, and also arrays and composite types containing sortable data types."* https://www.postgresql.org/docs/18/functions-aggregate.html
 
 [^pg18-funcdep]: PostgreSQL 18.0 Release Notes. *"Ignore GROUP BY columns that are functionally dependent on other columns (Zhang Mingli, Jian He, David Rowley). If a GROUP BY clause includes all columns of a unique index, as well as other columns of the same table, those other columns are redundant and can be dropped from the grouping. This was already true for non-deferred primary keys."* https://www.postgresql.org/docs/release/18.0/
 

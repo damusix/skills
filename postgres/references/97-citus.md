@@ -153,7 +153,7 @@ Rules:
 - Picked from **dominant join key** + **dominant filter column** + **column with even cardinality** — bias toward join key wins ties.
 - **Changing distribution column:** use `alter_distributed_table(..., distribution_column := ...)` after assessing locks, foreign keys and colocation impact.
 - Citus hash distribution maps hashed values into shard ranges. Default `citus.shard_count = 32`.
-- `SELECT alter_distributed_table('events', shard_count => 64)` re-shards online (Citus 11+).
+- `SELECT alter_distributed_table('events', shard_count => 64)` re-shards (Citus 11+). It creates a new table, copies the rows, and drops the old one while holding `ExclusiveLock` on the table, so writes block for the whole copy; reads continue except briefly while the old table is dropped and the new one renamed into place. See `CreateTableConversion` and `ConvertTableInternal` in <https://github.com/citusdata/citus/blob/v13.0.0/src/backend/distributed/commands/alter_table.c>.
 
 ### Co-location
 
@@ -539,11 +539,12 @@ SELECT * FROM pg_dist_node;
 ### Recipe 11: Migrate from single-node to Citus (online cutover)
 
 1. Stand up a compatible Citus cluster and rehearse the chosen distribution and logical-replication setup.
-2. Replicate an initial consistent copy while avoiding unreplicated DDL and ensuring compatible target schema.
-3. Fence source writers, wait for a published cutover marker on the target, and synchronize every sequence's value and `is_called` state.
-4. Distribute tables using a tested procedure that respects logical replication and Citus version restrictions; validate data before routing applications.
+2. Recreate the schema on the coordinator. Every migrated table needs a primary key, and on the target it must include the distribution column.
+3. Run `SELECT create_distributed_table('events', 'tenant_id')` for each table before replication starts. Distributing first sends replicated rows to the workers; distributing afterwards means the whole data set has to fit on the coordinator first.
+4. Replicate an initial consistent copy, avoiding DDL during replication (logical replication does not carry it).
+5. Fence source writers, wait for a published cutover marker on the target, and synchronize every sequence's value and `is_called` state. Validate data before routing applications.
 
-Schema-only dumps define sequences but do not synchronize their current values. See <https://www.postgresql.org/docs/16/logical-replication-restrictions.html>.
+Schema-only dumps define sequences but do not synchronize their current values. See <https://www.postgresql.org/docs/16/logical-replication-restrictions.html> and <https://docs.citusdata.com/en/v13.0/develop/migration_data_big.html>.
 
 ### Recipe 12: Inspect 2PC state after failure
 
@@ -554,9 +555,12 @@ SELECT * FROM pg_dist_transaction;
 -- Pending 2PC across workers
 SELECT gid, prepared, owner, database FROM pg_prepared_xacts;
 
--- Do not resolve an individual participant based only on its local state.
--- Consult the coordinator's durable outcome and the Citus recovery procedure;
+-- Do not resolve an individual participant based only on its local state;
 -- inconsistent manual COMMIT/ROLLBACK PREPARED can split the transaction.
+-- On the coordinator, let Citus resolve them from its pg_dist_transaction
+-- records: it commits prepared transactions that have a record and aborts
+-- the rest. The maintenance daemon also runs this periodically.
+SELECT recover_prepared_transactions();
 ```
 
 Cross-ref [41](./41-transactions.md) for PREPARE TRANSACTION mechanics.

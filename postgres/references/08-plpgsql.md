@@ -651,7 +651,7 @@ No `EXCEPTION` block — `ON CONFLICT` does the work and avoids subtransaction o
     END;
     $$;
 
-A procedure (not function) is needed for the `COMMIT` calls — see [07-procedures.md](./07-procedures.md). An empty `SKIP LOCKED` batch may mean remaining rows are locked, not that the job is complete; retry later or perform a final verification.
+A procedure (not function) is needed for the `COMMIT` calls. See [07-procedures.md](./07-procedures.md). An empty `SKIP LOCKED` batch may mean remaining rows are locked, not that the job is complete; retry later or perform a final verification.
 
 ### 3. STRICT lookup with friendly errors
 
@@ -790,8 +790,11 @@ a holdable cursor on the first `COMMIT` and materialized — see
 
 ## Gotchas / Anti-patterns
 
-1. **`EXCEPTION` block inside a tight loop.** Each iteration writes a subtransaction
-   record into the `subtrans` SLRU and consumes a virtual XID. Move the block outside
+1. **`EXCEPTION` block inside a tight loop.** A block's subtransaction gets a real
+   subxid only when it writes. Subcommitted subxids stay in the 64-entry per-backend
+   cache until the top-level transaction ends (only aborts remove them), so a loop of
+   writing `EXCEPTION` blocks overflows it and visibility checks then read `pg_subtrans`.
+   See [41-transactions.md](./41-transactions.md) gotcha #5. Move the block outside
    the loop, or refactor to `ON CONFLICT` / preventive WHERE clauses. See
    [27-mvcc-internals.md](./27-mvcc-internals.md) and [29-transaction-id-wraparound.md](./29-transaction-id-wraparound.md).[^control]
 
@@ -822,9 +825,9 @@ a holdable cursor on the first `COMMIT` and materialized — see
 
 9. **Using a `RECORD` variable across rows of different shapes.** Assignment can change its shape, but cached statements referencing its fields expect consistent field types. Use separate record variables where layouts or field types differ.[^impl]
 
-10. **Variable-name collisions with column names.** Default is to error. Prefix locals with `v_` or qualify both sides — `users.id` vs `myfunc.id` vs `outerblock.id`.[^impl]
+10. **Variable-name collisions with column names.** Default is to error. Prefix locals with `v_` or qualify both sides: `users.id` vs `myfunc.id` vs `outerblock.id`.[^impl]
 
-11. **`PERFORM` confused with `SELECT`.** Inside PL/pgSQL, use `PERFORM expr;` to call a function for side effects when discarding its result.[^stmt]
+11. **`PERFORM` confused with `SELECT`.** Inside PL/pgSQL, use `PERFORM expr;` to call a function for side effects when discarding its result. A bare `SELECT` with no `INTO` fails at runtime with *"query has no destination for result data"*.[^stmt]
 
 12. **Mutable defaults in `DECLARE`.** A default expression is re-evaluated at every block entry. `now()` remains the transaction start time; use `clock_timestamp()` for the actual block-entry time.[^decl]
 

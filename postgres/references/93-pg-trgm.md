@@ -224,7 +224,7 @@ Rule of thumb: **GIN unless you need KNN or write rate is so high GIN can't keep
 
 ### LIKE / ILIKE / Regex Acceleration
 
-Both opclasses accelerate `LIKE`, `ILIKE`, `~`, `~*` when the pattern yields useful trigrams. A pattern with no extractable trigrams degenerates to a full-index scan; the planner may instead choose a sequential scan.[pgtrgm-16]
+Both opclasses accelerate `LIKE`, `ILIKE`, `~`, `~*` when the pattern yields useful trigrams. A pattern with no extractable trigrams degenerates to a full-index scan; the planner may instead choose a sequential scan ([pgtrgm.html][pgtrgm-16]).
 
     -- All four accelerate via gin_trgm_ops / gist_trgm_ops:
     SELECT * FROM users WHERE name LIKE '%alice%';
@@ -235,9 +235,13 @@ Both opclasses accelerate `LIKE`, `ILIKE`, `~`, `~*` when the pattern yields use
     -- Anchored prefix LIKE 'foo%' — trigram works but B-tree text_pattern_ops faster:
     SELECT * FROM users WHERE name LIKE 'al%';
 
-    -- Short unanchored patterns may yield no extractable trigrams:
-    SELECT * FROM users WHERE name LIKE '%a%';
-    -- Expect poor selectivity; inspect the plan.
+    -- No extractable trigram: a word-character run with a wildcard (% or _) on
+    -- both sides is not padded, so it needs 3 consecutive word characters.
+    -- '%ab%' extracts nothing; '%abc%' extracts 'abc'. A run that touches the
+    -- pattern start or end, or a non-word character, is padded with spaces,
+    -- so 'ab%' still extracts '  a' and ' ab'.
+    SELECT * FROM users WHERE name LIKE '%ab%';
+    -- Full-index scan or sequential scan; inspect the plan.
 
 `EXPLAIN ANALYZE` to verify trigram index used:
 
@@ -413,7 +417,7 @@ Audit query to find all trigram indexes:
 ### 8. Post-PG18-upgrade REINDEX after non-libc default
 
     -- Generate commands in psql; execute each outside a transaction block.
-    SELECT format('REINDEX INDEX CONCURRENTLY %I.%I;', n.nspname, c.relname)
+    SELECT DISTINCT format('REINDEX INDEX CONCURRENTLY %I.%I;', n.nspname, c.relname)
     FROM pg_index i
     JOIN pg_class c ON c.oid = i.indexrelid
     JOIN pg_namespace n ON n.oid = c.relnamespace

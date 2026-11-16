@@ -52,7 +52,7 @@ Five rules drive every pgbench run.
 
 **Rule 3 — `-c N -j M -T S`: N clients, M threads, S seconds.** Threads ≤ clients (one thread serves multiple clients). Threads beyond `nproc` waste CPU on context-switch. Time-based `-T` preferred over transaction-count `-t` for steady-state.
 
-**Rule 4 — custom `.sql` scripts use `\set` expressions such as `random(1, 100)`.** Each script execution is one transaction in pgbench's report. Multiple `-f` scripts can be weighted.
+**Rule 4 — custom `.sql` scripts use `\set` expressions such as `random(1, 100)`.** Each script execution is one transaction in pgbench's report. Variables interpolate as `:varname`. Multiple `-f` scripts run weighted: `-f script1.sql@70 -f script2.sql@30` picks script1 for about 70% of transactions and script2 for about 30%.
 
 **Rule 5 — `--rate N` targets aggregate TPS, and `--latency-limit MS` counts late transactions.** With rate limiting, transactions already too late to meet the limit are skipped before being sent.
 

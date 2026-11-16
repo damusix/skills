@@ -247,7 +247,7 @@ Use `IS TRUE` / `IS FALSE` / `IS NOT TRUE` / `IS NOT FALSE` / `IS NULL` to handl
     SET bytea_output = 'hex';              -- default since PG9
     SET bytea_output = 'escape';           -- legacy
 
-- **Storage**: 1- or 4-byte header + raw bytes. Up to ~1 GB per value; values over `toast_tuple_target` (default ~2 KB) compress and TOAST out-of-line.[^toast]
+- **Storage**: 1- or 4-byte header + raw bytes. Up to ~1 GB per value; when a row exceeds the compile-time `TOAST_TUPLE_THRESHOLD` (about 2 KB), wide values compress and move out-of-line until the row fits `toast_tuple_target`. That setting sets the target size only, not the trigger point; see [`31-toast.md`](./31-toast.md).[^toast]
 - **Default I/O format**: hex (`\x` prefix + 2 hex digits per byte). *"The hex format is compatible with a wide range of external applications and protocols, and it tends to be faster to convert than the escape format, so its use is preferred."*[^bytea]
 
 **Escape format requires escaping** for: NUL byte (`\000`), single quote (`''` or `\047`), backslash (`\\` or `\134`), and any non-printable octets (0–31, 127–255 as `\xxx` octal).[^bytea]
@@ -400,8 +400,7 @@ Adding a length cap to a column is a `ALTER TABLE ... ALTER COLUMN ... TYPE varc
     COMMIT;
 
     -- An unused sequence on an empty table retains is_called=false, so 1 is first.
-    -- setval is not transactional. If the transaction fails, inspect sequence state
-    -- before retrying. Update callers that referenced t_id_seq directly.
+    -- Update callers that referenced t_id_seq directly.
 
 Why `BY DEFAULT` instead of `ALWAYS`: with `ALWAYS`, manual `INSERT (id, name) VALUES (42, 'x')` will fail unless you say `OVERRIDING SYSTEM VALUE`. `BY DEFAULT` lets you continue inserting explicit IDs for backfill/data-load.
 
@@ -467,10 +466,25 @@ For very large tables (10M+ rows) where you only ever check exact match, a btree
     -- ----------------
     --  192.0.2.0/24
 
-For a text column you're migrating to `cidr`, find values that won't cast cleanly:
+For a text column you're migrating to `cidr`, find values that won't cast cleanly (PG16+, `pg_input_is_valid`):
 
     SELECT s FROM legacy_blocks
     WHERE s IS NOT NULL AND NOT pg_input_is_valid(s, 'cidr');
+
+On PG14–15, wrap the cast in an exception block:
+
+    CREATE FUNCTION is_valid_cidr(s text) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE AS $$
+    BEGIN
+        PERFORM s::cidr;
+        RETURN true;
+    EXCEPTION WHEN data_exception THEN
+        RETURN false;
+    END;
+    $$;
+
+    SELECT s FROM legacy_blocks
+    WHERE s IS NOT NULL AND NOT is_valid_cidr(s);
 
 
 ### Recipe 6: Bitwise feature flags in `bigint` (better than `bit(n)`)
@@ -627,7 +641,7 @@ Output is the audit list. `char(n)` pads short values and does not enforce an ex
 
 5. **`real` and `double precision` accumulate error.** Summing one billion `real` values is *not* accurate to the last decimal place. For accounting-grade arithmetic, the answer is always `numeric`, even if you have to round at display time.[^numeric]
 
-6. **Integer-to-boolean casts are supported.** `1::boolean` is true and `0::boolean` is false; text forms such as `'true'`, `'false'`, `'yes'`, and `'no'` are also accepted.[^bool]
+6. **The integer-to-boolean cast is explicit-only.** `1::boolean` is true and `0::boolean` is false, but assigning an integer to a `boolean` column (`INSERT INTO t (flag) VALUES (1)`) fails with `column "flag" is of type boolean but expression is of type integer`. Write the cast, or use a text literal: `'1'`, `'0'`, `'true'`, `'false'`, `'yes'`, `'no'`, `'on'`, `'off'`, `'t'`, `'f'`, `'y'`, and `'n'` are all accepted.[^bool]
 
 7. **`bytea_output` flips display but not storage.** Setting `SET bytea_output = 'escape'` makes existing `\x...` outputs render with octal escapes. Drivers see whichever format they ask for. *Storage is identical.* If your client library is comparing returned bytea strings instead of using its bytea-bind API, you have a bug waiting.[^bytea]
 

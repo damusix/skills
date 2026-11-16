@@ -51,7 +51,7 @@ Five rules.
 
 **Rule 2 — Both clusters must be shut down cleanly before invocation.** Not a hot upgrade. Schedule downtime window. `--check` mode is the only flag that runs against a live old cluster.
 
-**Rule 3 — PG18 preserves some, not all, planner statistics.** For earlier targets run staged ANALYZE; for PG18 follow both `vacuumdb` commands emitted by `pg_upgrade`. See <https://www.postgresql.org/docs/18/pgupgrade.html>.
+**Rule 3 — PG18 preserves some, not all, planner statistics.** For earlier targets run staged ANALYZE; for PG18 run `vacuumdb --all --analyze-in-stages --missing-stats-only`, then `vacuumdb --all --analyze-only`, as `pg_upgrade` prints. See <https://www.postgresql.org/docs/18/pgupgrade.html>.
 
 **Rule 4 — Logical slots transfer only when the source is PG17+ and all documented prerequisites hold.** Earlier sources require coordinated rebootstrap or another consumer-specific migration that avoids gaps and duplicates. See <https://www.postgresql.org/docs/17/pgupgrade.html>.
 
@@ -294,7 +294,7 @@ Decision table:
 | Source version | Target version | Per-column stats preserved? | Extended stats preserved? | Post-upgrade ANALYZE required? |
 |---|---|---|---|---|
 | Any | ≤ PG17 | ❌ No | ❌ No | Yes — full `vacuumdb --all --analyze-in-stages` |
-| Any | PG18+ (default) | Supported column stats | No | Run both `vacuumdb` commands emitted by `pg_upgrade` |
+| Any | PG18+ (default) | Supported column stats | No | Yes — `vacuumdb --all --analyze-in-stages --missing-stats-only`, then `vacuumdb --all --analyze-only` |
 | Any | PG18+ with `--no-statistics` | ❌ No | ❌ No | Same as pre-PG18 target |
 
 Cross-reference [`55-statistics-planner.md`](./55-statistics-planner.md) for what's in `pg_statistic` vs `pg_statistic_ext_data`.
@@ -485,32 +485,28 @@ psql -c "SELECT slot_name, slot_type, plugin, database, active, restart_lsn, con
 
 Cross-reference [`75-replication-slots.md`](./75-replication-slots.md) for slot lifecycle.
 
-### Recipe 5 — Pre-PG17 source: manual slot recreation post-upgrade
+### Recipe 5 — Pre-PG17 source: rebuild logical subscribers post-upgrade
 
-Source = PG16 or earlier → slots not migrated. Procedure:
+Source = PG16 or earlier → slots not migrated. PostgreSQL documents logical-replication cluster upgrades only when every member is 17.0 or later, so rebuild each subscriber after the upgrade instead of recreating its old slot. See <https://www.postgresql.org/docs/18/logical-replication-upgrade.html>.
 
 ```bash
-# 1. On source PG16, capture slot state.
+# 1. On source PG16, inventory the slots each consumer depends on.
+#    Tablesync slots (pg_<oid>_sync_<relid>_<sysid>) are transient and dropped when table sync finishes; leave them out.
 psql -At -c "SELECT slot_name, plugin, database, two_phase
-             FROM pg_replication_slots WHERE slot_type='logical';" > /tmp/slots.txt
+             FROM pg_replication_slots
+             WHERE slot_type = 'logical' AND slot_name NOT LIKE 'pg\_%\_sync\_%';" > /tmp/slots.txt
 
-# 2. Disable subscribers after draining their changes; do not drop them blindly.
+# 2. Disable each subscriber; do not drop it until its rebuild is planned.
 # On EACH subscriber cluster:
 psql -c "ALTER SUBSCRIPTION my_sub DISABLE;"
 
 # 3. Stop source PG16, run pg_upgrade as in Recipe 1.
 
-# 4. After new PG18 cluster starts, recreate slots manually.
-# IMPORTANT: confirmed_flush_lsn cannot be restored; subscribers must reseed via copy_data or
-# an external mechanism (CDC pipeline snapshot, etc.).
-while IFS='|' read -r slot_name plugin database two_phase; do
-    psql -d "$database" -c "SELECT pg_create_logical_replication_slot('$slot_name', '$plugin');"
-done < /tmp/slots.txt
-
-# 5. Rebootstrap each subscriber from a coordinated snapshot using the
-# subscriber/consumer-specific procedure. REFRESH PUBLICATION does not
-# recopy existing tables, and recreating a slot cannot recover old positions.
+# 4. Rebootstrap each subscriber from a coordinated snapshot using the
+#    subscriber/consumer-specific procedure. Do not pre-create its slot.
 ```
+
+A rebuilt subscription with the default `create_slot = true` fails with "replication slot already exists" against a pre-created slot of the same name, and an unused pre-created slot retains WAL. If the slot must exist first, create the subscription with `create_slot = false` and a matching `slot_name`. `REFRESH PUBLICATION` does not recopy existing tables, and recreating a slot cannot recover old positions.
 
 Plan this migration before stopping the source. See <https://www.postgresql.org/docs/17/pgupgrade.html> and <https://www.postgresql.org/docs/16/sql-altersubscription.html>.
 
@@ -677,7 +673,23 @@ PG18+ enables `--data-checksums` by default at `initdb` — cross-reference [`88
 
 ### Recipe 13 — Rollback after `--link` mode failure
 
-If new cluster fails to start after `--link`, the old cluster's data dir is half-modified (`pg_control` may have been edited). Rollback procedure:
+Which rollback applies depends on whether the new cluster ever started:
+
+| State | Rollback |
+|---|---|
+| `pg_upgrade` aborted before linking started | Old cluster unmodified; restart it |
+| Linking started, new cluster never started | Rename `$PGDATA/global/pg_control.old` back to `pg_control` in the old data directory, then restart the old cluster |
+| New cluster started, even once | Shared files were written; the old cluster is unsafe. Restore from backup or snapshot (steps below) |
+
+See <https://www.postgresql.org/docs/18/pgupgrade.html> step "Reverting to old cluster".
+
+```bash
+# Case: new cluster never started.
+mv /var/lib/pgsql/16/data/global/pg_control.old /var/lib/pgsql/16/data/global/pg_control
+systemctl start postgresql-16
+```
+
+When the new cluster has started:
 
 ```bash
 # 1. DO NOT start the old cluster yet.

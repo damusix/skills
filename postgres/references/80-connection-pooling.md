@@ -47,7 +47,7 @@ Five rules:
 
 2. **Pool sizing formula = active connections, not max connections.** Community wiki rule: `active connections ≈ (CPU cores × 2) + effective_spindle_count`[^wiki-conn]. Verbatim: *"for optimal throughput the number of active connections should be somewhere near ((core_count * 2) + effective_spindle_count)"*. NVMe / fully-cached datasets → spindle term = 0. Pool size of 16-50 typically saturates 8-16-core machine. Bigger pool = lock contention + context switching + memory pressure, not more throughput.
 
-3. **Three pool modes form a feature/throughput dial.** Session mode leases a backend for the client connection; transaction mode leases one per transaction; statement mode disallows multi-statement transactions. PgBouncer defaults to session mode.
+3. **Three pool modes form a feature/throughput dial.** Session mode leases a backend for the client connection; transaction mode leases one per transaction; statement mode disallows multi-statement transactions. PgBouncer defaults to session mode. Transaction mode gives up session state: `SET`, `LISTEN`, `WITH HOLD` cursors, session-level advisory locks, temporary tables kept across transactions, and SQL-level `PREPARE`.
 
 4. **Protocol-level named prepared statements work in transaction mode with PgBouncer 1.21+ when `max_prepared_statements` is nonzero.** PostgreSQL 17 libpq's close functions are not a prerequisite. SQL `PREPARE` remains session-bound.
 

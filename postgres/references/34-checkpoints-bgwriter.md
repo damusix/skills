@@ -66,7 +66,7 @@ checkpointer and to read the post-PG17 monitoring views correctly.
 
 4. **The bgwriter and checkpointer have different goals.** The bgwriter writes dirty buffers ahead of clock-sweep eviction. Those writes can also reduce the work remaining for a checkpoint, although pages dirtied again still need writing.
 
-5. **Frequent checkpoints multiply WAL volume.** Every page modified for the first time after a checkpoint becomes a full-page image (FPI) in the WAL by default (`full_page_writes = on`). Doubling `checkpoint_timeout` does *not* double WAL volume — it *cuts* it because FPI cost is amortized over a longer window. This is the highest-leverage tuning insight in the file. Cross-reference [`33-wal.md`](./33-wal.md) Rule 5.
+5. **Frequent checkpoints multiply WAL volume.** Every page modified for the first time after a checkpoint becomes a full-page image (FPI) in the WAL by default (`full_page_writes = on`). Longer checkpoint intervals can reduce WAL volume when the same pages are modified across intervals, because each page pays for one FPI per checkpoint cycle instead of several. The reduction is workload-dependent, not proportional, and comes at the cost of longer crash recovery. Cross-reference [`33-wal.md`](./33-wal.md) Rule 5.
 
 ## Decision Matrix
 

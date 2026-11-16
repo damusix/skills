@@ -124,7 +124,7 @@ Two grammars:
     ALTER TABLESPACE name SET ( tablespace_option = value [, ... ] )
     ALTER TABLESPACE name RESET ( tablespace_option [, ... ] )
 
-`ALTER TABLESPACE` has no `LOCATION` clause. For a supported SQL-level move, create a new tablespace, move objects and database defaults into it, verify all databases and dependencies, then drop the empty old tablespace. The path is represented by the on-disk symlink, not `pg_tablespace.spcoptions`.
+`ALTER TABLESPACE` has no `LOCATION` clause. The SQL-level move is: create a new tablespace, move objects and database defaults into it, verify all databases and dependencies, then drop the empty old tablespace. The docs also allow redefining the symlinks under `$PGDATA/pg_tblspc` by hand with the server stopped, but call it *"not recommended"*.[^manage-ag-symlinks] The path is represented by the on-disk symlink, not `pg_tablespace.spcoptions`.
 
 ### DROP TABLESPACE
 
@@ -401,7 +401,7 @@ If a tablespace has no rows in `spcoptions` (NULL), it inherits the cluster-wide
     -- Connect to a different database first. No session may be connected to app.
     ALTER DATABASE app SET TABLESPACE fast_nvme;
 
-Only objects in the old database default tablespace move; objects in other tablespaces remain there. The destination must be empty for this database, and the command cannot run in a transaction block. See [ALTER DATABASE](https://www.postgresql.org/docs/16/sql-alterdatabase.html).
+Only objects in the old database default tablespace move; objects in other tablespaces remain there. The destination must be empty for this database, and the command cannot run in a transaction block. See [ALTER DATABASE](https://www.postgresql.org/docs/16/sql-alterdatabase.html). On PG18+, `file_copy_method = clone` lets the kernel share blocks on copy-on-write file systems instead of rewriting every file, which can make the move much faster.[^pg18-file_copy_method]
 
 ### Recipe 10: Detect tablespace location inside `$PGDATA`
 
@@ -487,7 +487,7 @@ This query checks relations only in the current database, plus cluster-wide data
 
 9. **`CREATE TABLESPACE` and `DROP TABLESPACE` cannot run in transaction blocks.** Verbatim from the docs.[^create-tablespace] This means migration frameworks must be configured to disable wrapping these in a transaction (Rails' `disable_ddl_transaction!`, Alembic's `transactional_ddl: False`).
 
-10. **You cannot change a tablespace's location with `ALTER TABLESPACE`.** There is no `ALTER TABLESPACE name LOCATION` clause. To relocate, you must evacuate (ALTER ... SET TABLESPACE), drop, and recreate — or stop the cluster and move on disk.
+10. **You cannot change a tablespace's location with `ALTER TABLESPACE`.** There is no `ALTER TABLESPACE name LOCATION` clause. To relocate, evacuate (ALTER ... SET TABLESPACE), drop, and recreate. Stopping the cluster and redefining the `pg_tblspc` symlink by hand is possible but not recommended.[^manage-ag-symlinks]
 
 11. **Plan tablespace restore paths explicitly.** Plain-format `pg_basebackup` defaults to the original absolute paths; use `--tablespace-mapping` when necessary and verify the restore with your chosen backup tool.
 
@@ -582,6 +582,8 @@ If your deployment target is uncertain or may move between self-hosted and manag
 ## Sources
 
 [^manage-ag]: PostgreSQL 16 documentation, "Tablespaces". https://www.postgresql.org/docs/16/manage-ag-tablespaces.html — verbatim: *"Tablespaces allow database administrators to define locations in the file system where the files representing database objects can be stored."* Also: *"`pg_global`, used for shared system catalogs. `pg_default`, the default tablespace of the `template1` and `template0` databases (and therefore the default for other databases as well, unless overridden)."*
+
+[^manage-ag-symlinks]: PostgreSQL 16 documentation, "Tablespaces". https://www.postgresql.org/docs/16/manage-ag-tablespaces.html — verbatim: *"Although not recommended, it is possible to adjust the tablespace layout by hand by redefining these links. Under no circumstances perform this operation while the server is running."*
 
 [^manage-ag-backup]: PostgreSQL 16 documentation, "Tablespaces". https://www.postgresql.org/docs/16/manage-ag-tablespaces.html — verbatim: *"Even though located outside the main PostgreSQL data directory, tablespaces are an integral part of the database cluster and cannot be treated as an autonomous collection of data files. They are dependent on metadata contained in the main data directory, and therefore cannot be attached to a different database cluster or backed up individually."*
 

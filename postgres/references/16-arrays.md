@@ -171,7 +171,6 @@ Append, prepend, concatenate:
     UPDATE t SET tags = array_append(tags, 'new')  WHERE id = 1;
     UPDATE t SET tags = array_prepend('first', tags) WHERE id = 1;
     UPDATE t SET tags = tags || ARRAY['x','y'] WHERE id = 1;  -- concat
-    UPDATE t SET tags = array_append(tags, 'new');             -- function form
 
 Remove by value (all occurrences):
 
@@ -200,7 +199,7 @@ There is **no `array_insert(at_position, value)`** in core PostgreSQL. To insert
 
 | Operator | Signature | Meaning | Indexable by |
 |---|---|---|---|
-| `=` | `anyarray = anyarray` | Element-wise equality including dimensions and lower bounds | B-tree on whole-array, GIN `array_ops` |
+| `=` | `anyarray = anyarray` | Element-wise equality including dimensions and lower bounds; two NULL elements compare equal, so `ARRAY[1,NULL] = ARRAY[1,NULL]` is true | B-tree on whole-array, GIN `array_ops` |
 | `<>` `<` `<=` `>` `>=` | `anyarray <op> anyarray` | Element-wise comparison, sort by first difference | B-tree |
 | `@>` | `anyarray @> anyarray` | Left contains every element of right (duplicates ignored) | GIN `array_ops` |
 | `<@` | `anyarray <@ anyarray` | Left contained by right | GIN `array_ops` |
@@ -334,7 +333,7 @@ The B-tree index access method **also supports arrays**, but only for whole-arra
 - `gin_fuzzy_search_limit` (default 0 — unlimited): caps the number of rows returned from a single GIN scan. Useful for protecting against runaway predicate-popular queries.
 
 **Functional GIN on a derived array** can index an immutable expression matching the query:
-    -- Or for queries on a derived array
+
     CREATE INDEX ON events USING gin ((string_to_array(LOWER(tags_csv), ',')));
 
 > [!NOTE] PostgreSQL 18

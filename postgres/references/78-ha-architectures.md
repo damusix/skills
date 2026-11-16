@@ -258,10 +258,12 @@ RTO = recovery time objective (downtime budget). RPO = recovery point objective 
 | Async streaming + manual failover | 15-60 min | seconds-to-minutes | Human-in-the-loop |
 | Async streaming + repmgr | 30-60s | 1-30s | Lost in-flight async-replicated tx |
 | Async streaming + Patroni | 10-30s | 1-10s | TTL-driven failover |
-| Sync (`FIRST 1`) + Patroni | workload-dependent | depends on strict mode and failover | Patroni may disable synchronous replication without strict mode |
-| Quorum sync (`ANY 1 of N`) + Patroni | workload-dependent | depends on surviving eligible standby and promotion policy | Manual failover and per-transaction overrides can lose data |
+| Sync (`FIRST 1`) + Patroni | 10-30s | depends on strict mode and failover | Patroni may disable synchronous replication without strict mode |
+| Quorum sync (`ANY 1 of N`) + Patroni | 10-30s | depends on surviving eligible standby and promotion policy | Manual failover and per-transaction overrides can lose data |
 | K8s operator (CNPG) | 20-60s | depends on sync mode | Pod restart adds latency |
 | Cross-region async (DR, not HA) | 5-30 min | 1-5 min | Not for automatic failover; see [`90-disaster-recovery.md`](./90-disaster-recovery.md) |
+
+The Patroni RTO rows assume the default `ttl = 30` and `loop_wait = 10`: a failed leader's key expires within 30s, and replicas run the HA loop every 10s, so detection and promotion usually complete in 10-30s. Lower values shorten RTO and raise the risk of false failovers. [Patroni dynamic configuration](https://patroni.readthedocs.io/en/latest/dynamic_configuration.html)
 
 > [!NOTE] RPO = 0 is expensive.
 >
@@ -696,8 +698,6 @@ Full DR runbook lives in [`90-disaster-recovery.md`](./90-disaster-recovery.md).
 [^zalando-pg-op]: Zalando postgres-operator. https://github.com/zalando/postgres-operator — Bundles Patroni internally. Version and PG support checked 2026-11-14 in [`92-kubernetes-operators.md`](./92-kubernetes-operators.md).
 
 [^crunchy-pgo]: Crunchy Data PGO (Postgres Operator). https://github.com/CrunchyData/postgres-operator — Version checked 2026-11-14 in [`92-kubernetes-operators.md`](./92-kubernetes-operators.md). v5 documentation at https://access.crunchydata.com/documentation/postgres-operator/v5/.
-
-[^sync-standby]: PostgreSQL 16 documentation, `synchronous_commit` GUC at https://www.postgresql.org/docs/16/runtime-config-wal.html — Verbatim: "When set to `remote_apply`, commits will wait until replies from the current synchronous standby(s) indicate they have received the commit record of the transaction and applied it, so that it has become visible to queries on the standby(s)." If no sync standby is available, writes block.
 
 [^pg-rewind]: PostgreSQL 16 documentation, `pg_rewind` at https://www.postgresql.org/docs/16/app-pgrewind.html — Verbatim: "The target server must allow `wal_log_hints` to be enabled, or have `data_checksums` enabled." This is a prerequisite that cannot be enabled retroactively for past WAL.
 

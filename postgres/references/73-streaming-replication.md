@@ -189,7 +189,7 @@ Recommendation: `on` for reporting/analytics standbys (queries are long-running,
 | `on` (default) | Primary WAL and required synchronous standby WAL flushed to durable storage | Higher | Protects acknowledged commits if a sufficiently up-to-date synchronous standby survives and is promoted. |
 | `remote_apply` | WAL flushed and replayed on required synchronous standbys | Highest | New standby snapshots can see the commit; existing snapshots may not. |
  
-The remote guarantees apply only when `synchronous_standby_names` selects synchronous standbys. Otherwise `on`, `remote_write`, and `remote_apply` wait only for local flush. Correct failover selection and fencing remain necessary.[^hot-standby]
+The remote guarantees apply only when `synchronous_standby_names` selects synchronous standbys. Otherwise `on`, `remote_write`, and `remote_apply` wait only for local flush. Correct failover selection and fencing remain necessary.[^sync-commit]
 
 Per-transaction override:
 
@@ -521,7 +521,7 @@ Cross-reference [`89-pg-rewind.md`](./89-pg-rewind.md) for re-attaching old prim
 
 ### Recipe 6 — `recovery_min_apply_delay` for human-error rollback
 
-Delayed replay provides time to inspect or recover before an unwanted commit is applied. Promotion ends the delay and replays immediately available WAL, so promoting is not a way to discard an unwanted transaction.
+Delayed replay provides time to stop recovery before an unwanted commit is applied. Promoting without a recovery target ends the delay and replays all WAL already received, so a bare promotion applies the unwanted transaction.
 
 Standby `postgresql.conf`:
 
@@ -529,7 +529,21 @@ Standby `postgresql.conf`:
 recovery_min_apply_delay = 1h
 ```
 
-Standby receives WAL while delaying commit replay. Before the unwanted commit is applied, pause replay and inspect or copy data; use a separate point-in-time recovery from backup when a precise cutoff is needed.
+Standby receives WAL while delaying commit replay. If a bad commit lands at 10:00, the standby has until 11:00 to stop before it:
+
+1. Pause replay at once: `SELECT pg_wal_replay_pause();`.
+2. Set a target just before the bad transaction and restart the standby, because recovery target settings apply only at server start:
+
+    ```ini
+    recovery_target_time = '2026-03-01 09:59:00+00'   # or recovery_target_xid / recovery_target_lsn
+    recovery_target_inclusive = off
+    recovery_target_action = 'pause'
+    ```
+
+3. Replay stops at the target and pauses. Inspect the data with read-only queries. If the point is wrong, shut down, choose a later target, and restart.
+4. Either copy the rows back to the primary, or end recovery with `SELECT pg_wal_replay_resume();` to make this standby a new primary on a new timeline. Fence the old primary first.
+
+With `hot_standby = off`, `pause` acts like `shutdown`. A separate point-in-time recovery from backup reaches the same cutoff when the delay window has passed.
 
 Trade-offs:
 - Standby data is always 1 hour stale.
@@ -571,6 +585,9 @@ SELECT pg_create_logical_replication_slot('app_slot', 'pgoutput', false, false, 
 Standby `postgresql.conf` (PG17+):
 ```ini
 sync_replication_slots = on
+primary_slot_name = 'standby1'          # physical slot on the primary
+hot_standby_feedback = on               # required for slot sync
+primary_conninfo = 'host=primary user=replicator dbname=postgres'   # dbname required for slot sync
 ```
 
 Primary `postgresql.conf` (PG17+):
@@ -715,7 +732,7 @@ SELECT pg_wal_replay_resume();           -- continue
 
 13. **LISTEN/NOTIFY does not propagate to standby.** A `NOTIFY` issued on primary does not fire LISTEN handlers on standby connections. Standby applications must connect to primary for notifications.
 
-14. **Temporary tables cannot be created or written on a hot standby.** This restriction applies to PG16; use the primary for temporary-table workloads.[^hot-standby]
+14. **Temporary tables cannot be created or written on a hot standby.** This restriction applies to every supported version; use the primary for temporary-table workloads.[^hot-standby]
 
 15. **Standby does NOT serve transactions started on primary.** Cannot start tx on primary, route SELECT to standby. `synchronous_commit = remote_apply` only ensures the COMMIT is visible on standby — does not transfer the transaction itself.
 
@@ -768,6 +785,8 @@ SELECT pg_wal_replay_resume();           -- continue
 [^recovery-config]: PostgreSQL 16 docs Appendix O.1 (Obsolete or Renamed Features). https://www.postgresql.org/docs/16/recovery-config.html
 
 [^hot-standby]: PostgreSQL 16 docs §27.4 Hot Standby. https://www.postgresql.org/docs/16/hot-standby.html
+
+[^sync-commit]: PostgreSQL 16 docs §20.5 Write Ahead Log, `synchronous_commit`. https://www.postgresql.org/docs/16/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT
 
 [^pg13-max-slot-wal-keep]: PG13 release notes. `max_slot_wal_keep_size` GUC introduced. https://www.postgresql.org/docs/release/13.0/
 

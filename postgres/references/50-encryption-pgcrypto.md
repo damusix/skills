@@ -473,16 +473,19 @@ Cost factor 12 (bcrypt) is a defensible 2025 default on commodity hardware (~250
 -- When you change policy from cost=10 to cost=12, rehash on next successful login:
 CREATE OR REPLACE FUNCTION login_and_maybe_rehash(p_email citext, p_password text, p_target_cost int DEFAULT 12)
 RETURNS bigint
-LANGUAGE plpgsql VOLATILE SECURITY INVOKER
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
     v_user_id bigint;
     v_current_hash text;
 BEGIN
+    -- citext's = lives in public; an unqualified = would resolve to the
+    -- case-sensitive text = in pg_catalog.
     SELECT id, password_hash INTO v_user_id, v_current_hash
-    FROM users
-    WHERE email = p_email
-      AND password_hash = crypt(p_password, password_hash);
+    FROM public.users
+    WHERE email OPERATOR(public.=) p_email
+      AND password_hash = public.crypt(p_password, password_hash);
 
     IF v_user_id IS NULL THEN
         RETURN NULL;
@@ -490,14 +493,20 @@ BEGIN
 
     -- bcrypt hash format: $2a$<cost>$<salt22><hash31> — extract cost
     IF substring(v_current_hash from '\$2.\$(\d+)\$')::int < p_target_cost THEN
-        UPDATE users SET password_hash = crypt(p_password, gen_salt('bf', p_target_cost))
+        UPDATE public.users
+        SET password_hash = public.crypt(p_password, public.gen_salt('bf', p_target_cost))
         WHERE id = v_user_id;
     END IF;
 
     RETURN v_user_id;
 END;
 $$;
+
+REVOKE EXECUTE ON FUNCTION login_and_maybe_rehash(citext, text, int) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION login_and_maybe_rehash(citext, text, int) TO app_login;
 ```
+
+`SECURITY DEFINER` keeps `password_hash` out of the application role's reach: `app_login` needs only `EXECUTE`, not `SELECT` or `UPDATE` on `users`, so a compromised application connection cannot dump every hash. The pinned `search_path` with `pg_temp` last and the schema-qualified table, functions, and operator stop a caller from substituting its own objects. The example assumes `users` and pgcrypto live in `public`; adjust the qualifiers to match your schemas.
 
 The hash itself encodes the cost factor — you can detect stale-cost hashes without a separate column.
 
@@ -643,7 +652,7 @@ SELECT 'tok_' || replace(replace(encode(gen_random_bytes(32), 'base64'), '+', '-
 
 ```sql
 -- PG18+: inspect both FIPS mode and the pgcrypto policy.
-SELECT fips_mode(), current_setting('pgcrypto.builtin_crypto_enabled');
+SELECT fips_mode(), current_setting('pgcrypto.builtin_crypto_enabled', true);
 ```
 
 If FIPS mode is active and the setting is `fips`, both `crypt()` and `gen_salt()` are disabled, regardless of the algorithm. Use an appropriate validated external password-hashing implementation.
@@ -715,7 +724,7 @@ Adopt a column-naming convention (`*_encrypted` suffix or column comment contain
 4. **Raw `encrypt()` does not authenticate ciphertext.** Bit-flip attacks are not detected; `decrypt()` returns garbage. Use `pgp_sym_encrypt` (built-in MDC) unless you need bit-exact wire compatibility with an external system.
 5. **CBC mode requires a fresh IV per encryption.** Reusing an IV with the same key leaks information. Always use `encrypt_iv()` with `gen_random_bytes(16)`, never `encrypt()` (which uses an internal predictable IV).
 6. **ECB mode is for testing only.** Verbatim from the docs: *"`ecb` — each block is encrypted separately (for testing only)"*[^pgcrypto-raw]. Identical plaintext blocks produce identical ciphertext blocks under ECB, leaking structure.
-7. **bcrypt truncates passwords longer than 72 bytes.** Reject overly long passwords or use an appropriate password-hashing scheme that supports them. Do not invent a pre-hashing construction without a vetted design.
+7. **bcrypt truncates passwords longer than 72 bytes.** Two passwords identical in their first 72 bytes hash to the same value. Reject overly long passwords, or on PG18+ use `sha256crypt` or `sha512crypt`, which have no password-length limit.[^pg18-shacrypt] Do not invent a pre-hashing construction without a vetted design.
 8. **Default `gen_salt('bf')` cost is 6 — too low.** Pass an explicit cost: `gen_salt('bf', 12)`. Periodically re-benchmark and raise as hardware speeds increase.
 9. **`crypt()` cost factor is not stored separately — it is embedded in the hash.** You can detect stale-cost hashes by parsing the hash format (`$2a$<cost>$...`), but you cannot raise cost in-place; you must rehash on next successful login.
 10. **`digest('md5')` and `md5()` are broken.** Both produce MD5; both are collision-vulnerable for cryptographic purposes. Use SHA-256 or BLAKE2.

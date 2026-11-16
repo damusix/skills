@@ -289,7 +289,9 @@ CREATE TABLE partman.events_template (LIKE public.events);
 
 -- Step 2: template-managed options apply to new children.
 ALTER TABLE partman.events_template SET (autovacuum_vacuum_scale_factor = 0.02);
--- Ordinary indexes and replica identity belong on the parent.
+-- Ordinary indexes and replica identity belong on the parent. REPLICA IDENTITY
+-- does not recurse: run the same ALTER on each existing leaf. pg_partman 5.1+
+-- copies the parent's setting to children it creates.
 ALTER TABLE public.events REPLICA IDENTITY FULL;
 CREATE INDEX events_tenant_idx ON public.events(tenant_id);
 CREATE INDEX events_payload_gin ON public.events USING GIN (payload);
@@ -310,7 +312,7 @@ WHERE parent_table = 'public.events';
 ```
 
 > [!WARNING] Template is one-shot at child creation
-> Properties on the template apply to children created AFTER the template was registered. Existing children are not back-filled. To retro-fit, you must `CREATE INDEX CONCURRENTLY` / `ALTER TABLE` each existing leaf by hand. Same applies to any later template change.[^4]
+> Properties the template manages (for example storage parameters such as `autovacuum_vacuum_scale_factor`) apply to children created AFTER the template was registered. Existing children are not back-filled, so retro-fit them with `ALTER TABLE` on each existing leaf. Same applies to any later template change. Ordinary indexes belong on the parent instead (Recipe 3).[^4]
 
 ## Sub-partitioning
 
@@ -400,7 +402,7 @@ pg_partman is wholly external. **All five PG major release notes (PG14 / PG15 / 
 |---|---|---|
 | 4.7.x | 2021–2023 | Last v4 series. Supported trigger-based + declarative partitioning. `time-static` / `time-dynamic` / `id-static` / `id-dynamic` types. Stay on this branch if on PG12 / PG13. |
 | **5.0.0** | 2023-09-28 | **Major break.** Trigger-based sets require migration to declarative partitioning; review the upstream 5.0.1 upgrade guide before `ALTER EXTENSION`. |
-| 5.1.0 | 2024-04-02 | LIST partitioning for single-value integers. `maintenance_order` + `maintenance_last_run` columns added to `part_config`. REPLICA IDENTITY auto-inherits from template. Experimental numeric-column range partitioning. |
+| 5.1.0 | 2024-04-02 | LIST partitioning for single-value integers. `maintenance_order` + `maintenance_last_run` columns added to `part_config`. REPLICA IDENTITY auto-inherits from the parent table (new children only). Experimental numeric-column range partitioning. |
 | 5.2.0 | 2024-11-22 | UUIDv7 + custom-encoded methods for time-based partitioning. Microsecond epoch precision. **Superuser requirement removed.** `default_table` column removed from `part_config` (kept as `create_parent()` arg). Control column may be NULL (with care). |
 | 5.3.0 | 2025-10-09 | New `partition_data_async()` for smaller batched moves out of default partition (time-based only). `p_ignored_columns` support. UUID partitioning support in `partition_data_time()` / `_proc()`. |
 | 5.4.0 | 2026-01-05 | Renamed `create_parent()` → `create_partition()` + `create_sub_parent()` → `create_sub_partition()` (old names retained). New `config_cleanup()` strips pg_partman state while leaving partitioned table intact. `p_ignore_infinity` parameter for default-table handling. |
@@ -488,11 +490,10 @@ SELECT pg_size_pretty(pg_relation_size('public.events_default'));
 For ordinary indexes, define the index on the partitioned parent; new partitions inherit it. Existing leaves can be built concurrently and attached. See <https://www.postgresql.org/docs/16/sql-createindex.html>.
 
 ```sql
-
--- Step 2: create the partitioned parent index without recursing.
+-- Step 1: create the partitioned parent index without recursing.
 CREATE INDEX events_event_type_idx ON ONLY public.events (event_type);
 
--- Step 3: in psql with autocommit enabled, build each direct leaf concurrently.
+-- Step 2: in psql with autocommit enabled, build each direct leaf concurrently.
 -- Pause partition maintenance while building and attaching. For subpartitioned
 -- trees, repeat the procedure at each level.
 SELECT format('CREATE INDEX CONCURRENTLY %I ON %s (event_type);',
@@ -502,7 +503,7 @@ JOIN pg_class c ON c.oid = i.inhrelid
 WHERE i.inhparent = 'public.events'::regclass AND c.relkind = 'r'
 \gexec
 
--- Step 4: attach the corresponding schema-qualified indexes.
+-- Step 3: attach the corresponding schema-qualified indexes.
 SELECT format('ALTER INDEX public.events_event_type_idx ATTACH PARTITION %I.%I;',
               n.nspname, 'events_event_type_' || c.oid)
 FROM pg_inherits i
@@ -672,7 +673,7 @@ CALL partman.undo_partition_proc(
 
 ### 12. Refresh logical replication subscriptions after partition changes
 
-pg_partman 5 removed automatic subscription refresh. When the publication includes individual partitions and new partitions must be subscribed, run `ALTER SUBSCRIPTION my_subscription REFRESH PUBLICATION` separately on the subscriber, outside a transaction block. See <https://github.com/pgpartman/pg_partman/blob/v5.5.0/CHANGELOG.md> and <https://www.postgresql.org/docs/16/sql-altersubscription.html>.
+pg_partman 5 removed automatic subscription refresh. With `publish_via_partition_root = false` (the default), the publisher publishes each leaf as its own table, so every new partition is a new table the subscriber must pick up. That covers publications that list individual partitions, `FOR TABLE parent`, `FOR TABLES IN SCHEMA`, and `FOR ALL TABLES`. In those cases run `ALTER SUBSCRIPTION my_subscription REFRESH PUBLICATION` on the subscriber after partman creates partitions, outside a transaction block. With `publish_via_partition_root = true`, only the root is published and new leaves need no refresh. See <https://github.com/pgpartman/pg_partman/blob/v5.5.0/CHANGELOG.md> and <https://www.postgresql.org/docs/16/sql-altersubscription.html>.
 
 ### 13. Cleanup partman state without dropping the partitioned table (v5.4+)
 
@@ -692,7 +693,7 @@ SELECT partman.config_cleanup(p_parent_table := 'public.events');
 
 3. **No HASH partitioning support.** partman manages `range` and `list` (v5.1+) only. Hash-partitioned tables must be created and maintained manually, or use Citus ([97-citus.md](./97-citus.md)).
 
-4. **Template table changes are NOT retroactive.** Indexes / constraints / REPLICA IDENTITY added to template apply to NEW children only. Existing children stay un-indexed — walk them with `CREATE INDEX CONCURRENTLY` per Recipe 3.
+4. **Template table changes are NOT retroactive.** Properties the template manages (storage parameters, per-child unique indexes, and other items in the upstream property matrix) apply to NEW children only; apply them to existing children with `ALTER TABLE` per leaf. Ordinary indexes and REPLICA IDENTITY belong on the parent, not the template: see Recipe 3 for indexes, and run `ALTER TABLE ... REPLICA IDENTITY` on each existing leaf.
 
 5. **`retention_keep_table = false` drops the table irreversibly.** Once `run_maintenance()` drops a partition, data is gone. Pair with logical archive (cron `COPY` to S3) or use `retention_schema` for safer detach + move pattern.
 

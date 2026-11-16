@@ -156,7 +156,7 @@ SHOW wal_buffers;       -- typically 4MB on a 128MB shared_buffers default
 
 Default `-1` selects `shared_buffers / 32`, with an automatic range of 64 kB to one WAL segment. Positive manual settings can exceed one segment; values below 32 kB are treated as 32 kB.[^wal-buffers]
 
-Leave automatic sizing unless measurements such as WAL buffer-full events justify changing it. An explicit 16 MB setting does not avoid meaningful recurring computation.
+Leave automatic sizing unless measurements such as WAL buffer-full events justify changing it.
 
 ### synchronous_commit
 

@@ -433,9 +433,9 @@ vacuum_buffer_usage_limit = '32MB'   # cluster-wide, also applies to autovacuum
 Linux hugepage reservation (one-time, via `/etc/sysctl.d/40-postgres-hugepages.conf`):
 
 ```ini
-# Set this from shared_memory_size_in_huge_pages for the actual configuration,
-# adding operational headroom if appropriate.
-vm.nr_hugepages = 9000
+# <N> = output of `postgres -D "$PGDATA" -C shared_memory_size_in_huge_pages`
+# (run with the server stopped, PG15+), plus operational headroom.
+vm.nr_hugepages = <N>
 ```
 
 After reboot, verify:
@@ -479,8 +479,6 @@ LIMIT  20;
 SELECT  buffers_alloc,
         buffers_backend,
         buffers_clean,
-        round(100.0 * buffers_backend / NULLIF(buffers_alloc, 0), 2) AS pct_backend,
-        round(100.0 * buffers_clean   / NULLIF(buffers_alloc, 0), 2) AS pct_clean,
         maxwritten_clean,
         stats_reset
 FROM    pg_stat_bgwriter;
@@ -490,7 +488,7 @@ Interpretation:
 
 - Compare interval deltas of `buffers_backend`, `buffers_clean`, and `buffers_alloc` alongside workload context. These count different events, so their ratios are not a fraction of a common total and cannot alone establish bgwriter saturation.[^monitoring-stats]
 - `maxwritten_clean` growing — the bgwriter is hitting its per-round write cap (`bgwriter_lru_maxpages`). Raise it.
-- `pct_clean` very low (e.g., <10%) AND `pct_backend` very low — bgwriter is barely running, possibly because the workload doesn't dirty pages fast enough or the pool is mostly clean.
+- `buffers_clean` barely moving over a busy interval — the bgwriter is writing little, either because the pool stays mostly clean or because `bgwriter_lru_multiplier` and `bgwriter_lru_maxpages` keep it from getting ahead of allocations.
 
 ### Recipe 4 — diagnose "is bgwriter falling behind?" (PG17+)
 

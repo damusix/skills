@@ -30,7 +30,7 @@ The function holds the validation logic. The trigger is a one-liner that wires i
             WHERE account_no = NEW.account_no AND type = 'savings'
         ) THEN
             RAISE EXCEPTION 'savings_account requires account.type = ''savings'''
-                USING ERRCODE = 'P0010';
+                USING ERRCODE = 'Z0010';
         END IF;
         RETURN NEW;
     END;
@@ -108,7 +108,7 @@ Don't forget the **other side**: prevent the base row from changing type while s
             OR EXISTS (SELECT 1 FROM checking_account WHERE account_no = OLD.account_no)
             THEN
                 RAISE EXCEPTION 'cannot change account.type while subtype rows exist'
-                    USING ERRCODE = 'P0010';
+                    USING ERRCODE = 'Z0010';
             END IF;
         END IF;
         RETURN NEW;
@@ -131,7 +131,7 @@ When a column must reference state in another table that an FK alone can't expre
             WHERE product_no = NEW.product_no AND status = 'active'
         ) THEN
             RAISE EXCEPTION 'cannot add inactive product % to order line', NEW.product_no
-                USING ERRCODE = 'P0005';
+                USING ERRCODE = 'Z0005';
         END IF;
         RETURN NEW;
     END;
@@ -172,7 +172,7 @@ Enforce that an entity can only move between allowed states:
             ) THEN
                 RAISE EXCEPTION 'invalid order status transition: % -> %',
                         OLD.status, NEW.status
-                    USING ERRCODE = 'P0005';
+                    USING ERRCODE = 'Z0005';
             END IF;
         END IF;
         RETURN NEW;

@@ -376,8 +376,9 @@ GROUP BY CUBE (region, product, channel);
 > **`GROUP BY DISTINCT`** removes duplicate grouping sets that are produced when you combine multiple `ROLLUP` / `CUBE` clauses. The release note: *"Allow `DISTINCT` to be added to `GROUP BY` to remove duplicate `GROUPING SET` combinations."*[^pg14-group-by-distinct]
 >
 > ```sql
-> -- Multiple ROLLUP items produce a cross product of grouping sets.
-> -- DISTINCT removes duplicates from that cross product.
+> -- ROLLUP(a,b), ROLLUP(a,c) is the cross product of {(a,b),(a),()} and {(a,c),(a),()}:
+> --   without DISTINCT: (a,b,c), (a,b), (a,b), (a,c), (a), (a), (a,c), (a), ()
+> --   with DISTINCT:    (a,b,c), (a,b), (a,c), (a), ()
 > SELECT a, b, c, COUNT(*)
 > FROM t
 > GROUP BY DISTINCT ROLLUP(a,b), ROLLUP(a,c);
@@ -406,7 +407,7 @@ ORDER BY customer_id, created_at DESC;
 `DISTINCT ON` is a PostgreSQL extension (not SQL standard) but it is the **most efficient** "top-1 per group" pattern in PG when you also have a btree index on `(group_col, sort_col DESC)`. The alternative — a window function — almost always plans worse for top-1.
 
 > [!WARNING] `DISTINCT ON` and `ORDER BY` must agree
-> The leftmost `ORDER BY` expressions must match the `DISTINCT ON` expressions; their order among those leading keys may differ. Add tie-breaker columns after the DISTINCT-ON keys.
+> The leftmost `ORDER BY` expressions must match the `DISTINCT ON` expressions,[^select] or the parser raises *"SELECT DISTINCT ON expressions must match initial ORDER BY expressions."* The parser accepts those leading keys in any order (`DISTINCT ON (a, b) … ORDER BY b, a`), adopting the `ORDER BY` order.[^parse-clause-distinct-on] Add tie-breaker columns after the DISTINCT-ON keys.
 
 
 ### `UNION`, `INTERSECT`, `EXCEPT`
@@ -777,7 +778,7 @@ ORDER BY created_at DESC, id DESC
 LIMIT 50;
 ```
 
-Assume `created_at` and `id` are non-null and `id` breaks ties uniquely; nullable sort keys need explicit handling. An index on `(created_at DESC, id DESC)` can support an efficient seek. Concurrent changes can still alter results between pages unless a consistent snapshot is held.
+Assume `created_at` and `id` are non-null and `id` breaks ties uniquely; nullable sort keys need explicit handling. An index on `(created_at DESC, id DESC)` can support an efficient seek. `OFFSET N` reads and discards N rows; a keyset seek does not. Concurrent changes can still alter results between pages unless a consistent snapshot is held.
 
 
 ### Stable random ordering for fixed-seed exploration
@@ -961,6 +962,8 @@ WHERE o.id IN (SELECT id FROM flagged_orders);
 [^lateral-section]: "LATERAL Subqueries" section in the queries chapter — explains the lateral-reference rules and why `LATERAL` is implicit for set-returning functions in `FROM`. https://www.postgresql.org/docs/16/queries-table-expressions.html#QUERIES-LATERAL
 
 [^pg13-with-ties]: PostgreSQL 13 release notes: *"Allow `FETCH FIRST` to use `WITH TIES` to return any additional rows that match the last result row (Surafel Temesgen)."* https://www.postgresql.org/docs/release/13.0/
+
+[^parse-clause-distinct-on]: PostgreSQL source, `transformDistinctOnClause` in `src/backend/parser/parse_clause.c`: ORDER BY items that match DISTINCT ON items set the sort semantics and column order; an error is raised only when a DISTINCT ON item follows a skipped ORDER BY item. https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/parser/parse_clause.c
 
 [^pg14-group-by-distinct]: PostgreSQL 14 release notes: *"Allow `DISTINCT` to be added to `GROUP BY` to remove duplicate `GROUPING SET` combinations (Vik Fearing). For example, `GROUP BY CUBE (a,b), CUBE (b,c)` will generate duplicate grouping combinations without `DISTINCT`."* https://www.postgresql.org/docs/release/14.0/
 

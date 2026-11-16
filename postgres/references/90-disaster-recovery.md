@@ -93,7 +93,7 @@ Five rules to internalize.
 | Logical replica subscriber needs to become primary | Plan an application cutover; PG17 failover slots protect logical subscribers of a promoted physical standby, not promotion of a logical subscriber | [`75-replication-slots.md`](./75-replication-slots.md) |
 | Old primary diverged, want to re-attach as standby | pg_rewind to new primary | [`89-pg-rewind.md`](./89-pg-rewind.md) |
 | Verify restorability without affecting prod | Restore to disposable host, run integrity checks | Below — DR Drills |
-| Want zero data loss during planned failover | Controlled switchover with `pg_switch_wal` + sync replication | [`77-standby-failover.md`](./77-standby-failover.md) Recipe 5 |
+| Want zero data loss during planned failover | Controlled switchover: block writers, wait until the standby replays the saved `pg_current_wal_flush_lsn()` barrier, then promote | [`77-standby-failover.md`](./77-standby-failover.md) [Controlled switchover procedure](./77-standby-failover.md#controlled-switchover-procedure) and Recipe 5 |
 | Estimate restore time before disaster | Run quarterly drill, capture wall-clock | Below — DR Drills |
 
 ---

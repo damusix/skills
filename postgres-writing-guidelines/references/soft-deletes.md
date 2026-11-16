@@ -73,8 +73,6 @@ Mutate via procedures so the timestamp + actor are captured consistently:
     CREATE OR REPLACE PROCEDURE pr_remove_customer(p_customer_no customer_no)
     LANGUAGE plpgsql AS $$
     BEGIN
-        PERFORM fn_assert_not_in_transaction();
-
         UPDATE customer
         SET deleted_at = clock_timestamp(),
             deleted_by = fn_current_app_user_id()
@@ -83,29 +81,21 @@ Mutate via procedures so the timestamp + actor are captured consistently:
 
         IF NOT FOUND THEN
             RAISE EXCEPTION 'customer % not found or already deleted', p_customer_no
-                USING ERRCODE = 'P0002';
+                USING ERRCODE = 'Z0002';
         END IF;
-
-        COMMIT;
-    EXCEPTION WHEN OTHERS THEN ROLLBACK; RAISE;
     END;
     $$;
 
     CREATE OR REPLACE PROCEDURE pr_restore_customer(p_customer_no customer_no)
     LANGUAGE plpgsql AS $$
     BEGIN
-        PERFORM fn_assert_not_in_transaction();
-
         UPDATE customer SET deleted_at = NULL, deleted_by = NULL
         WHERE customer_no = p_customer_no AND deleted_at IS NOT NULL;
 
         IF NOT FOUND THEN
             RAISE EXCEPTION 'customer % not found or not deleted', p_customer_no
-                USING ERRCODE = 'P0002';
+                USING ERRCODE = 'Z0002';
         END IF;
-
-        COMMIT;
-    EXCEPTION WHEN OTHERS THEN ROLLBACK; RAISE;
     END;
     $$;
 

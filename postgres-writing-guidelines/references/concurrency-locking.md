@@ -91,7 +91,7 @@ For workflows where conflicts are rare and you'd rather fail loudly than seriali
     -- If row count is 0, someone else modified it — surface to caller
     IF NOT FOUND THEN
         RAISE EXCEPTION 'document modified by another writer'
-            USING ERRCODE = 'P0013';   -- OPTIMISTIC_LOCK_LOST
+            USING ERRCODE = 'Z0013';   -- OPTIMISTIC_LOCK_LOST
     END IF;
 
 No pessimistic lock, no waiting, no deadlock potential. Trade-off: callers may have to retry.

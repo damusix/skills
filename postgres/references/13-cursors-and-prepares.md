@@ -80,7 +80,7 @@ Option-by-option semantics, verbatim from `sql-declare.html`[^pg-decl]:
 
 - **`BINARY`** — rows come back in PostgreSQL binary wire format, not text. *"Many applications, including psql, are not prepared to handle binary cursors."* Reserve for native-protocol clients that explicitly opt in.
 
-- **`ASENSITIVE` / `INSENSITIVE`** — PostgreSQL cursors are insensitive. Explicit `INSENSITIVE` cannot be combined with `FOR UPDATE`/`FOR SHARE`.
+- **`ASENSITIVE` / `INSENSITIVE`** — *"In PostgreSQL, all cursors are insensitive; so these key words have no effect and are only accepted for compatibility with the SQL standard. Specifying INSENSITIVE together with FOR UPDATE or FOR SHARE is an error."*
 
 - **`SCROLL` / `NO SCROLL`** — `SCROLL` permits non-sequential and backward fetches. *"The default is to allow scrolling in some cases; this is not the same as specifying `SCROLL`. PostgreSQL will allow backward fetches without `SCROLL`, if the cursor's query plan is simple enough that no extra overhead is needed to support it."* Treat the default as "forward-only" — explicitly declare `SCROLL` if you ever fetch backward.
 
@@ -274,6 +274,7 @@ CREATE FUNCTION jobs_pending(IN cur refcursor) RETURNS refcursor AS $$
 BEGIN
     OPEN cur FOR SELECT id, payload FROM jobs WHERE status = 'pending';
     RETURN cur;
+END;
 $$ LANGUAGE plpgsql;
 
 BEGIN;
@@ -377,7 +378,7 @@ The rule, verbatim from `sql-prepare.html`[^pg-prep]:
 
 Translated:
 
-The first five executions use custom plans. At the sixth execution PostgreSQL builds and compares a generic plan, then selects generic or custom based on estimated cost including planning overhead. The choice can be reconsidered as cost estimates change; it is not a fresh comparison against each current parameter's selectivity.
+The first five executions use custom plans. At the sixth execution PostgreSQL builds and compares a generic plan, then selects generic or custom based on estimated cost including planning overhead. Once the generic plan wins, it stays: later executions build no new custom plans, so the average it is compared against never changes. The choice is revisited only when plan invalidation (DDL or new statistics on a referenced table) forces a rebuild. It is not a fresh comparison against each call's parameter selectivity.
 
 This is why a query slows on the sixth call — the planner switched to a generic plan that picked a Seq Scan because the parameter is no longer known to be highly selective.
 
@@ -759,7 +760,7 @@ Without `WITH HOLD`, the volatile-function caveat from `sql-declare.html`[^pg-de
 
 ## Sources
 
-[^pg-decl]: PostgreSQL 16 — `DECLARE`. <https://www.postgresql.org/docs/16/sql-declare.html>. Quoted: *"All cursors are insensitive; so these key words have no effect and are only accepted for compatibility with the SQL standard"*; *"The default is to allow scrolling in some cases; this is not the same as specifying `SCROLL`. PostgreSQL will allow backward fetches without `SCROLL`, if the cursor's query plan is simple enough that no extra overhead is needed to support it"*; *"the cursor created by this command can only be used within the current transaction"*; *"the cursor can continue to be used after the transaction that created it successfully commits"*; *"In the current implementation, the rows represented by a held cursor are copied into a temporary file or memory area so that they remain available for subsequent transactions"*; *"Scrollable cursors may give unexpected results if they invoke any volatile functions"*.
+[^pg-decl]: PostgreSQL 16 — `DECLARE`. <https://www.postgresql.org/docs/16/sql-declare.html>. Quoted: *"In PostgreSQL, all cursors are insensitive; so these key words have no effect and are only accepted for compatibility with the SQL standard. Specifying INSENSITIVE together with FOR UPDATE or FOR SHARE is an error."*; *"The default is to allow scrolling in some cases; this is not the same as specifying `SCROLL`. PostgreSQL will allow backward fetches without `SCROLL`, if the cursor's query plan is simple enough that no extra overhead is needed to support it"*; *"the cursor created by this command can only be used within the current transaction"*; *"the cursor can continue to be used after the transaction that created it successfully commits"*; *"In the current implementation, the rows represented by a held cursor are copied into a temporary file or memory area so that they remain available for subsequent transactions"*; *"Scrollable cursors may give unexpected results if they invoke any volatile functions"*.
 
 [^pg-fetch]: PostgreSQL 16 — `FETCH`. <https://www.postgresql.org/docs/16/sql-fetch.html>. Direction table verified verbatim; `ABSOLUTE 0` positions before the first row, `RELATIVE 0` re-fetches the current row.
 

@@ -347,7 +347,7 @@ huge_pages = try                    # restart required
 
 # --- WAL ---
 wal_level = replica                 # or 'logical' if you need logical replication
-wal_compression = lz4               # requires PostgreSQL built with LZ4
+wal_compression = lz4               # PG15+; requires a build with LZ4
 max_wal_size = 16GB
 min_wal_size = 2GB
 checkpoint_timeout = 15min
@@ -363,7 +363,7 @@ hot_standby_feedback = off          # set 'on' only if standby runs reporting qu
 # --- Autovacuum ---
 autovacuum_vacuum_cost_delay = 2ms
 autovacuum_naptime = 30s
-log_autovacuum_min_duration = 10min # workload-specific threshold
+log_autovacuum_min_duration = 10min # default since PG15
 
 # --- Connections ---
 max_connections = 200               # restart required; use a pooler for >200
@@ -473,7 +473,7 @@ Settings apply at session start, in precedence order: per-role-in-database wins 
 
 ```sql
 -- Audit pending changes
-SELECT name, setting AS current_value, reset_val,
+SELECT name, setting AS current_value,
        sourcefile, sourceline
 FROM pg_settings
 WHERE pending_restart

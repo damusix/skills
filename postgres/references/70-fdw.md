@@ -557,6 +557,8 @@ CREATE SERVER analytics_db
 CREATE USER MAPPING FOR app_user
     SERVER analytics_db
     OPTIONS (user 'fdw_reader', password '<remote-password>');
+-- app_user can read this password through pg_user_mappings.
+-- PG18+: OPTIONS (user 'fdw_reader', use_scram_passthrough 'true') stores no password.
 
 -- Import all tables from remote schema
 IMPORT FOREIGN SCHEMA reporting
@@ -599,7 +601,7 @@ Limit
 
 If a predicate or aggregate is missing from `Remote SQL`, inspect expression shippability and the chosen plan. `ANALYZE` and `use_remote_estimate` improve estimates but do not make an unsafe expression shippable.[^pg-fdw-16]
 
-### Recipe 3: bulk migration with batched INSERT
+### Recipe 3: bulk migration into a local table
 
 ```sql
 -- One-time, single big transaction

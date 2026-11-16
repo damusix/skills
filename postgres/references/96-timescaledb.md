@@ -761,7 +761,11 @@ SELECT create_hypertable('events_new', by_range('ts', INTERVAL '1 day'));
 
 BEGIN;
 LOCK TABLE events IN ACCESS EXCLUSIVE MODE;
-INSERT INTO events_new SELECT * FROM events;
+-- Name the columns. INCLUDING ALL copies generated and identity columns:
+-- leave GENERATED ... STORED columns out of both lists (they recompute), and
+-- add OVERRIDING SYSTEM VALUE when an identity column is GENERATED ALWAYS.
+INSERT INTO events_new (ts, device_id, payload)
+SELECT ts, device_id, payload FROM events;
 ALTER TABLE events RENAME TO events_old;
 ALTER TABLE events_new RENAME TO events;
 COMMIT;

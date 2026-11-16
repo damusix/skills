@@ -24,11 +24,11 @@ Custom codes give you a parseable contract:
 
     -- Server side
     RAISE EXCEPTION 'email already taken: %', new_email
-        USING ERRCODE = 'P0003';
+        USING ERRCODE = 'Z0003';
 
     -- Client side (Node example)
     catch (err) {
-        if (err.code === 'P0003') return showError('That email is taken');
+        if (err.code === 'Z0003') return showError('That email is taken');
     }
 
 The catalog is a versioned constants document — no runtime registration needed.
@@ -37,16 +37,13 @@ The catalog is a versioned constants document — no runtime registration needed
 
 SQLSTATE is exactly **5 alphanumeric characters**. The first two characters are the *class*; the last three the *subclass*.
 
-- Classes `00`–`HZ` are reserved by the SQL standard and Postgres.
-- Class `P0` is reserved for **PL/pgSQL exceptions** (the `RAISE` mechanism).
-- Postgres treats any code in class `P0` as a user-defined exception.
+- The SQL standard defines classes starting with `0`–`4` or `A`–`H`. Classes starting with `5`–`9` or `I`–`Z` are left to implementations.
+- Postgres defines its own codes in several implementation classes (`53`, `54`, `55`, `57`, `58`, `P0`, `XX`). It defines no class `Z` codes.
+- Class `P0` is **PL/pgSQL's own**: `P0000` `plpgsql_error`, `P0001` `raise_exception` (the default for a bare `RAISE EXCEPTION`), `P0002` `no_data_found`, `P0003` `too_many_rows`, `P0004` `assert_failure`.
 
-By convention, use `P0001`–`P0999` for application errors. Reserve specific ranges for categories if helpful:
+Application codes use class `Z0`, not `P0`. A `P0` code collides with native errors: `WHEN SQLSTATE 'P0002'` also catches a `SELECT INTO STRICT` that found no row, and a client matching `'P0001'` also catches every `RAISE EXCEPTION` that set no code.
 
-- `P0001`–`P0099` — input/validation
-- `P0100`–`P0199` — authentication/authorization
-- `P0200`–`P0299` — state/business rules
-- `P0300`–`P0399` — external integration
+Use `Z0001`–`Z0999` for application errors.
 
 ## The Error Code Catalog
 
@@ -54,18 +51,17 @@ Maintain a single source of truth (e.g., `errors.yaml`) shared by server and cli
 
 | Code | Name | Meaning |
 |------|------|---------|
-| `P0001` | `INVALID_INPUT` | Caller passed malformed or missing required input |
-| `P0002` | `NOT_FOUND` | Referenced entity does not exist |
-| `P0003` | `DUPLICATE_KEY` | Unique constraint conflict at the application level |
-| `P0004` | `FORBIDDEN` | Caller lacks permission for this operation |
-| `P0005` | `STATE_CONFLICT` | Operation invalid in current entity state |
-| `P0006` | `RATE_LIMITED` | Caller exceeded a rate limit |
-| `P0007` | `EXTERNAL_FAILURE` | A non-transient external service call failed |
-| `P0010` | `TYPE_DISCRIMINATOR_MISMATCH` | Subtype FK references a base row of the wrong type |
-| `P0011` | `TRANSACTION_REQUIRED` | Caller must be inside an explicit transaction |
-| `P0012` | `TRANSACTION_FORBIDDEN` | Caller must NOT be inside an explicit transaction |
-| `P0013` | `OPTIMISTIC_LOCK_LOST` | Row was modified between read and write |
-| `P0014` | `WORKER_RETRY_EXHAUSTED` | Background job exceeded max attempts |
+| `Z0001` | `INVALID_INPUT` | Caller passed malformed or missing required input |
+| `Z0002` | `NOT_FOUND` | Referenced entity does not exist |
+| `Z0003` | `DUPLICATE_KEY` | Unique constraint conflict at the application level |
+| `Z0004` | `FORBIDDEN` | Caller lacks permission for this operation |
+| `Z0005` | `STATE_CONFLICT` | Operation invalid in current entity state |
+| `Z0006` | `RATE_LIMITED` | Caller exceeded a rate limit |
+| `Z0007` | `EXTERNAL_FAILURE` | A non-transient external service call failed |
+| `Z0010` | `TYPE_DISCRIMINATOR_MISMATCH` | Subtype FK references a base row of the wrong type |
+| `Z0011` | `TRANSACTION_REQUIRED` | Caller must be inside an explicit transaction |
+| `Z0013` | `OPTIMISTIC_LOCK_LOST` | Row was modified between read and write |
+| `Z0014` | `WORKER_RETRY_EXHAUSTED` | Background job exceeded max attempts |
 
 Generate the constants file from this manifest at deploy time so server and client stay in sync.
 
@@ -84,7 +80,7 @@ Example:
     RAISE EXCEPTION 'cannot transition order % from % to %',
             p_order_no, v_current_status, p_new_status
         USING
-            ERRCODE = 'P0005',
+            ERRCODE = 'Z0005',
             DETAIL  = format('valid transitions from %s: %s',
                              v_current_status, v_valid_targets),
             HINT    = 'check order_status_transitions reference table';
@@ -98,20 +94,20 @@ Catch by named condition (preferred for built-in SQLSTATEs):
     EXCEPTION
         WHEN unique_violation THEN
             RAISE EXCEPTION 'email already taken'
-                USING ERRCODE = 'P0003';
+                USING ERRCODE = 'Z0003';
         WHEN foreign_key_violation THEN
             RAISE EXCEPTION 'referenced record does not exist'
-                USING ERRCODE = 'P0002';
+                USING ERRCODE = 'Z0002';
         WHEN check_violation THEN
             RAISE EXCEPTION 'value violates a check constraint'
-                USING ERRCODE = 'P0001';
+                USING ERRCODE = 'Z0001';
 
-Catch by SQLSTATE (required for custom `P0...` codes):
+Catch by SQLSTATE (required for custom `Z0...` codes):
 
     EXCEPTION
-        WHEN SQLSTATE 'P0010' THEN
-            -- type discriminator mismatch — log and re-raise
-            INSERT INTO type_mismatch_log(...) VALUES (...);
+        WHEN SQLSTATE 'Z0010' THEN
+            -- type discriminator mismatch: log to the server log and re-raise
+            RAISE LOG 'type discriminator mismatch: %', SQLERRM;
             RAISE;
 
 Catch multiple in one block:
@@ -119,7 +115,7 @@ Catch multiple in one block:
     EXCEPTION
         WHEN unique_violation OR check_violation THEN
             RAISE EXCEPTION 'invalid data'
-                USING ERRCODE = 'P0001';
+                USING ERRCODE = 'Z0001';
 
 ## GET STACKED DIAGNOSTICS
 
@@ -146,22 +142,23 @@ Inside an EXCEPTION block, retrieve full error context:
             RAISE;  -- re-raise so caller still sees the error
         END;
 
-Use this when you need to log structured error data before re-raising. `PG_EXCEPTION_CONTEXT` includes the call stack — invaluable for debugging trigger chains.
+Use this when you need structured error data before re-raising. The `error_log` row survives only if an outer caller catches the error; if the error reaches the top level, the transaction aborts and the row rolls back. `PG_EXCEPTION_CONTEXT` includes the call stack — invaluable for debugging trigger chains.
 
 ## Re-Raising vs Translating
 
 **Re-raise** when you've handled the side effect (logging, cleanup) but the caller still needs to know:
 
     EXCEPTION WHEN OTHERS THEN
-        ROLLBACK;
-        INSERT INTO failed_jobs(...) VALUES (...);
+        RAISE WARNING 'job % failed: %', p_job_id, SQLERRM;
         RAISE;  -- caller sees the original error
+
+Do not put `ROLLBACK` in a handler: a block with an `EXCEPTION` clause is a subtransaction, and ending the transaction inside it fails. Rows a handler inserts before `RAISE` roll back with the aborted transaction, so a durable failure record belongs in the server log (`RAISE WARNING`/`RAISE LOG`) or in the caller, after its own rollback.
 
 **Translate** when you want to give the caller a more meaningful error than Postgres's native one:
 
     EXCEPTION WHEN unique_violation THEN
         RAISE EXCEPTION 'an account with email % already exists', p_email
-            USING ERRCODE = 'P0003';
+            USING ERRCODE = 'Z0003';
 
 `RAISE` with no arguments re-raises the current exception unchanged. Translation always uses `RAISE EXCEPTION ... USING ERRCODE = ...` with a fresh code.
 

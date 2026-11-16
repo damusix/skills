@@ -294,7 +294,7 @@ Data streams over the wire on the open psql connection. Slower than server-side 
         (FORMAT csv, HEADER MATCH, FREEZE);
     COMMIT;
 
-The COPY result count confirms the number of rows loaded; it does not prove that tuples are frozen. Use visibility-map inspection when freeze verification is required.
+The COPY result count confirms the number of rows loaded; it does not prove that tuples are frozen. When freeze verification is required, compare `all_frozen` from the `pg_visibility` extension's `pg_visibility_map_summary('events_2026_05')` with the table's page count.
 
 For partitioned target, FREEZE not allowed. Load into a leaf partition created/truncated in same transaction, then ATTACH to parent. See [`35-partitioning.md`](./35-partitioning.md).
 
@@ -479,7 +479,7 @@ See [`58-performance-diagnostics.md`](./58-performance-diagnostics.md) for the f
 For multi-hour bulk-load events on a quiet cluster, temporarily relax durability and raise maintenance memory:
 
     BEGIN;
-    -- session-level for one load
+    -- transaction-level for one load
     SET LOCAL synchronous_commit = off;
     SET LOCAL maintenance_work_mem = '4GB';
     SET LOCAL work_mem = '256MB';

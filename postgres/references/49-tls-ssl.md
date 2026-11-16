@@ -221,7 +221,7 @@ Values:
 - `md5` — MD5 challenge (deprecated)
 - `scram-sha-256` — SCRAM
 - `gss` / `sspi` — Kerberos
-- `none` — no authentication challenge (including certificate authentication)
+- `none` — the server must not send an authentication challenge; TLS client-certificate authentication and GSS-encrypted transport stay allowed
 - Comma-separated combinations: `scram-sha-256,gss`
 - Negation: `!password` accepts everything except cleartext password
 

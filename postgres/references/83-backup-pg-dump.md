@@ -47,6 +47,8 @@ Five rules:
 4. **PG17+ `--filter` accepts an include/exclude file** (one rule per line: `include table public.users`, `exclude table_data public.audit`). PG17+ also adds `--exclude-extension`, `pg_restore --transaction-size`, and `--sync-method` for fsync control. **PG17+ batches large-object restore in parallel** — restoring millions of large objects no longer requires a single huge transaction.[^pg17]
 5. **PG18+ `--statistics` preserves optimizer statistics in dumps.** Default behavior remains "don't dump stats." Add `--statistics` to include them. **`--no-policies` (PG18+) disables RLS-policy emission** — useful when restoring into a cluster with different policy schema. Plus `--no-data`, `--no-schema`, `--statistics-only`, `--sequence-data` for fine-grained control.[^pg18]
 
+`pg_restore` continues past SQL errors by default and reports their count at the end, so a restore with failed objects can look finished. The full-restore examples on this page pass `--exit-on-error`; the `--list` examples only read the archive's table of contents and need no flag.[^pgrestore]
+
 ## Decision Matrix
 
 | Need | Use | Avoid | Why |
@@ -96,9 +98,9 @@ Verbatim from PG16 docs[^pgdump]:
 
 Canonical restore pattern:
 
-    pg_restore --section=pre-data -d target dump.custom
-    pg_restore --section=data --jobs=8 -d target dump.custom
-    pg_restore --section=post-data --jobs=8 -d target dump.custom
+    pg_restore --exit-on-error --section=pre-data -d target dump.custom
+    pg_restore --exit-on-error --section=data --jobs=8 -d target dump.custom
+    pg_restore --exit-on-error --section=post-data --jobs=8 -d target dump.custom
 
 Data loads faster because no indexes / FKs / triggers fire. Post-data builds indexes once from final data — faster than per-row insert into existing index.
 
@@ -139,7 +141,7 @@ Selection rules differ by option. In particular, `pg_dump -n` and `-N` have no e
 
 **Custom + directory** support parallel restore:
 
-    pg_restore -d target -j 8 dump.custom
+    pg_restore --exit-on-error -d target -j 8 dump.custom
 
 Parallel restore handles data load + post-data (index build, FK validate) in parallel. **Single-transaction restore (`--single-transaction`) blocks parallelism — pick one.** Cannot combine.
 
@@ -243,7 +245,7 @@ Core flags:
 
     pg_restore --list dump.custom > all_objects.txt
     # edit all_objects.txt — comment out (;) the objects you don't want
-    pg_restore --use-list=all_objects.txt -d target dump.custom
+    pg_restore --exit-on-error --use-list=all_objects.txt -d target dump.custom
 
 > [!WARNING] Minor releases 2026-08-13 / 2026-11-12
 > Several `pg_dump` and `pg_restore` CVEs were fixed in these rounds: CVE-2026-19385 (`pg_dump` overflow, 2026-08-13)[^minor-aug-announce]; CVE-2026-116314 (`pg_restore`, CVSS 8.8, exploitable without privileges), CVE-2026-116318 (SQL injection through a not-null constraint name in `pg_dump` output), and CVE-2026-116330 (psql injection through the `restore.sql` of a `pg_dump` tar archive) (2026-11-12).[^minor-nov-announce] Restore only trusted archives, and run `pg_dump` and `pg_restore` from the current minors. Full CVE list: <https://www.postgresql.org/support/security/>.
@@ -272,24 +274,53 @@ Core flags:
 
     # Restore on new cluster
     createdb -O myowner mydb
-    pg_restore -d mydb -j 4 /backup/mydb.dir
+    pg_restore --exit-on-error -d mydb -j 4 /backup/mydb.dir
 
 Directory format + 4 parallel workers + gzip level 6. Use `--compress=zstd:6` to select zstd explicitly.
 
 ### Recipe 2 — Cluster-wide backup with globals + per-DB data
 
+    #!/bin/bash
+    set -euo pipefail
+    BACKUP=/backup/$(date +%Y-%m-%d)
+    mkdir -p "$BACKUP"
+
+    # Roles and tablespaces once
+    pg_dumpall --globals-only -f "$BACKUP/globals.sql"
+
+    # Every connectable non-template database, including postgres.
+    # Archive paths use the OID; each name is kept beside its archive.
+    oids=$(psql -X -At -v ON_ERROR_STOP=1 -d postgres -c "SELECT oid FROM pg_database WHERE NOT datistemplate AND datallowconn ORDER BY oid")
+    [ -n "$oids" ] || { echo "database inventory is empty" >&2; exit 1; }
+    for oid in $oids; do
+      name=$(psql -X -At -d postgres -c "SELECT datname FROM pg_database WHERE oid = $oid")
+      printf '%s' "$name" > "$BACKUP/db-$oid.name"
+      esc=${name//\\/\\\\}; esc=${esc//\'/\\\'}      # libpq conninfo quoting
+      pg_dump -Fd -j 4 -f "$BACKUP/db-$oid.dir" -d "dbname='$esc'"
+    done
+
+Each `pg_dump` takes its own snapshot, so the set is not a cluster-wide point-in-time copy. Passing the name as a quoted `dbname=` conninfo value keeps spaces, quotes and `=` in database names from being split or parsed as connection options.
+
+Restore order: initialize the target → restore reviewed globals (below) with `psql -X -v ON_ERROR_STOP=1` → `pg_restore --create --exit-on-error -d postgres db-<oid>.dir` for each database except `postgres`, which `initdb` already created; restore that one with `pg_restore --exit-on-error -d postgres`. `--create` recreates the database with its source name, ACLs and settings.
+
+A single plain script is the alternative when parallel and selective restore are not needed:
+
     # All databases, roles and tablespaces in a plain SQL script:
     pg_dumpall --file=/backup/cluster.sql
 
-`pg_dumpall` includes the `postgres` database, but takes a separate snapshot for each database; it is not a cluster-wide point-in-time snapshot. For per-database parallel dumps, inventory every connectable database, including `postgres`, handle database names safely, and retain a mapping from database names to archive paths. See <https://www.postgresql.org/docs/16/app-pg-dumpall.html>.
+`pg_dumpall` includes the `postgres` database, but takes a separate snapshot for each database; it is not a cluster-wide point-in-time snapshot. See <https://www.postgresql.org/docs/16/app-pg-dumpall.html>.
 
-Prepare an isolated target before running `psql -X -v ON_ERROR_STOP=1 -f /backup/cluster-reviewed.sql postgres`. A normal dump contains `CREATE ROLE` for the source bootstrap superuser, commonly `postgres`; `initdb` has already created that role on a target initialized with the same name. An unmodified restore would stop at that expected conflict before restoring the databases.
+A globals or cluster script contains `CREATE ROLE` for the source bootstrap superuser, commonly `postgres`; `initdb` has already created that role on a target initialized with the same name. An unmodified restore would stop at that expected conflict before restoring anything else.
 
-Create `/backup/cluster-reviewed.sql` as a copy of the dump and keep the original backup unchanged. Review that copy's global-role section against the target's role inventory. For a bootstrap role verified to represent the same intended identity, omit only its duplicate `CREATE ROLE` statement from the reviewed copy; retain its following `ALTER ROLE`, settings, grants and membership statements. Reconcile other existing roles and objects deliberately, and prepare tablespace paths and permissions. Do not remove matching text elsewhere in the dump or disable `ON_ERROR_STOP` globally to ignore errors. Restore only trusted SQL and retain fail-fast handling for unexpected failures. See <https://www.postgresql.org/docs/18/app-pg-dumpall.html>.
+Create `/backup/cluster-reviewed.sql` (or `globals-reviewed.sql`) as a copy of the dump and keep the original backup unchanged. Review that copy's global-role section against the target's role inventory. For a bootstrap role verified to represent the same intended identity, omit only its duplicate `CREATE ROLE` statement from the reviewed copy; retain its following `ALTER ROLE`, settings, grants and membership statements. Reconcile other existing roles and objects deliberately, and prepare tablespace paths and permissions. Do not remove matching text elsewhere in the dump or disable `ON_ERROR_STOP` globally to ignore errors. Restore only trusted SQL and retain fail-fast handling for unexpected failures. See <https://www.postgresql.org/docs/18/app-pg-dumpall.html>.
+
+Then restore the reviewed copy on the isolated target:
+
+    psql -X -v ON_ERROR_STOP=1 -f /backup/cluster-reviewed.sql postgres
 
 ### Recipe 3 — Restore one table from full dump
 
-    pg_restore -d mydb -t users -t orders /backup/mydb.dir
+    pg_restore --exit-on-error -d mydb -t users -t orders /backup/mydb.dir
 
 Custom + directory formats only. Plain dumps require manually grepping the SQL.
 
@@ -302,13 +333,13 @@ Plain text, sorted by section. Diff-friendly. Strip ownership + grants so the di
 ### Recipe 5 — Schema-then-data-then-indexes restore (faster on large tables)
 
     # Pre-data first (tables + types, no indexes)
-    pg_restore --section=pre-data --no-owner -d target /backup/mydb.dir
+    pg_restore --exit-on-error --section=pre-data --no-owner -d target /backup/mydb.dir
 
     # Parallel data load (no indexes/FKs fire)
-    pg_restore --section=data --jobs=8 -d target /backup/mydb.dir
+    pg_restore --exit-on-error --section=data --jobs=8 -d target /backup/mydb.dir
 
     # Post-data: indexes + FKs + triggers built once from final data
-    pg_restore --section=post-data --jobs=8 -d target /backup/mydb.dir
+    pg_restore --exit-on-error --section=post-data --jobs=8 -d target /backup/mydb.dir
 
 5-10× faster on TB-scale restores than monolithic `pg_restore`.
 
@@ -319,13 +350,13 @@ Plain text, sorted by section. Diff-friendly. Strip ownership + grants so the di
 
     # Comment out unwanted items (prepend ;)
     # Then restore
-    pg_restore --use-list=toc.txt -d target /backup/mydb.dir
+    pg_restore --exit-on-error --use-list=toc.txt -d target /backup/mydb.dir
 
 Useful when migrating partial schemas, skipping one bad object, or filtering by object type.
 
 ### Recipe 7 — Force restore on existing cluster
 
-    pg_restore --clean --if-exists -d existing_db /backup/mydb.dir
+    pg_restore --exit-on-error --clean --if-exists -d existing_db /backup/mydb.dir
 
 Drops every object first using `DROP ... IF EXISTS`. Without `--if-exists`, missing objects produce errors. Without `--clean`, `CREATE` collides with existing objects.
 
@@ -352,14 +383,14 @@ Only objects defined by `postgis` extension. Useful when migrating extension dat
 ### Recipe 10 — PG18+ preserve planner stats across restore
 
     pg_dump -Fc --statistics -f mydb.custom mydb
-    pg_restore -d target mydb.custom
+    pg_restore --exit-on-error -d target mydb.custom
 
 PG18 includes most optimizer statistics, but not extended statistics data created with `CREATE STATISTICS`, extension-specific statistics, or cumulative statistics. Run `ANALYZE` as needed after restore. See <https://www.postgresql.org/docs/18/app-pgdump.html>.
 
 ### Recipe 11 — Skip RLS policies during migration
 
     pg_dump -Fc --no-policies -f mydb.custom mydb       # PG18+
-    pg_restore -d target --no-policies mydb.custom      # PG18+
+    pg_restore --exit-on-error -d target --no-policies mydb.custom      # PG18+
 
 Useful when target cluster has different RLS schema or you want to inspect data without policies.
 
@@ -397,7 +428,7 @@ pg_dump shows up as `application_name = 'pg_dump'` (parallel workers append work
     pg_dump -Fc mydb | gpg --encrypt --recipient backup@example.com -o /backup/mydb.dump.gpg
 
     # Restore
-    gpg --decrypt /backup/mydb.dump.gpg | pg_restore -d target_db
+    gpg --decrypt /backup/mydb.dump.gpg | pg_restore --exit-on-error -d target_db
 
 Pipe avoids leaving plaintext dump on disk. Combine with directory format via per-file tar:
 
@@ -415,7 +446,7 @@ Cross-reference `50-encryption-pgcrypto.md` — pgcrypto is in-database encrypti
     /usr/pgsql-18/bin/pg_dump -Fd -j 4 -h pg14-host -f /backup/mydb.dir mydb
 
     # Restore on PG18
-    pg_restore -d mydb -j 4 /backup/mydb.dir
+    pg_restore --exit-on-error -d mydb -j 4 /backup/mydb.dir
 
 Newer pg_dump reads older servers cleanly. **Reverse direction fails**: PG14 pg_dump cannot read PG18 server because catalog schema changed.
 
@@ -432,10 +463,10 @@ For zero-downtime cross-version: use logical replication (cross-reference `74-lo
 
     # Restore schema on fresh cluster
     createdb mydb
-    pg_restore -d mydb /backup/mydb_schema.custom
+    pg_restore --exit-on-error -d mydb /backup/mydb_schema.custom
 
     # Reload one table only
-    pg_restore -d mydb /backup/events.data
+    pg_restore --exit-on-error -d mydb /backup/events.data
 
 Useful when one table is recoverable independently or when partial restore is the desired pattern. Beware of FK ordering — load referenced tables first.
 
@@ -558,7 +589,7 @@ Useful for confirming what's actually in an old backup before relying on it for 
 ### Recipe 24 — Strip ownership + grants for portable dumps
 
     pg_dump -Fc -f portable.custom mydb
-    pg_restore --no-owner --no-privileges -d target portable.custom
+    pg_restore --exit-on-error --no-owner --no-privileges -d target portable.custom
 
 Useful when:
 

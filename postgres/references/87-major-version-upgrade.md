@@ -209,7 +209,8 @@ Run new-version cluster in parallel as logical replication subscriber. Cutover =
     # 4. Adjust source for logical replication:
     # postgresql.conf: wal_level = logical, max_replication_slots = N, max_wal_senders = N
     # pg_hba.conf: allow target to connect with REPLICATION privilege
-    # Restart the source if wal_level or other start-only settings changed.
+    # Reload the source after the pg_hba.conf edit (pg_ctl reload);
+    # restart instead if wal_level or another start-only setting changed.
 
     # 5. CREATE PUBLICATION on source (FOR ALL TABLES is canonical):
     psql -h source -d production -c "CREATE PUBLICATION upgrade_pub FOR ALL TABLES;"
@@ -596,8 +597,10 @@ Standard pre-production drill:
 
     # 2. On the isolated host, start and cleanly stop the restored cluster
     # using its original PG major to finish backup recovery.
-    # 3. Initialize a compatible target, matching the source checksum setting:
-    /usr/lib/postgresql/18/bin/initdb -D /tmp/upgrade-target
+    # 3. Initialize a compatible target, matching the source checksum setting.
+    # PG18 initdb enables checksums by default; for a source without them
+    # (SHOW data_checksums = off), add --no-data-checksums.
+    /usr/lib/postgresql/18/bin/initdb -D /tmp/upgrade-target   # [--no-data-checksums]
     /usr/lib/postgresql/18/bin/pg_upgrade --check \
         --old-datadir=/tmp/test-restore \
         --new-datadir=/tmp/upgrade-target \
@@ -652,7 +655,7 @@ Follow the post-upgrade instructions emitted by `pg_upgrade`, including on PG18+
     # Pre-PG18 target:
     vacuumdb --all --analyze-in-stages --jobs=$(nproc)
 
-    # PG18+ target (faster: only fill missing stats):
+    # PG18+ target: first fill relations with no stats, then refresh all:
     vacuumdb --all --analyze-in-stages --missing-stats-only --jobs=$(nproc)
     vacuumdb --all --analyze-only --jobs=$(nproc)
 
