@@ -46,18 +46,18 @@ Pick different file when:
 
 Five rules.
 
-**Rule 1 — Data checksums detect corruption; they do NOT repair it.** When a page checksum mismatch is detected on read, the backend raises an error and aborts the transaction. The detection moves silent disk corruption into a loud, blocking failure — that's the design. Repair requires restoring the affected pages from a backup or replaying WAL. `pg_checksums` enables/disables/verifies cluster-wide; it cannot correct mismatches.
+**Rule 1 — Data checksums detect corruption; they do not repair it.** A checksum mismatch normally aborts the query. Preserve the damaged cluster before repair. Restore a consistent complete backup into a separate cluster and extract recovered data as needed; do not replace individual relation files in the live data directory.[^physical-backup]
 
 **Rule 2 — Indexes corrupt independently of heap.** Heap bytes can be intact while a B-tree index disagrees with the underlying rows (or vice versa). `amcheck` separates the two checks: `bt_index_check` / `bt_index_parent_check` for B-tree structure, `verify_heapam` (PG14+) for heap pages, `gin_index_check` (PG18+) for GIN. Routine `bt_index_check` runs under `AccessShareLock` — safe on a live primary. `bt_index_parent_check` upgrades to `ShareLock` and blocks writes.
 
 **Rule 3 — `pg_resetwal` is last-resort and destroys data integrity guarantees.** Verbatim docs warning: *"It should be used only as a last resort, when the server will not start due to such corruption. After running this command, it should be possible to start the server, but bear in mind that the database might contain inconsistent data due to partially-committed transactions. You should immediately dump your data, run initdb, and restore."*[^pg-resetwal] Treat the post-`pg_resetwal` cluster as a one-shot dump source, not a production cluster.
 
-**Rule 4 — Single-user mode is for catalog rescue and wraparound emergencies, not interactive debugging.** Verbatim: *"The primary use for this mode is during bootstrapping by initdb. Sometimes it is used for debugging or disaster recovery; note that running a single-user server is not truly suitable for debugging the server, since no realistic interprocess communication and locking will happen."*[^postgres-single] No background processing — no autovacuum, no checkpointer, no replication. Use it for `VACUUM FREEZE` when autovacuum can't start (wraparound), for `REINDEX SYSTEM` when a system catalog index is broken, and as a path into a cluster that won't accept multi-user connections.
+**Rule 4 — Single-user mode is for expert-directed catalog rescue.** It has no automatic checkpoints, autovacuum, or replication. Ordinary wraparound recovery uses multi-user `VACUUM`, without `FULL` or `FREEZE`; see [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md).[^routine-vacuum]
 
-**Rule 5 — Test corruption hypothesis with `pg_dump` before invoking destructive tools.** If a `pg_dump` of the entire cluster succeeds, the storage is internally consistent enough for logical extraction — corruption is likely localized. If `pg_dump` fails on a specific table or index, the failure narrows the investigation. Run `pg_dump -Fc --no-blobs --schema-only` first (catalog walk), then `pg_dump -Fc` (full extraction). `pg_dump` reads every visible row through MVCC; it surfaces page-level corruption as it goes.
+**Rule 5 — Successful extraction does not prove integrity.** A schema-only `pg_dump` checks whether catalog definitions can be extracted; a full dump reads visible table data. Neither proves that rows are complete, indexes are correct, or application invariants hold. Use `amcheck` as an additional diagnostic, not a certificate of corruption-freeness.[^amcheck-docs]
 
-> [!WARNING] `pg_resetwal` and `zero_damaged_pages` destroy data
-> Both tools allow the cluster to keep running by skipping over corrupted bytes — but the bytes they skip are *real rows*. `pg_resetwal` discards uncommitted-but-WAL-only changes (in-flight transactions) and may reuse OIDs from committed-but-not-yet-checkpointed pages. `zero_damaged_pages` zeroes a damaged 8 KB page in memory destroying every tuple on it. Both produce a cluster suitable for one `pg_dump` and one `initdb`+restore, nothing more. Take a `cp -a $PGDATA` byte-level copy BEFORE touching either.
+> [!WARNING] Preserve evidence before salvage
+> Stop and isolate the damaged server and preserve a complete filesystem copy or consistent snapshot, including external WAL and every tablespace, before attempting repairs. `cp -a "$PGDATA"` alone preserves symlinks, not their external targets. Work on a separate copy with its paths isolated from the original. `pg_resetwal` discards recovery information; `zero_damaged_pages` discards every row on a damaged page. Neither repairs logical consistency.[^physical-backup][^corruption-wiki]
 
 > [!WARNING] PG18: data checksums on by default
 > Verbatim PG18 release-note: *"Change initdb to default to enabling checksums. The new initdb option `--no-data-checksums` disables checksums."*[^pg18-checksums-default] Clusters initialized on PG18+ have checksums on out of the box. `pg_upgrade` from a non-checksum cluster onto a PG18+ default-checksum new cluster fails the consistency-check phase — initialize the new cluster with `initdb --no-data-checksums`, then run `pg_checksums --enable` post-upgrade once the cluster is stopped.
@@ -68,7 +68,7 @@ Five rules.
 
 | Symptom / goal | Tool / action | Notes |
 |---|---|---|
-| `ERROR: invalid page in block N` on a query | `amcheck` → identify corrupt index vs heap; restore page from backup. | Cross-reference Recipe 4. |
+| `ERROR: invalid page in block N` on a query | Preserve the cluster, identify the relation, and diagnose index vs heap damage. | Restore a consistent backup separately; see Recipe 4. |
 | Suspect silent corruption (no error yet) | `pg_amcheck --all --jobs=N` weekly. | PG14+. |
 | Suspect index corruption only | `SELECT bt_index_check('myidx'::regclass);` | `AccessShareLock` — safe in production. |
 | Suspect index structure + parent/child invariants | `SELECT bt_index_parent_check('myidx'::regclass);` | `ShareLock` — blocks writes. |
@@ -76,16 +76,16 @@ Five rules.
 | Suspect GIN-index corruption | `SELECT gin_index_check('myidx'::regclass);` | PG18+. |
 | Enable checksums on existing cluster | `pg_checksums --enable -D $PGDATA` | Cluster must be **cleanly shut down**. |
 | Verify checksums on offline cluster | `pg_checksums --check -D $PGDATA` | Default mode. |
-| Cluster will not start, WAL corrupt | `pg_resetwal -D $PGDATA` then dump+restore | Last resort. Take byte-level backup first. |
+| Cluster will not start because of WAL/control corruption | Expert-directed `pg_resetwal` on a preserved, isolated copy; see Recipe 8 | Last resort, followed immediately by dump and restore into a new cluster. |
 | Catalog-index corruption blocks startup | `postgres --single` + `REINDEX SYSTEM <db>` | Then restart normally. |
-| Wraparound emergency, autovacuum can't run | `postgres --single` + `VACUUM FREEZE` | Cross-reference [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md). |
-| Pre-upgrade integrity check | `pg_amcheck --all`, then `pg_dump --schema-only` | Run on a recent base-backup replica, not production. |
-| Damaged page on one block, willing to lose rows | `SET zero_damaged_pages = on;` then `VACUUM FULL` table | **Destructive** — last resort before restore from backup. |
+| Wraparound hard stop | Resolve blockers and run ordinary database-wide `VACUUM` as superuser in multi-user mode | Do not use `FULL`, `FREEZE`, or `pg_resetwal`.[^routine-vacuum] |
+| Pre-upgrade integrity check | `pg_amcheck --all`, then `pg_dump --schema-only` | Use an isolated restored clone for disruptive checks. |
+| Damaged page, no usable backup, accepted row loss | Expert-directed salvage with session-scoped `zero_damaged_pages` on an isolated copy | Extract readable rows and restore separately; see Recipe 9. |
 
 Three smell signals — wrong tool for the situation:
 
 - **`pg_resetwal -f` as a first response to a startup error.** Read the log first. Most "won't start" cases are recoverable without resetting WAL (config error, missing tablespace mount, exhausted disk, wraparound).
-- **`zero_damaged_pages = on` set cluster-wide as a "safety" default.** This is a one-shot escape hatch, not a configuration. Setting it cluster-wide can mask further corruption and propagate zeroed pages to disk during the next checkpoint.
+- **`zero_damaged_pages = on` set cluster-wide as a default.** Keep it confined to the salvage session. Zeroed buffers are not forced to disk; a checkpoint does not guarantee that the damaged on-disk page is replaced.[^zero-damaged]
 - **Running `bt_index_parent_check` on every index in production.** Acquires `ShareLock` — blocks writes. Use `bt_index_check` for routine; reserve `--parent-check` / `bt_index_parent_check` for after-the-fact incident investigation on a maintenance window.
 
 ## Mechanics
@@ -188,7 +188,7 @@ Verbatim docs: *"pg_checksums checks, enables or disables data checksums in a Po
 
 | Mode | Behavior |
 |---|---|
-| `--check` (default) | Verify every page; exit nonzero on first checksum failure. |
+| `--check` (default) | Verify checksums; exit nonzero if any failure is found. Requires checksums to be enabled. |
 | `--enable` | Rewrite every page with its computed checksum, flip cluster-control flag on. |
 | `--disable` | Flip cluster-control flag off (no page rewrites). |
 
@@ -197,7 +197,7 @@ Verbatim docs: *"pg_checksums checks, enables or disables data checksums in a Po
 - Cluster MUST be cleanly shut down (`pg_ctl stop -m fast` not `-m immediate`; `pg_controldata` must show `Database cluster state: shut down`).
 - `--enable` is time-proportional to data size — every relation page gets read, checksummed, and rewritten. For TB clusters, plan multi-hour offline window.
 - Verbatim warning: *"Enabling checksums in a large cluster can potentially take a long time. During this operation, the cluster or other programs that write to the data directory must not be started or else data loss may occur."*[^pg-checksums]
-- On replicated clusters: run on each replica separately AFTER stopping replication, then re-sync. Don't enable on the primary while standbys are streaming.
+- For physical replication, stop all nodes and switch their checksum settings consistently, or discard the standbys, convert the stopped primary, and rebuild standbys from it. Do not promote a stale independently converted replica or mix checksum settings with block-copy tools such as `pg_rewind`.[^pg-checksums]
 
 ### `zero_damaged_pages` and `ignore_checksum_failure`
 
@@ -209,16 +209,19 @@ Verbatim `ignore_checksum_failure` docs: *"Setting ignore_checksum_failure to on
 
 **Distinction:**
 
-- `zero_damaged_pages` — fires on **page-header** corruption (the layout-byte sanity check). Zeroes the page in memory; subsequent checkpoint persists the zeroed page to disk.
-- `ignore_checksum_failure` — fires only on **checksum** mismatch; only meaningful when data checksums are enabled. Reads the page anyway and lets the backend continue.
+- `zero_damaged_pages` zeroes, in memory, any page that fails read verification: a damaged page header, or a checksum failure when data checksums are enabled. Every row on that page is lost. PostgreSQL does not force the zeroed page to disk; recreating the affected relation is needed before returning to normal use.[^zero-damaged]
+- `ignore_checksum_failure` fires only on **checksum** mismatch and only when data checksums are enabled. It reads a checksum-failed page anyway when the page header is sane, so the rows on it stay readable; a corrupt header still errors. Try it before `zero_damaged_pages` when the goal is to read such a page rather than discard it.[^ignore-checksum]
 
-**Usage pattern (last-resort, destructive):**
+**Usage pattern (expert-directed salvage on an isolated copy):**
 
-    -- Session-local:
-    SET LOCAL zero_damaged_pages = on;
-    -- Force the damaged page to be loaded, zeroed, and (eventually) checkpointed:
-    VACUUM FULL mytable;       -- or: SELECT * FROM mytable;
-    -- IMMEDIATELY pg_dump and restore. The zeroed page is now real.
+    -- In one privileged psql session, after accepting loss of damaged-page rows:
+    SET zero_damaged_pages = on;
+    \copy public.mytable TO '/tmp/mytable-survivors.csv' WITH (FORMAT csv, HEADER true)
+    RESET zero_damaged_pages;
+
+The docs recommend recreating the table before turning `zero_damaged_pages` off, because the zeroed pages exist only in memory. If you rebuild on this salvage copy instead of in a fresh cluster, run `CREATE TABLE ... AS SELECT` from the damaged table in the same session, before `RESET`.[^zero-damaged]
+
+Treat the export as incomplete. If extraction fails, preserve the error and investigate rather than trusting a partially written CSV. Recreate the table or restore into a fresh cluster and reconcile constraints and application data. `SET LOCAL` outside a transaction would not persist to the extraction, and `VACUUM` cannot run inside a transaction block.[^zero-damaged]
 
 ### `ignore_system_indexes`
 
@@ -249,16 +252,15 @@ Rules:
 
 **Canonical uses:**
 
-- **Wraparound emergency** when autovacuum can't start: `VACUUM FREEZE;` cross-reference [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md).
-- **System-index corruption:** `REINDEX SYSTEM <dbname>;` then exit and start the multi-user server normally.
-- **Catalog manual surgery:** rare; e.g., delete a stuck row from `pg_class` after a crash mid-CREATE.
+- **System-index corruption:** start with `ignore_system_indexes=on`, run `REINDEX SYSTEM <dbname>;`, then exit and restart normally.
+- **Other catalog damage:** obtain case-specific recovery advice; do not delete catalog rows as a generic repair.
 
 **Cannot do in single-user mode:**
 
 - Run two psql sessions side-by-side (it's single-process by definition).
 - Use `LISTEN` / `NOTIFY` (no IPC).
 - Replication — `walsender` doesn't run.
-- Connect via TCP — Unix socket only, but `psql` cannot connect either; you talk to the process via its own stdin/stdout.
+- Connect via TCP or Unix socket: there is no client listener. Commands go directly to the process's stdin/stdout.
 
 ### `pg_resetwal` Last-Resort Recovery
 
@@ -268,40 +270,18 @@ Verbatim: *"After running this command, it should be possible to start the serve
 
 Verbatim about `-f` / `--force`: *"the recovered database must be treated with even more suspicion than usual: an immediate dump and restore is imperative. Do not execute any data-modifying operations in the database before you dump, as any such action is likely to make the corruption worse."*[^pg-resetwal]
 
-**When it's the right answer:**
+**Potential last-resort candidates, after ruling out recoverable causes and usable backups:**
 
-- `pg_control` is unreadable or contains a checksum that fails.
-- WAL files in `pg_wal/` are missing or truncated at the current segment.
-- The server logs `could not locate a valid checkpoint record`.
+- Corrupt `pg_control` or WAL prevents startup.
+- `could not locate a valid checkpoint record` persists after verifying the correct data directory, mounts, and available WAL or backup recovery paths.
 
 **When it's NOT the right answer:**
 
 - Cluster ran out of disk and won't start — free space, don't reset WAL.
-- Wraparound shutdown — use `postgres --single` + `VACUUM FREEZE`, not `pg_resetwal`.
-- `invalid page in block N of relation ...` from one table — that's a relfile issue, not a WAL issue. Use `amcheck` + page surgery + restore from backup.
+- Wraparound hard stop: resolve blockers and run ordinary `VACUUM` in multi-user mode, without `FULL` or `FREEZE`.[^routine-vacuum]
+- `invalid page in block N of relation ...` from one table: diagnose the relation and restore from a consistent backup; resetting WAL does not repair a data page.
 
-**Procedure (when truly necessary):**
-
-    # 1. Stop the server. Confirm it's stopped:
-    pg_ctl -D $PGDATA stop -m immediate
-    pg_controldata $PGDATA | grep "Database cluster state"
-    # Expected: "Database cluster state: shut down" — if not, try -m fast first.
-
-    # 2. Take a byte-level backup:
-    cp -a $PGDATA /backup/cluster-pre-resetwal-$(date +%F)
-
-    # 3. Dry run — inspect what pg_resetwal would set:
-    pg_resetwal -n -D $PGDATA
-
-    # 4. Actually reset (only if dry run looks sane):
-    pg_resetwal -D $PGDATA
-
-    # 5. Start the cluster:
-    pg_ctl -D $PGDATA start
-
-    # 6. IMMEDIATELY: pg_dumpall > rescue.sql
-
-    # 7. initdb a fresh cluster, restore from rescue.sql.
+**Procedure:** follow Recipe 8 below. Use the same major-version binaries as the damaged cluster. A dry run reports proposed control values, not a verdict that they are safe. Do not add `-f` merely because the output looks plausible.[^pg-resetwal]
 
 PG18+ also adds `--char-signedness` to `pg_resetwal` for cross-platform restoration scenarios — verbatim: *"Add pg_resetwal option --char-signedness to change the default char signedness (Masahiko Sawada)."*[^pg18-charsign-resetwal]
 
@@ -310,14 +290,14 @@ PG18+ also adds `--char-signedness` to `pg_resetwal` for cross-platform restorat
 `pg_dump` reads every row through the executor. If a page is corrupt and the rows on it are visible to the dump snapshot, `pg_dump` either:
 
 - Errors out with `ERROR: invalid page in block N` — narrows the corruption to a specific relation + block, OR
-- Successfully extracts every readable row, proving the cluster is logically consistent (no missing rows from visible snapshot's view).
+- Successfully extracts the visible rows it can read. This does not prove logical consistency, absence of missing rows, or absence of index corruption.
 
 **Three-pass diagnostic:**
 
     # Pass 1 — fast: catalog walk + schema-only. Detects catalog-side issues.
     pg_dump -d mydb --schema-only -Fc -f /dev/null 2> /tmp/dump-schema.log
 
-    # Pass 2 — full extraction, sequential. Detects heap + index corruption.
+    # Pass 2 — full logical extraction. Can expose damaged readable heap/TOAST pages.
     pg_dump -d mydb -Fc -f /dev/null 2> /tmp/dump-full.log
 
     # Pass 3 — per-table parallel narrows the failing relation:
@@ -325,11 +305,11 @@ PG18+ also adds `--char-signedness` to `pg_resetwal` for cross-platform restorat
 
 What `pg_dump` does NOT catch:
 
-- Index corruption where heap is fine and index just has wrong entries — `pg_dump` reads heap directly via sequential scan; it never traverses indexes.
-- Visibility/MVCC corruption where rows are present but marked invisible.
-- Corruption on pages that hold no live visible rows from `pg_dump`'s snapshot view.
+- Index corruption on ordinary table indexes: `pg_dump` normally reads table data rather than validating each index.
+- Visibility/MVCC corruption that makes rows incorrectly invisible.
+- Other structural or application inconsistencies outside the dump's visible data.
 
-That's why `pg_amcheck` (heap + index) is the canonical pre-upgrade audit, not `pg_dump`.
+Use both extraction and appropriate `amcheck` checks. The manual states that `amcheck` can prove the presence of corruption, but cannot prove its absence.[^amcheck-docs]
 
 ### WAL Reliability + Underlying Storage
 
@@ -342,7 +322,7 @@ Page checksums and `amcheck` detect corruption that's already on disk. Preventin
 **Don't disable for "performance":**
 
 - `fsync = off` — crash-unsafe; cluster can corrupt on power loss.
-- `full_page_writes = off` — only safe on filesystems that guarantee atomic 8 KB writes (ZFS, btrfs with the right options); cross-reference [`33-wal.md`](./33-wal.md).
+- `full_page_writes = off`: risks unrecoverable corruption unless the complete storage stack has verified protection against partial PostgreSQL-page writes. A filesystem name or copy-on-write label alone is not sufficient justification.
 - `synchronous_commit = off` — loses recent committed transactions on crash but does not corrupt the cluster.
 
 Cross-reference [`33-wal.md`](./33-wal.md) and [`34-checkpoints-bgwriter.md`](./34-checkpoints-bgwriter.md).
@@ -361,8 +341,9 @@ Cross-reference [`33-wal.md`](./33-wal.md) and [`34-checkpoints-bgwriter.md`](./
 
 ### Recipe 1 — Routine `pg_amcheck` Weekly Sweep
 
-Production baseline. Runs as a `pg_cron` (or systemd) weekly job. Cross-reference [`98-pg-cron.md`](./98-pg-cron.md).
+Run from an operating-system scheduler such as cron or systemd; `pg_amcheck` is an external program, not a SQL command that `cron.schedule()` can execute directly.
 
+    set -o pipefail
     pg_amcheck \
         --all \
         --jobs=4 \
@@ -371,11 +352,11 @@ Production baseline. Runs as a `pg_cron` (or systemd) weekly job. Cross-referenc
         --verbose \
         2>&1 | tee /var/log/postgresql/amcheck-$(date +%F).log
 
-    # Exit code 0 = no corruption. Anything else = investigate.
+    # A nonzero status requires investigation; zero means no error was detected.
     # Use --parent-check for deep audit only during scheduled windows
     # (it acquires ShareLock and blocks writes on each index).
 
-Alert when log contains the words `corruption`, `inconsistent`, or `invalid`.
+Alert on a nonzero process status and preserve the full output. A zero status does not prove that all possible corruption was excluded.
 
 ### Recipe 2 — Find a Specific Index's Corruption
 
@@ -424,26 +405,19 @@ For a fast survey of all heap relations in a database:
 
 Hit during query or VACUUM. Triage:
 
-    -- 1. Identify the relfile from the OID in the error message
-    --    (the path looks like `base/16384/24576`):
-    SELECT relname, pg_relation_filepath(oid)
-    FROM pg_class WHERE oid = 24576;
+    -- In the database identified by base/16384, map the filenode to a relation.
+    -- A filenode is not necessarily the relation's catalog OID.
+    -- Tablespace 0 means the database's default tablespace, which base/ paths use.
+    SELECT pg_filenode_relation(0, 24576) AS damaged_relation;
 
-    -- 2. Determine if it's an index or a heap:
-    SELECT relkind FROM pg_class WHERE oid = 24576;
-    -- 'r' = heap, 'i' = index, 't' = TOAST table, 'm' = matview.
+    SELECT c.oid::regclass, c.relkind, pg_relation_filepath(c.oid)
+    FROM pg_class c
+    WHERE c.oid = pg_filenode_relation(0, 24576);
+    -- 'r' = table, 'i' = index, 't' = TOAST table, 'm' = matview.
 
-    -- 3a. If index: drop + recreate (lose nothing):
-    REINDEX INDEX CONCURRENTLY corrupt_idx;
+After preserving the damaged cluster, a rebuild may repair isolated index damage if the heap and comparison semantics are sound. Use the appropriate `REINDEX` procedure; a corrupt system index needs the system-index rescue path.
 
-    -- 3b. If heap or TOAST: restore the file from a recent base backup
-    --     (cross-reference 84-backup-physical-pitr.md), then replay WAL.
-
-    -- 3c. If no backup AND can lose the rows on that page:
-    SET LOCAL zero_damaged_pages = on;
-    VACUUM FULL corrupt_table;
-    -- Zeros the damaged page in memory; next checkpoint persists it.
-    -- Dump and restore the whole cluster after this step.
+For heap or TOAST damage, restore a complete backup and replay required WAL on a separate isolated cluster. Extract recovered data logically; do not copy an old relfile into the current cluster. Without a usable backup, Recipe 9 describes incomplete-data salvage.[^physical-backup]
 
 ### Recipe 5 — Enable Checksums on an Existing Cluster (Offline)
 
@@ -456,11 +430,11 @@ Cluster moving from `data_checksums = off` to `on`:
     pg_controldata $PGDATA | grep "Database cluster state"
     # Must show "shut down" — not "shut down in recovery" or "in production".
 
-    # 3. Dry-run check (default mode):
-    pg_checksums --check -D $PGDATA
+    # 3. Enable checksums. --check cannot validate a cluster with checksums disabled.
+    pg_checksums --enable --progress -D "$PGDATA"
 
-    # 4. Enable (rewrites every relation page — time proportional to data size):
-    pg_checksums --enable --progress -D $PGDATA
+    # 4. Verify checksums before startup:
+    pg_checksums --check -D "$PGDATA"
 
     # 5. Verify the flip happened:
     pg_controldata $PGDATA | grep checksum
@@ -469,26 +443,19 @@ Cluster moving from `data_checksums = off` to `on`:
     # 6. Start the cluster:
     pg_ctl -D $PGDATA start
 
-For replicated clusters: do this on a stopped replica first, take a fresh `pg_basebackup` from the new-checksums replica, promote it, then re-sync the rest of the topology. Cross-reference [`73-streaming-replication.md`](./73-streaming-replication.md).
+For physical replication, stop and convert every node consistently, or convert the stopped primary and recreate its standbys from a fresh base backup. Do not use `pg_rewind` between nodes with different checksum settings.[^pg-checksums]
 
-### Recipe 6 — Single-User Mode for Wraparound Emergency
+### Recipe 6 — Wraparound Hard Stop
 
-Database refuses connections, log says `database is not accepting commands to avoid wraparound data loss`. Cross-reference [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md).
 
-    # 1. Stop the cluster:
-    pg_ctl -D $PGDATA stop -m fast
+The error `database is not accepting commands to avoid wraparound data loss` blocks new XID allocation, not ordinary VACUUM or all connections. Keep the server in multi-user mode.
 
-    # 2. Enter single-user mode in the affected database:
-    postgres --single -D $PGDATA mydb
+1. Connect as a superuser to the affected database.
+2. Inspect old prepared transactions, running transactions, and replication slots. Resolve each with its owner or coordinator; do not guess a prepared transaction's outcome.
+3. Execute `VACUUM (VERBOSE);` outside a transaction block. Do not specify `FULL` or `FREEZE`.
+4. Monitor `age(datfrozenxid)` and correct the maintenance failure after ordinary writes resume.
 
-    # At the backend > prompt (newline terminates):
-    backend> VACUUM FREEZE;
-
-    # 3. After VACUUM completes, Ctrl-D to exit.
-    # 4. Start the cluster normally:
-    pg_ctl -D $PGDATA start
-
-If multiple databases need freezing, run `postgres --single` once per database.
+Follow [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md#recipe-9--hard-stop-level-cluster-refusing-commands) for diagnostics. Single-user mode disables wraparound safeguards and is reserved here for expert-directed removal of unneeded tables, not routine vacuum recovery.[^routine-vacuum]
 
 ### Recipe 7 — Single-User Mode for System-Index Corruption
 
@@ -508,66 +475,47 @@ Catalog index corrupt — backend can't look up its own tables.
 
 ### Recipe 8 — `pg_resetwal` Last-Resort
 
-Server won't start; log shows `could not locate a valid checkpoint record`:
+Use this only when WAL or control-file corruption prevents startup and a usable backup recovery path is unavailable. A missing checkpoint error alone does not establish that reset is necessary.
 
-    # 1. Confirm the server is stopped (no postmaster pid):
-    pg_ctl -D $PGDATA status
+1. Stop and isolate the damaged cluster. If it is running and responds, use a fast shutdown, not immediate shutdown. Verify that no server process remains; do not rely solely on `pg_control` state or delete a lock file while a server might be alive.
+2. Preserve the complete damaged cluster, including every external tablespace and WAL directory. Keep that copy unchanged. Prepare a separate salvage copy with symlinks and configuration pointing only to its own files.
+3. Use same-major binaries to inspect the salvage copy:
 
-    # 2. Byte-level backup of the data directory — ESSENTIAL:
-    cp -a $PGDATA /backup/cluster-pre-resetwal-$(date -u +%FT%H%M%SZ)
+        pg_resetwal --dry-run -D "$SALVAGE_PGDATA"
 
-    # 3. Dry run — see what pg_resetwal would set without writing:
-    pg_resetwal -n -D $PGDATA
+4. Have a PostgreSQL recovery specialist determine the control values. `-f` substitutes guessed fields when valid control data cannot be determined; it is not a normal next step after a plausible dry run. If reset is justified, run it only against the stopped salvage copy:
 
-    # 4. Run for real:
-    pg_resetwal -D $PGDATA
+        pg_resetwal -D "$SALVAGE_PGDATA"
 
-    # 5. Start:
-    pg_ctl -D $PGDATA start
+5. Start the salvage cluster isolated from applications, replication, and scheduled writers. Immediately dump readable data without application writes:
 
-    # 6. IMMEDIATELY dump (do NOT do any writes first):
-    pg_dumpall > /tmp/rescue.sql
+        pg_dumpall -h "$SALVAGE_SOCKET" -p "$SALVAGE_PORT" -f /backup/rescue.sql
 
-    # 7. initdb a fresh cluster on new $PGDATA:
-    /usr/lib/postgresql/16/bin/initdb --data-checksums -D /var/lib/postgresql/16/new
+6. Initialize and start a **separate new cluster**, with its own data directory and endpoint. Prepare `/backup/rescue-reviewed.sql` as a reviewed copy using the [logical restore preparation](83-backup-pg-dump.md), including reconciliation of the target's existing bootstrap role. Restore the reviewed copy explicitly to the new endpoint, never to the salvage server:
 
-    # 8. Restore:
-    psql -d postgres -f /tmp/rescue.sql
+        psql -X -v ON_ERROR_STOP=1 -h "$NEW_SOCKET" -p "$NEW_PORT" -d postgres -f /backup/rescue-reviewed.sql
 
-    # 9. Decommission the old data dir. Run pg_amcheck on the new one
-    #    to confirm the restored cluster is clean.
+7. Resolve any restore errors. Check constraints, business invariants, missing or duplicate rows, and appropriate `amcheck` diagnostics before reopening service. Keep the original and salvage copies until recovery is validated.[^pg-resetwal][^physical-backup]
 
 Never write to the post-`pg_resetwal` cluster before dumping — verbatim: *"any such action is likely to make the corruption worse"*[^pg-resetwal].
 
 ### Recipe 9 — Recover One Damaged Page (Destructive)
 
-When a single block is damaged, no backup is available, and losing the rows on that page is acceptable:
+Use this only on an isolated salvage copy after preserving the original cluster and accepting the loss of every row on a damaged page. `zero_damaged_pages` zeroes pages with a damaged header or, with data checksums on, a checksum failure; it does not repair tuple or TOAST corruption on pages that pass verification. To read a checksum-failed page with a sane header instead of zeroing it, use `ignore_checksum_failure`.[^zero-damaged][^ignore-checksum]
 
-    -- 1. Confirm the block number from the error:
-    --    ERROR: invalid page in block 147 of relation base/16384/24576
+    -- In the affected database, identify the relation from the logged path.
+    SELECT c.oid::regclass, c.relkind
+    FROM pg_class c
+    WHERE pg_relation_filepath(c.oid) = 'base/16384/24576';
 
-    -- 2. Identify the table:
-    SELECT relname FROM pg_class WHERE pg_relation_filepath(oid) = 'base/16384/24576';
-    -- => 'orders'
+    -- In the same privileged psql session:
+    SET zero_damaged_pages = on;
+    \copy public.orders TO '/tmp/orders-survivors.csv' WITH (FORMAT csv, HEADER true)
+    RESET zero_damaged_pages;
 
-    -- 3. Save anything still readable from the table:
-    \copy (SELECT * FROM orders) TO '/tmp/orders-survivors.csv' CSV HEADER
-    -- This may itself raise on block 147 — capture what comes out before.
+To rebuild on this salvage copy, create the replacement table with `CREATE TABLE ... AS SELECT` in the same session before `RESET`, as the docs recommend.
 
-    -- 4. Set session-local zero_damaged_pages and force-read:
-    SET LOCAL zero_damaged_pages = on;
-    VACUUM FULL orders;
-    -- The damaged page is zeroed in memory and persisted at next checkpoint.
-
-    -- 5. Force checkpoint to persist the zeroed page (cross-reference 34):
-    CHECKPOINT;
-
-    -- 6. Run pg_amcheck on the cluster to confirm only this one
-    --    relation lost data, nothing else surfaced:
-    \q
-    pg_amcheck --all --jobs=4
-
-    -- 7. Plan a logical dump+restore (this cluster has a known-zeroed page).
+Check that the export completed. A partial CSV from a failed COPY is not a valid backup. Zeroed buffers are not forced to disk, so `CHECKPOINT` is not a repair procedure. Restore readable data into a fresh cluster or recreate the affected relation, and reconcile lost rows, foreign keys, uniqueness, and application invariants before reuse.[^zero-damaged]
 
 ### Recipe 10 — Pre-Upgrade Integrity Audit
 
@@ -632,34 +580,34 @@ When checksums on the primary disagree with a streaming replica. Cross-reference
     SELECT bt_index_check('public.suspect_idx'::regclass, heapallindexed => true);
     SELECT * FROM verify_heapam('public.suspect'::regclass);
 
-    -- Compare. Mismatch on replica only -> rebuild replica from primary
-    --   (pg_basebackup or pg_rewind, see 89-pg-rewind.md).
-    -- Mismatch on primary only -> primary disk fault; failover + rebuild old primary.
+    -- Findings only on replica: isolate it and normally rebuild from a verified primary.
+    -- Findings only on primary: preserve evidence and verify a candidate standby's
+    -- integrity and replay position before a fenced failover.
 
 ## Gotchas / Anti-patterns
 
 23 gotchas. Roughly ordered most-leveraged first.
 
 1. **`pg_resetwal` as first response to a startup error.** Read `pg_log/*.log` first. Most "won't start" cases are config errors, missing tablespace mounts, full disk, or wraparound — none need `pg_resetwal`. Verbatim docs: *"It should be used only as a last resort"*[^pg-resetwal].
-2. **No byte-level backup before `pg_resetwal` or `zero_damaged_pages`.** Both are destructive. `cp -a $PGDATA /backup/...` first, every time.
-3. **`zero_damaged_pages = on` set in `postgresql.conf` cluster-wide.** Session-local only. Cluster-wide masks future corruption and persists zeroed pages on subsequent checkpoint.
-4. **`pg_checksums --enable` on a running cluster.** Refuses to start AND would corrupt if it didn't. Verbatim: *"The server must be shut down cleanly before running pg_checksums"*[^pg-checksums].
-5. **`pg_checksums --enable` on a primary while standbys stream.** Each standby gets corrupt pages from the primary's not-yet-fully-rewritten state. Always do the conversion on a stopped replica, take a base backup, then re-build the topology.
+2. **Incomplete preservation before salvage.** Stop the server and copy or snapshot the complete cluster, including external WAL and tablespaces. Preserve the original unchanged.[^physical-backup]
+3. **`zero_damaged_pages = on` set cluster-wide.** Confine it to a salvage session on an isolated copy. It discards rows and does not force zeroed buffers to disk.[^zero-damaged]
+4. **`pg_checksums --enable` on a running cluster.** The server must be cleanly shut down and remain stopped throughout conversion.[^pg-checksums]
+5. **Inconsistent checksum settings in a physical replication topology.** Stop and switch all nodes consistently, or convert the stopped primary and rebuild standbys. Block-copy tools such as `pg_rewind` can otherwise introduce invalid checksums.[^pg-checksums]
 6. **`bt_index_parent_check` run cluster-wide on a production primary.** Acquires `ShareLock` per index. Schedule for a maintenance window. Use `bt_index_check` for routine.
-7. **`bt_index_parent_check` on a hot-standby replica.** Cannot run on standbys — requires writes to update validation state. Use `bt_index_check` on standbys.
+7. **`bt_index_parent_check` on a hot standby.** Its required `ShareLock` is not permitted during recovery. Use the lighter `bt_index_check` there.[^amcheck-docs]
 8. **Skipping `verify_heapam` because amcheck = "index checker".** Incorrect assumption since PG14 — `verify_heapam` was added to amcheck in PG14 and covers heap pages, TOAST tables, sequences, and matviews, not just B-tree indexes[^pg14-verifyheap].
 9. **`pg_amcheck` `--parent-check` + `--rootdescend` on every weekly sweep.** Both elevate locks. Reserve for after-incident audits.
 10. **Ignoring `pg_stat_database.checksum_failures`.** Wire it to alerting. Cross-reference [`82-monitoring.md`](./82-monitoring.md).
 11. **PG18 default-on checksums breaks `pg_upgrade` from non-checksum cluster.** Verbatim: *"pg_upgrade requires matching cluster checksum settings"*[^pg18-checksums-default]. New cluster needs `initdb --no-data-checksums` first; convert after with `pg_checksums --enable` while stopped.
-12. **`single-user` mode used for "interactive debugging".** Verbatim: *"not truly suitable for debugging the server, since no realistic interprocess communication and locking will happen"*[^postgres-single]. No checkpointer, no autovacuum, no logical decoding. Use only for catalog rescue and wraparound.
+12. **Single-user mode as a routine wraparound remedy.** Keep multi-user mode and run ordinary `VACUUM`; single-user mode disables wraparound safeguards.[^routine-vacuum]
 13. **`postgres --single` with `--single` not first argument.** Refuses to start. `--single` MUST be first; database name MUST be last.
 14. **Forgetting newline terminates statements in single-user mode.** Multi-line CREATE TABLE silently parses only the first line. Use `\` line-continuations or pass `-j` to switch to `;\n\n` terminator.
 15. **Running `REINDEX SYSTEM` against a multi-user-mode cluster while writes happen.** Locks every system catalog index in turn — writers block. Either do it during a maintenance window OR in single-user mode where contention is trivially zero.
-16. **`pg_dump` taken as proof of corruption-freeness.** `pg_dump` reads heap directly via seq-scan; never traverses indexes. Index-only corruption (`bt_index_check` finds it, `pg_dump` doesn't) slips past. Run `pg_amcheck` for the complete picture.
+16. **Successful `pg_dump` or `amcheck` as proof of complete integrity.** Dumps do not validate every index or application invariant. `amcheck` detects supported corruption classes but cannot prove their absence.[^amcheck-docs]
 17. **`ignore_checksum_failure = on` left enabled in `postgresql.conf`.** Verbatim: *"This behavior may cause crashes, propagate or hide corruption, or other serious problems"*[^ignore-checksum]. Session-local only; reset immediately.
-18. **`ignore_system_indexes = on` left in `postgresql.conf` after the rescue session.** System catalogs perform terribly without their indexes. `REINDEX SYSTEM` and remove the GUC.
-19. **`pg_resetwal -f` used to bypass an integrity warning the tool actively raised.** The `-f` flag escalates the warning — verbatim: *"the recovered database must be treated with even more suspicion than usual"*[^pg-resetwal]. Use only when even `pg_control` is unreadable.
-20. **Believing a checksum failure means total cluster corruption.** A single checksum mismatch localizes to one 8 KB page. Identify the relfile (Recipe 4) and restore that block or rebuild that one object.
+18. **`ignore_system_indexes = on` left enabled after rescue.** Rebuild affected system indexes and remove the setting before normal use.
+19. **`pg_resetwal -f` as a routine escalation.** It permits guessed control fields and can worsen corruption. Use it only with expert-directed reconstruction on a preserved salvage copy.[^pg-resetwal]
+20. **A checksum mismatch treated as permission to replace a page or relfile.** Preserve evidence and recover a consistent complete cluster separately; individual-file replacement can introduce further inconsistency.[^physical-backup]
 21. **Running `gin_index_check` on pre-PG18 cluster.** Function doesn't exist before PG18[^pg18-gin-check]. For GIN on PG14-17, the only recourse is `REINDEX` on suspicion.
 22. **Running `amcheck --checkunique` on pre-PG17 cluster.** Flag added in PG17[^pg17-checkunique]. Pre-PG17, write your own SQL: `SELECT key, count(*) FROM tbl GROUP BY key HAVING count(*) > 1`.
 23. **No regular `pg_amcheck` sweep — only checking after a customer reports missing data.** Latency-to-detection becomes weeks. Schedule weekly (Recipe 1) at minimum; daily on storage you don't trust.
@@ -668,8 +616,8 @@ When checksums on the primary disagree with a streaming replica. Cross-reference
 
 - [`26-index-maintenance.md`](./26-index-maintenance.md) — REINDEX, CONCURRENTLY rebuild for corrupt indexes
 - [`27-mvcc-internals.md`](./27-mvcc-internals.md) — xmin/xmax visibility, why `pg_dump` doesn't see every row
-- [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md) — VACUUM FREEZE invoked from single-user mode
-- [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md) — wraparound emergency requiring single-user mode
+- [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md) — ordinary maintenance and pre-emptive freezing
+- [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md) — multi-user ordinary-VACUUM emergency recovery
 - [`32-buffer-manager.md`](./32-buffer-manager.md) — how data pages move buffer ↔ disk; relation to checksums
 - [`33-wal.md`](./33-wal.md) — WAL durability, full_page_writes, CRC-32C per record
 - [`34-checkpoints-bgwriter.md`](./34-checkpoints-bgwriter.md) — checkpoint persistence of zeroed pages
@@ -679,8 +627,8 @@ When checksums on the primary disagree with a streaming replica. Cross-reference
 - [`73-streaming-replication.md`](./73-streaming-replication.md) — primary↔replica checksum mismatch diagnosis
 - [`82-monitoring.md`](./82-monitoring.md) — `pg_stat_database.checksum_failures` alert
 - [`83-backup-pg-dump.md`](./83-backup-pg-dump.md) — pg_dump as diagnostic + extraction
-- [`84-backup-physical-pitr.md`](./84-backup-physical-pitr.md) — restoring individual relfiles from base backup
-- [`85-backup-tools.md`](./85-backup-tools.md) — pgBackRest / Barman / WAL-G for per-relation restore
+- [`84-backup-physical-pitr.md`](./84-backup-physical-pitr.md) — complete physical restore and WAL replay on an isolated cluster
+- [`85-backup-tools.md`](./85-backup-tools.md) — pgBackRest, Barman, and WAL-G recovery workflows
 - [`86-pg-upgrade.md`](./86-pg-upgrade.md) — pre-upgrade integrity audit
 - [`87-major-version-upgrade.md`](./87-major-version-upgrade.md) — upgrade strategies, PG18 default-checksum trap
 - [`89-pg-rewind.md`](./89-pg-rewind.md) — re-attach diverged former primary
@@ -725,3 +673,9 @@ When checksums on the primary disagree with a streaming replica. Cross-reference
 [^pg18-checksums-default]: PostgreSQL 18 Release Notes. "Change initdb to default to enabling checksums (Greg Sabino Mullane). The new initdb option --no-data-checksums disables checksums." Migration note: "pg_upgrade requires matching cluster checksum settings, so this new option can be useful to upgrade non-checksum old clusters."
 
 [^pg18-charsign-resetwal]: PostgreSQL 18 Release Notes. "Add pg_resetwal option --char-signedness to change the default char signedness (Masahiko Sawada)."
+
+[^routine-vacuum]: PostgreSQL 16, Routine Vacuuming, wraparound recovery: ordinary VACUUM remains available at the XID hard stop; avoid FULL, FREEZE, and routine single-user recovery. <https://www.postgresql.org/docs/16/routine-vacuuming.html#VACUUM-FOR-WRAPAROUND>
+
+[^physical-backup]: PostgreSQL 16, File System Level Backup: physical backups and restores require a consistent complete cluster; relation files cannot be restored independently of transaction-status storage. Include WAL and tablespaces. <https://www.postgresql.org/docs/16/backup-file.html>
+
+[^corruption-wiki]: PostgreSQL wiki, Corruption: preserve a filesystem-level copy before attempting repairs and perform recovery experiments on a copy. <https://wiki.postgresql.org/wiki/Corruption>

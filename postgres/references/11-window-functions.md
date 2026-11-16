@@ -295,7 +295,7 @@ WINDOW w AS (PARTITION BY depname ORDER BY salary DESC);
 
 | Function | Returns | Meaning |
 |---|---|---|
-| `percent_rank()` | `double precision` | `(rank - 1) / (count - 1)` — value in `[0, 1]`. First row is always 0; last row is always 1 (unless there is only one row, then 0). |
+| `percent_rank()` | `double precision` | `(rank - 1) / (count - 1)` — value in `[0, 1]`. Ties at the end can make the maximum less than 1; a single row returns 0. |
 | `cume_dist()` | `double precision` | `(rows ≤ current) / count` — value in `(0, 1]`. |
 | `ntile(N)` | `integer` | Splits the partition into `N` roughly-equal buckets numbered 1..N. Extra rows go into the lower-numbered buckets. |
 
@@ -499,10 +499,13 @@ reading - lag(reading, 1, reading) OVER (ORDER BY day) AS delta
 Find runs of consecutive days for each user:
 
 ```sql
-WITH labeled AS (
+WITH login_days AS (
+    SELECT DISTINCT user_id, login_date FROM logins WHERE login_date IS NOT NULL
+),
+labeled AS (
     SELECT user_id, login_date,
            login_date - (row_number() OVER (PARTITION BY user_id ORDER BY login_date))::int AS grp
-    FROM logins
+    FROM login_days
 ),
 islands AS (
     SELECT user_id, grp,
@@ -624,7 +627,7 @@ FROM orders;
 `FILTER` is preferred over `sum(CASE WHEN status = 'fulfilled' THEN 1 ELSE 0 END)` because:
 
 - It is clearer.
-- It produces NULL (not 0) when no row matches inside the frame — sometimes useful.
+- `count(*) FILTER (...)` returns 0 when no row matches; `sum(...) FILTER (...)` returns NULL when no values contribute.
 - Some aggregates (e.g. `array_agg`) cannot easily be filtered with `CASE` without producing arrays of NULLs.
 
 ### Recipe 12: Pagination cursor using window output
@@ -652,7 +655,7 @@ FROM paged
 WHERE rn BETWEEN 51 AND 100;
 ```
 
-For deep pagination, **keyset cursors are faster** than `row_number()` ranges — see [`02-syntax-dql.md`](./02-syntax-dql.md). The window-based form is useful only when the ordering keys are not unique on their own.
+Ranks can shift when rows are inserted, deleted, or reordered between requests, even with a deterministic tiebreaker. Use a consistent snapshot for stable ranks, or keyset pagination for deep pages.
 
 ## Gotchas / Anti-patterns
 
@@ -669,7 +672,7 @@ For deep pagination, **keyset cursors are faster** than `row_number()` ranges �
 11. **`ntile(N)` doesn't give equal buckets when partition size isn't divisible by N.** Extra rows go into the *lower-numbered* buckets. So `ntile(4)` over 10 rows gives bucket sizes (3, 3, 2, 2), not (3, 3, 3, 1) — but specifically the first two buckets are larger, not the last two. If you need balanced buckets, use a custom `floor((row_number()-1) * N / count)` expression.
 12. **Window functions and parallel queries.** Window functions themselves are not marked PARALLEL UNSAFE, but the planner historically didn't parallelize the `WindowAgg` node. Parallel scans below `WindowAgg` work, but the window-aggregate step itself runs in the leader. Check `EXPLAIN ANALYZE` to confirm — if you see `Gather` *below* `WindowAgg`, the scan is parallel but the window step isn't.
 13. **`UNBOUNDED FOLLOWING` reads the rest of the partition.** Frames extending to `UNBOUNDED FOLLOWING` (or any FOLLOWING offset) force the executor to buffer subsequent rows, which costs memory proportional to the partition size. Avoid for very large partitions when you only need preceding rows.
-14. **`RANGE` frames over non-unique `ORDER BY` are peer-sensitive.** Any frame where `frame_start = CURRENT ROW` includes all peers, not just the current row. To exclude peers, use `EXCLUDE GROUP` or `EXCLUDE TIES`; to keep only the current row, use `EXCLUDE GROUP` after extending the frame to peers.
+14. **`RANGE` frames over non-unique `ORDER BY` are peer-sensitive.** `EXCLUDE GROUP` removes the current row and all its peers; `EXCLUDE TIES` keeps the current row but removes its other peers.
 15. **DISTINCT before vs after window function.** `DISTINCT` runs *after* window functions, so `SELECT DISTINCT id, row_number() OVER (…) FROM …` will not deduplicate on `id` alone — each row's `row_number()` value participates in the distinct comparison. Either drop `DISTINCT` or pre-deduplicate in a subquery.
 
 ## See Also

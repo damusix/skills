@@ -131,15 +131,17 @@ For full RLS patterns — policies, USING vs WITH CHECK, FORCE RLS, multi-tenant
 
 Postgres enforces transaction boundaries naturally:
 
-- **PROCEDUREs** can `COMMIT`/`ROLLBACK` inside. They **cannot** be called from within an explicit transaction (Postgres errors).
+- **PROCEDUREs** can `COMMIT`/`ROLLBACK`, but only when `CALL` runs in its own transaction. Inside the caller's `BEGIN` block, the `COMMIT` fails with `2D000` (`invalid_transaction_termination`).
 - **FUNCTIONs** always run inside a transaction (the caller's, or implicit). They cannot `COMMIT`/`ROLLBACK`.
-- **No subtransactions** without an explicit `SAVEPOINT`.
+- **A PL/pgSQL block with an `EXCEPTION` clause is a subtransaction.** It cannot `COMMIT` or `ROLLBACK`, and PL/pgSQL has no `SAVEPOINT` command. A nested `BEGIN ... EXCEPTION ... END` block is how PL/pgSQL rolls back part of the work.
 
-**The one rule: no explicit nested transactions.** Never wrap one `BEGIN` inside another. Use `SAVEPOINT` only for selective rollback within a single logical unit. Postgres prevents most accidental nesting at the engine layer; this rule covers the rest.
+**Default: the caller owns the transaction.** A procedure does its work and lets errors propagate, so the caller's transaction (or the implicit one around a bare `CALL`) rolls back. Only a procedure that deliberately owns batch boundaries calls `COMMIT`, and only outside any block with an `EXCEPTION` clause.
 
-A small helper `fn_assert_not_in_transaction()` can be called at the top of any operation that assumes it owns its own transaction.
+**The one rule: no explicit nested transactions.** Never wrap one `BEGIN` inside another. For selective rollback, use a nested `BEGIN ... EXCEPTION ... END` block in PL/pgSQL, or `SAVEPOINT` in client-side SQL.
 
-For full procedure/function templates, transaction patterns, savepoints, and the assertion helper — read [Procedure Structure](references/procedure-structure.md).
+A batch procedure that commits must be called outside an explicit transaction; PostgreSQL enforces this with `2D000` at the first `COMMIT`.
+
+For full procedure/function templates, transaction patterns, and selective rollback — read [Procedure Structure](references/procedure-structure.md).
 
 ## Concurrency & Locking
 
@@ -152,20 +154,19 @@ For lock modes, deadlock prevention (consistent ordering of lock acquisition), a
 PL/pgSQL has no `GOTO`. Errors flow through `EXCEPTION WHEN ... THEN` blocks, which automatically roll back the surrounding subtransaction. For client-parseable errors, use a SQLSTATE catalog:
 
     RAISE EXCEPTION 'email already taken: %', new_email
-        USING ERRCODE = 'P0003';
+        USING ERRCODE = 'Z0003';
 
-SQLSTATE codes are 5 alphanumeric chars. User-defined codes use class `P0` (`P0001`–`P0999` is the conventional range). Maintain a constants document mapping codes to semantic names so client apps can match on the code:
+SQLSTATE codes are 5 alphanumeric chars. Application codes use class `Z0` (`Z0001`–`Z0999`), not `P0`: PostgreSQL owns `P0001`–`P0004` (`raise_exception`, `no_data_found`, `too_many_rows`, `assert_failure`), so a `P0` application code collides with native PL/pgSQL errors. Maintain a constants document mapping codes to semantic names so client apps can match on the code:
 
 | Code | Meaning |
 |------|---------|
-| `P0001` | INVALID_INPUT |
-| `P0002` | NOT_FOUND |
-| `P0003` | DUPLICATE_KEY |
-| `P0004` | FORBIDDEN |
-| `P0005` | STATE_CONFLICT |
-| `P0010` | TYPE_DISCRIMINATOR_MISMATCH |
-| `P0011` | TRANSACTION_REQUIRED |
-| `P0012` | TRANSACTION_FORBIDDEN |
+| `Z0001` | INVALID_INPUT |
+| `Z0002` | NOT_FOUND |
+| `Z0003` | DUPLICATE_KEY |
+| `Z0004` | FORBIDDEN |
+| `Z0005` | STATE_CONFLICT |
+| `Z0010` | TYPE_DISCRIMINATOR_MISMATCH |
+| `Z0011` | TRANSACTION_REQUIRED |
 
 Reserve `EXCEPTION WHEN OTHERS` for truly unexpected failures — don't use it as control flow. Catch specific conditions (`unique_violation`, `foreign_key_violation`, named SQLSTATEs) when you need to translate them.
 
@@ -184,7 +185,7 @@ Postgres `CHECK` constraints can't reliably reach across tables — functions in
             WHERE account_no = NEW.account_no AND type = 'savings'
         ) THEN
             RAISE EXCEPTION 'savings_account requires account.type = ''savings'''
-                USING ERRCODE = 'P0010';
+                USING ERRCODE = 'Z0010';
         END IF;
         RETURN NEW;
     END;
@@ -427,7 +428,8 @@ For the full Postgres-specific catalog — read [Query Patterns](references/quer
 | Putting cross-table reads inside `CHECK` constraints | `CHECK` can't safely reach across tables — use `BEFORE` triggers calling functions |
 | Putting DML inside trigger bodies directly | Triggers stay thin; call a function that holds the logic |
 | Wrapping deterministic operations in `EXCEPTION WHEN OTHERS` | Reserve EXCEPTION for actual failure handling, not control flow |
-| Nesting explicit transactions | Never `BEGIN` inside `BEGIN`. Use `SAVEPOINT` for selective rollback |
+| Nesting explicit transactions | Never `BEGIN` inside `BEGIN`. Use a nested `BEGIN ... EXCEPTION ... END` block (PL/pgSQL) or `SAVEPOINT` (client SQL) for selective rollback |
+| `COMMIT`/`ROLLBACK` inside a block with an `EXCEPTION` clause | Fails at runtime. Let errors propagate to the caller's transaction; commit only in batch procedures, outside exception blocks |
 | Using `Create`, `Update`, `Delete` as procedure verbs | Use `add`, `modify`, `remove` — avoid keyword collisions |
 | Nullable columns by default | Define DOMAINs as `NOT NULL`; nullable only with explicit business reason |
 | Hardcoding configuration in functions | Read from `app_settings` with `COALESCE` defaults |

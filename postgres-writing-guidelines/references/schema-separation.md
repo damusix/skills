@@ -29,7 +29,7 @@ A typical application database:
     audit        -- audit/history tables (customer_audit, ...)
     ref          -- reference / lookup tables (account_type, country, ...)
     archive      -- archived historical data (customer_audit_archive, ...)
-    util         -- helper functions (fn_assert_not_in_transaction, meta-fns)
+    util         -- helper functions (fn_next_*_no, meta-fns)
     public       -- usually empty; serves as fallback search_path entry
 
 Create with:

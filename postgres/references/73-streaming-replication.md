@@ -161,7 +161,7 @@ Standby restrictions (verbatim from `hot-standby.html`):
 - No `SERIALIZABLE` isolation (verbatim *"Serializable transactions are not allowed on hot standby servers"*)[^hot-standby]
 - `pg_replication_origin_*` functions disabled
 - LISTEN/NOTIFY disabled
-- Temp tables: only via `pg_temp` namespace allowed since PG14
+- Temporary tables cannot be created or written during hot standby.[^hot-standby]
 
 ### `hot_standby_feedback` (Block Primary Vacuum)
 
@@ -185,9 +185,11 @@ Recommendation: `on` for reporting/analytics standbys (queries are long-running,
 |---|---|---|---|
 | `off` | In primary's WAL buffer (asynchronous flush) | Lowest | Loss window: up to `wal_writer_delay × 3` (~600ms default). Crash-safe but recent commits may vanish. NOT corruption — bounded loss. |
 | `local` | Flushed to primary's local disk (fsync) | Low | Survives primary crash. Does NOT wait for any standby. |
-| `remote_write` | Primary's disk + standby has received WAL into memory | Medium | Survives primary crash if at least one sync standby alive. NOT durable on standby's disk. |
-| `on` (default) | Primary's disk + standby's disk (flushed) | Higher | Survives both primary and standby crash. |
-| `remote_apply` | Primary's disk + standby's disk + standby has REPLAYED the WAL | Highest | Reads on standby see this commit immediately. Required for read-after-write on standby. |
+| `remote_write` | Primary WAL flushed locally; synchronous standby has written WAL to its operating system | Medium | Standby OS crash can lose WAL not flushed to durable storage. |
+| `on` (default) | Primary WAL and required synchronous standby WAL flushed to durable storage | Higher | Protects acknowledged commits if a sufficiently up-to-date synchronous standby survives and is promoted. |
+| `remote_apply` | WAL flushed and replayed on required synchronous standbys | Highest | New standby snapshots can see the commit; existing snapshots may not. |
+ 
+The remote guarantees apply only when `synchronous_standby_names` selects synchronous standbys. Otherwise `on`, `remote_write`, and `remote_apply` wait only for local flush. Correct failover selection and fencing remain necessary.[^sync-commit]
 
 Per-transaction override:
 
@@ -235,7 +237,7 @@ Names matched against `pg_stat_replication.application_name`. `application_name`
 
 Operational rules:
 
-- Sync standby that disconnects → COMMIT blocks until either (a) standby reconnects, (b) timeout via `wal_sender_timeout`, (c) operator removes it from list and reloads. **No automatic fallback to async** — explicit policy.
+- If a required synchronous standby disconnects, commits wait until another eligible standby satisfies the configured count, the standby reconnects, or an operator changes the policy. `wal_sender_timeout` detects a failed connection; it is not a timeout on commit waits.
 - `pg_stat_replication.sync_state` shows current status: `async` / `potential` (in list but not currently sync) / `sync` (currently sync) / `quorum` (member of quorum group).
 
 ### `max_standby_archive_delay` / `max_standby_streaming_delay`
@@ -491,14 +493,16 @@ Cross-reference [`27-mvcc-internals.md`](./27-mvcc-internals.md) for xmin horizo
 Primary becomes secondary, standby becomes primary. Zero data loss. Manual orchestration (use Patroni/repmgr in production — cross-reference [`78-ha-architectures.md`](./78-ha-architectures.md)).
 
 ```bash
-# Step 1: On primary — stop application traffic, force checkpoint
-psql -h primary -c "CHECKPOINT;"
+# Step 1: Stop every writer, drain active transactions, and capture
+# the primary's durable WAL flush position before shutdown.
+psql -h primary -Atc "SELECT pg_current_wal_flush_lsn();" > /secure/switchover-lsn
 
-# Step 2: On primary — stop cleanly (waits for standby to catch up)
-sudo systemctl stop postgresql
-
-# Step 3: On standby — verify caught up to old primary's last LSN
+# Step 2: Wait until the intended standby's replay LSN reaches the saved
+# barrier. Verify the correct timeline and keep all writers blocked.
 psql -h standby -c "SELECT pg_last_wal_replay_lsn();"
+
+# Step 3: Stop the primary cleanly and fence it against restart or writes.
+sudo systemctl stop postgresql
 
 # Step 4: On standby — promote
 psql -h standby -c "SELECT pg_promote(true, 60);"
@@ -517,7 +521,7 @@ Cross-reference [`89-pg-rewind.md`](./89-pg-rewind.md) for re-attaching old prim
 
 ### Recipe 6 — `recovery_min_apply_delay` for human-error rollback
 
-Apply WAL with 1-hour delay. Bug-induced data loss can be reverted by promoting standby before delayed WAL applies.
+Delayed replay provides time to stop recovery before an unwanted commit is applied. Promoting without a recovery target ends the delay and replays all WAL already received, so a bare promotion applies the unwanted transaction.
 
 Standby `postgresql.conf`:
 
@@ -525,13 +529,27 @@ Standby `postgresql.conf`:
 recovery_min_apply_delay = 1h
 ```
 
-Standby still receives WAL immediately (network) but applies it 1 hour late. If primary corrupts data at 10:00, you have until 11:00 to promote standby and stop replay.
+Standby receives WAL while delaying commit replay. If a bad commit lands at 10:00, the standby has until 11:00 to stop before it:
+
+1. Pause replay at once: `SELECT pg_wal_replay_pause();`.
+2. Set a target just before the bad transaction and restart the standby, because recovery target settings apply only at server start:
+
+    ```ini
+    recovery_target_time = '2026-03-01 09:59:00+00'   # or recovery_target_xid / recovery_target_lsn
+    recovery_target_inclusive = off
+    recovery_target_action = 'pause'
+    ```
+
+3. Replay stops at the target and pauses. Inspect the data with read-only queries. If the point is wrong, shut down, choose a later target, and restart.
+4. Either copy the rows back to the primary, or end recovery with `SELECT pg_wal_replay_resume();` to make this standby a new primary on a new timeline. Fence the old primary first.
+
+With `hot_standby = off`, `pause` acts like `shutdown`. A separate point-in-time recovery from backup reaches the same cutoff when the delay window has passed.
 
 Trade-offs:
 - Standby data is always 1 hour stale.
 - WAL accumulates on standby disk (1 hour worth).
-- During the delay window, RPO is 0 but RTO is "promote + delete remaining WAL" = minutes.
-- Slot retention on primary still measures "WAL written" not "WAL applied" — slot does NOT block primary from recycling.
+- The delay creates an intentional recovery point gap; it does not guarantee RPO zero.
+- Monitor both received and replayed WAL and standby disk usage.
 
 ### Recipe 7 — Diagnose stuck `state = 'catchup'`
 
@@ -560,13 +578,16 @@ Logical replication slots normally only exist on primary. After failover, subscr
 
 Primary:
 ```sql
-SELECT pg_create_logical_replication_slot('app_slot', 'pgoutput', false, true);
--- 4th arg = failover = true
+SELECT pg_create_logical_replication_slot('app_slot', 'pgoutput', false, false, true);
+-- 5th argument enables failover; 4th controls two-phase decoding.
 ```
 
 Standby `postgresql.conf` (PG17+):
 ```ini
 sync_replication_slots = on
+primary_slot_name = 'standby1'          # physical slot on the primary
+hot_standby_feedback = on               # required for slot sync
+primary_conninfo = 'host=primary user=replicator dbname=postgres'   # dbname required for slot sync
 ```
 
 Primary `postgresql.conf` (PG17+):
@@ -576,7 +597,7 @@ synchronized_standby_slots = 'standby1'
 
 Verbatim PG17: *"Allow specification of physical standbys that must be synchronized before they are visible to subscribers."*[^pg17-synchronized-standby-slots]
 
-After promotion, standby's slot is in sync with subscribers' last-known LSN. Subscribers reconnect to new primary without restart-from-scratch.
+Before promotion, confirm the intended standby's failover slot is synchronized and usable, fence the old primary, and account for asynchronous failover loss and possible replay.
 
 Cross-reference [`74-logical-replication.md`](./74-logical-replication.md) and [`75-replication-slots.md`](./75-replication-slots.md).
 
@@ -628,10 +649,10 @@ Standby logs flooded with `ERROR: canceling statement due to conflict with recov
 
 ```sql
 -- Run on standby
-SELECT count(*) AS cancels_today
+SELECT datname, conflicts AS cumulative_conflicts
 FROM pg_stat_database
 WHERE datname = current_database();
--- conflicts column was added in PG14
+-- Counter since statistics reset, not today's count.
 ```
 
 Three mitigations:
@@ -678,7 +699,7 @@ SELECT pg_get_wal_replay_pause_state();  -- 'paused'
 -- After investigation, either resume or promote
 SELECT pg_wal_replay_resume();           -- continue
 -- OR
-SELECT pg_promote(true, 60);             -- promote, abandon remaining WAL
+-- Promotion replays immediately available WAL and ends the delay; it does not discard pending WAL.
 ```
 
 `pg_get_wal_replay_pause_state()` PG14+ returns three values: `not paused`, `pause requested`, `paused`. Pre-PG14 use `pg_is_wal_replay_paused()` (boolean only).
@@ -691,9 +712,9 @@ SELECT pg_promote(true, 60);             -- promote, abandon remaining WAL
 
 3. **`synchronous_standby_names` empty string ≠ no sync — sync is OFF.** A common misconfiguration is to set `synchronous_commit = on` cluster-wide thinking it enables sync replication. Without `synchronous_standby_names` populated, every commit is "sync to primary disk only" — no standby is involved.
 
-4. **Sync standby disconnect blocks all writes.** No automatic fallback to async. COMMIT hangs forever (or until `wal_sender_timeout` declares standby dead). Operator must explicitly remove from `synchronous_standby_names` and reload to unblock.
+4. **A missing required synchronous standby blocks waiting commits.** A replacement synchronous standby or a policy change can release them; `wal_sender_timeout` only detects an inactive connection.
 
-5. **`hot_standby_feedback = on` + abandoned standby = unbounded primary bloat.** If standby is offline but slot is retained, primary's `xmin` horizon is held back by the last reported standby xmin. Vacuum cannot remove dead tuples. Combine with `max_slot_wal_keep_size` AND monitor `pg_stat_replication` for missing standbys.
+5. **`hot_standby_feedback = on` plus a retained physical slot can hold a stale xmin.** Monitor slot `xmin` and database age as well as WAL. `max_slot_wal_keep_size` does not bound xmin retention.
 
 6. **`max_standby_streaming_delay = -1` is "wait forever" — apply lag grows unbounded.** Standby reads block primary's commits if you also have sync replication. Pick a finite value or use `hot_standby_feedback`.
 
@@ -711,13 +732,13 @@ SELECT pg_promote(true, 60);             -- promote, abandon remaining WAL
 
 13. **LISTEN/NOTIFY does not propagate to standby.** A `NOTIFY` issued on primary does not fire LISTEN handlers on standby connections. Standby applications must connect to primary for notifications.
 
-14. **Temp tables not allowed on standby pre-PG14.** PG14 relaxed: temp tables allowed via `pg_temp` namespace. Older versions: any `CREATE TEMP TABLE` errors out.
+14. **Temporary tables cannot be created or written on a hot standby.** This restriction applies to every supported version; use the primary for temporary-table workloads.[^hot-standby]
 
 15. **Standby does NOT serve transactions started on primary.** Cannot start tx on primary, route SELECT to standby. `synchronous_commit = remote_apply` only ensures the COMMIT is visible on standby — does not transfer the transaction itself.
 
 16. **`pg_basebackup -R` writes `primary_conninfo` to `postgresql.auto.conf`.** Hand-editing `postgresql.conf` does NOT override (`postgresql.auto.conf` precedence is higher). Use `ALTER SYSTEM SET primary_conninfo = ''` to clear, then re-set.
 
-17. **`pg_promote()` returns immediately if `wait = false`.** Caller gets back `false` (because not yet complete) but promotion is in flight. Always check `pg_is_in_recovery()` to confirm.
+17. **`pg_promote(wait => false)` does not wait for completion.** A successful request returns immediately; check `pg_is_in_recovery()` to confirm promotion.
 
 18. **`recovery_target_inclusive = true` (default) means STOP AFTER target.** If `recovery_target_xid = 12345`, replay includes XID 12345 and stops just after. Set `inclusive = false` to stop just before.
 
@@ -764,6 +785,8 @@ SELECT pg_promote(true, 60);             -- promote, abandon remaining WAL
 [^recovery-config]: PostgreSQL 16 docs Appendix O.1 (Obsolete or Renamed Features). https://www.postgresql.org/docs/16/recovery-config.html
 
 [^hot-standby]: PostgreSQL 16 docs §27.4 Hot Standby. https://www.postgresql.org/docs/16/hot-standby.html
+
+[^sync-commit]: PostgreSQL 16 docs §20.5 Write Ahead Log, `synchronous_commit`. https://www.postgresql.org/docs/16/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT
 
 [^pg13-max-slot-wal-keep]: PG13 release notes. `max_slot_wal_keep_size` GUC introduced. https://www.postgresql.org/docs/release/13.0/
 

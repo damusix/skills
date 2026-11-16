@@ -34,7 +34,7 @@ Five rules:
 
 1. **Vector types have storage limits and *separate* indexed limits.** `vector(N)`: 16,000 dimensions storage / 2,000 indexed. `halfvec(N)`: 16,000 storage / 4,000 indexed. `sparsevec(N)`: 16,000 non-zero elements storage / 1,000 nnz indexed (HNSW only). `bit(N)`: 64,000 indexed (PostgreSQL core type, used with `bit_hamming_ops` / `bit_jaccard_ops`).
 
-2. **Six operators, six opclasses, three index types.** `<->`/`<=>`/`<#>`/`<+>` for `vector` + `halfvec` + `sparsevec`. `<~>`/`<%>` for `bit`. Each opclass binds one operator (`vector_l2_ops`, `vector_cosine_ops`, `vector_ip_ops`, `vector_l1_ops`, `halfvec_*_ops`, `sparsevec_*_ops`, `bit_hamming_ops`, `bit_jaccard_ops`). ONE opclass per index — pick the distance you query with.
+2. **Six operators and two approximate index types.** `<->`/`<=>`/`<#>`/`<+>` work with `vector`, `halfvec`, and `sparsevec`; `<~>`/`<%>` work with `bit`. Choose the opclass matching the distance and index type.
 
 3. **HNSW = better recall, slower build, more memory. IVFFlat = faster build, less memory, lower recall.** HNSW is verbatim default recommendation: *"better query performance than IVFFlat (in terms of speed-recall tradeoff), but has slower build times and uses more memory."* IVFFlat: *"faster build times and uses less memory than HNSW, but has lower query performance (in terms of speed-recall tradeoff)."*
 
@@ -50,12 +50,12 @@ Five rules:
 | Need | Use | Why |
 |---|---|---|
 | Default RAG embedding column 768-1536 dim | `vector(N)` + HNSW + `vector_cosine_ops` | Standard for OpenAI/Cohere/sentence-transformers embeddings. Cosine handles unnormalized vectors. |
-| 4× memory reduction with marginal recall loss | `halfvec(N)` + HNSW + `halfvec_cosine_ops` | Half-precision (2-byte) floats. 16,000 storage / 4,000 indexed. Added 0.7.0. |
+| Reduce vector storage with possible recall loss | `halfvec(N)` + HNSW + `halfvec_cosine_ops` | Half-precision components use 2 bytes each instead of 4. Benchmark recall and index size. |
 | Sparse term-frequency vectors (TF-IDF, BM25, SPLADE) | `sparsevec(16000)` + HNSW + `sparsevec_cosine_ops` | Stores only non-zero elements. HNSW only — IVFFlat does NOT index `sparsevec`. Added 0.7.0. |
 | Compact binary embeddings (e.g., binary-quantized) | `bit(N)` + HNSW + `bit_hamming_ops` | 64,000 dimensions indexed. Use `binary_quantize(vec)` to convert. |
 | Build first, query later, slower writes acceptable | HNSW | Default. Better speed-recall trade-off. |
-| Faster index build, OK with lower recall | IVFFlat | Smaller index, faster build. Must specify `lists` parameter. |
-| Filtered ANN with selective `WHERE` predicate | HNSW + `SET LOCAL hnsw.iterative_scan = strict_order` | 0.8.0+. Re-scans until enough rows survive `WHERE`. Pre-0.8.0: partial index per filter value. |
+| Faster index build, OK with lower recall | IVFFlat | Smaller index, faster build. Tune `lists` for the dataset. |
+| Filtered ANN with selective `WHERE` predicate | HNSW + `SET LOCAL hnsw.iterative_scan = strict_order` | 0.8.0+. Re-scans until enough rows survive `WHERE` or a scan limit (`hnsw.max_scan_tuples`) is reached. Pre-0.8.0: partial index per filter value. |
 | Multi-tenant — partition by tenant before ANN | Partial index `WHERE tenant_id = X` per tenant OR partition table | Avoids filtered-ANN problem. |
 | Tune recall vs latency per query | `SET LOCAL hnsw.ef_search = 100` | Default 40. Higher = better recall + higher latency. |
 | Tune IVFFlat recall vs latency per query | `SET LOCAL ivfflat.probes = 10` | Default 1. Higher = scans more lists = better recall + slower. |
@@ -65,7 +65,7 @@ Five rules:
 
 Three smell signals:
 
-- **`vector(>=2000)` with HNSW** → exceeds 2,000-dim indexed limit. Switch to `halfvec` (4,000-dim limit) OR reduce dimensionality (PCA, model truncation).
+- **`vector(>2000)` with HNSW** → exceeds the 2,000-dimension indexed limit. Use `halfvec` or reduce dimensions.
 - **Filtered ANN returning < `LIMIT` rows** → ANN scan exhausted candidates before `WHERE` matched enough. Set `hnsw.iterative_scan = strict_order` (0.8.0+) OR raise `hnsw.ef_search`.
 - **Building HNSW on 100M-row table without `maintenance_work_mem` raise** → swap thrashing. Raise `maintenance_work_mem` to 8-16GB AND `max_parallel_maintenance_workers` to 4-8.
 
@@ -80,7 +80,7 @@ Five callable types: `vector` (built-in float32), `halfvec` (float16, 0.7.0+), `
 | `vector(N)` | 16,000 dims | 2,000 dims | 2,000 dims | 4 (float32) | 0.1.0 |
 | `halfvec(N)` | 16,000 dims | 4,000 dims | 4,000 dims | 2 (float16) | 0.7.0 |
 | `sparsevec(N)` | 16,000 nnz | 1,000 nnz | (unsupported) | variable | 0.7.0 |
-| `bit(N)` | 64,000 bits | 64,000 bits | (unsupported) | 0.125 | core PG |
+| `bit(N)` | PostgreSQL bit type limit | 64,000 bits | 64,000 bits (Hamming) | 0.125 | core PG |
 
 Verbatim from [README][readme]:
 
@@ -131,7 +131,7 @@ Six operators, all return `double precision` (or `int` for bit-hamming). Lower d
 
 `<#>` returns *negated* inner product — so `ORDER BY a <#> b ASC` returns highest inner product (most similar). Avoids needing `DESC` for index scans (HNSW/IVFFlat scan ascending only).
 
-Cosine *similarity* score (0-1, higher = more similar): `1 - (a <=> b)`.
+Cosine *similarity* for nonzero vectors ranges from -1 to 1: `1 - (a <=> b)`.
 
 Distance computation cost: L2 < IP < cosine (cosine normalizes both vectors per call). For pre-normalized vectors (unit-length), use IP — faster, equivalent ordering to cosine.
 
@@ -160,10 +160,12 @@ Build with custom params:
 
 Tune query recall:
 
+    BEGIN;
     SET LOCAL hnsw.ef_search = 100;
     SELECT id FROM items ORDER BY embedding <=> $1 LIMIT 10;
+    COMMIT;
 
-`ef_search` *must* be ≥ `LIMIT`. If you want top-50, set `hnsw.ef_search >= 50`.
+With iterative scans off, choose `ef_search` at least as large as the desired limit to avoid restricting the initial candidate list. Filtering and dead tuples can still reduce results; iterative scans can continue beyond that initial list. See <https://github.com/pgvector/pgvector/blob/v0.8.7/README.md#iterative-index-scans>.
 
 ### IVFFlat Index
 
@@ -175,9 +177,9 @@ Default parameters:
 
 | Parameter | Default | Range | Effect |
 |---|---|---|---|
-| `lists` | (none — required) | 1-32768 | Number of clusters. **No default — you MUST specify.** |
+| `lists` | 100 | 1-32768 | Number of clusters. Tune for the dataset. |
 | `ivfflat.probes` | 1 | 1-`lists` | Query-time clusters scanned. Session GUC. Higher = better recall, slower query. |
-| `ivfflat.max_probes` | (= `probes`) | 1-`lists` | Iterative-scan cap (0.8.0+). |
+| `ivfflat.max_probes` | 32768 | 1-32768 | Iterative-scan cap, bounded by index list count; `probes` takes precedence if larger. See <https://github.com/pgvector/pgvector/blob/v0.8.7/src/ivfflat.c>. |
 
 Verbatim from [README][readme]:
 
@@ -208,7 +210,7 @@ IVFFlat must be built on a populated table. Building on empty table = useless (n
 | Build parameters | `m`, `ef_construction` | `lists` |
 | Query parameters | `hnsw.ef_search` | `ivfflat.probes` |
 | Supports `sparsevec` | Yes | No |
-| Supports `bit` | Yes | No |
+| Supports `bit` | Yes | Yes (Hamming) |
 | Iterative scan (0.8.0+) | `hnsw.iterative_scan` | `ivfflat.iterative_scan` |
 | Parallel build (0.6.0+) | Yes | Yes |
 
@@ -228,6 +230,7 @@ Pre-0.8.0 mechanics: index returns top-`ef_search` candidates by vector distance
 
 Pgvector 0.8.0 added **iterative index scans** that re-enter the index until enough rows survive `WHERE`:
 
+    BEGIN;
     SET LOCAL hnsw.iterative_scan = strict_order;
     SET LOCAL hnsw.max_scan_tuples = 20000;       -- default 20000
     SET LOCAL hnsw.scan_mem_multiplier = 2;       -- working memory cap
@@ -236,14 +239,9 @@ Pgvector 0.8.0 added **iterative index scans** that re-enter the index until eno
     WHERE category = 'shoes'
     ORDER BY embedding <=> $1
     LIMIT 10;
+    COMMIT;
 
-Three modes for `hnsw.iterative_scan` and `ivfflat.iterative_scan`:
-
-| Mode | Behavior |
-|---|---|
-| `off` (default) | Pre-0.8.0 behavior. Single index scan, may return fewer than `LIMIT` rows. |
-| `strict_order` | Re-scans until `LIMIT` reached. Results sorted by exact distance. |
-| `relaxed_order` | Re-scans until `LIMIT` reached. Results may be slightly out of distance order (faster). |
+HNSW supports `off`, `strict_order`, and `relaxed_order`; IVFFlat supports `off` and `relaxed_order` only. Iterative scans stop when enough rows are found or their configured scan limits are reached. Strict ordering orders returned HNSW candidates by distance; it does not make approximate search exact. See <https://github.com/pgvector/pgvector/blob/v0.8.7/README.md#iterative-index-scans>.
 
 `hnsw.max_scan_tuples` (default 20,000) caps total tuples examined — prevents pathological full-graph scan when `WHERE` matches almost nothing. Raise for more selective filters.
 
@@ -260,11 +258,13 @@ Three modes for `hnsw.iterative_scan` and `ivfflat.iterative_scan`:
 
 2. **Over-fetch then filter app-side:**
 
+        BEGIN;
         SET LOCAL hnsw.ef_search = 500;
         SELECT id FROM items
         WHERE category = 'shoes'
         ORDER BY embedding <=> $1
         LIMIT 100;
+        COMMIT;
 
     Wasteful — most candidates discarded. Only viable for low-selectivity filters.
 
@@ -383,6 +383,7 @@ Canonical setup for OpenAI text-embedding-3-small (1,536 dim):
     CREATE TABLE documents (
         id          bigserial PRIMARY KEY,
         content     text NOT NULL,
+        category    text NOT NULL,
         embedding   vector(1536) NOT NULL,
         created_at  timestamptz NOT NULL DEFAULT now()
     );
@@ -426,6 +427,7 @@ Use `halfvec` for budget-constrained workloads. Recall typically drops <1% vs `v
 The fix for the classic filtered-ANN trap:
 
     -- Without iterative scan, may return fewer than 10 rows
+    BEGIN;
     SET LOCAL hnsw.iterative_scan = strict_order;
     SET LOCAL hnsw.max_scan_tuples = 50000;
 
@@ -433,8 +435,9 @@ The fix for the classic filtered-ANN trap:
     WHERE category = 'engineering' AND created_at > now() - interval '90 days'
     ORDER BY embedding <=> $1
     LIMIT 10;
+    COMMIT;
 
-Returns exactly 10 rows (assuming ≥10 rows match `WHERE`). Cost: more index scans = higher latency. Tune `hnsw.max_scan_tuples` to bound worst case.
+May still return fewer than 10 rows when the scan limits are reached, even if more rows match. Tune `hnsw.max_scan_tuples` and memory, then measure recall.
 
 ### 4. Pre-0.8.0 filtered ANN via partial indexes
 
@@ -464,10 +467,12 @@ For 5M-row table, build IVFFlat with `lists = sqrt(5_000_000) ≈ 2236`:
         WITH (lists = 2236);
 
     -- Query with raised probes for better recall
+    BEGIN;
     SET LOCAL ivfflat.probes = 50;       -- ~sqrt(2236)
     SELECT id FROM documents
     ORDER BY embedding <=> $1
     LIMIT 10;
+    COMMIT;
 
 Tune `ivfflat.probes` upward until recall meets target. Each doubling of `probes` roughly doubles query latency.
 
@@ -509,7 +514,12 @@ Reciprocal Rank Fusion or simple `WHERE` + ANN:
     ORDER BY distance
     LIMIT 10;
 
-Use `SET LOCAL hnsw.iterative_scan = strict_order` if `created_at` filter is selective.
+If the `created_at` filter is selective, enable iterative scans for the query. `SET LOCAL` only lasts inside a transaction block:
+
+    BEGIN;
+    SET LOCAL hnsw.iterative_scan = strict_order;
+    -- run the hybrid query above
+    COMMIT;
 
 ### 8. Two-stage retrieval — binary quantize then rerank
 
@@ -555,7 +565,7 @@ Find every vector index, opclass, and parameters:
     JOIN pg_am am ON am.oid = i.relam
     JOIN pg_opclass opc ON opc.oid = ANY(ix.indclass::oid[])
     WHERE am.amname IN ('hnsw', 'ivfflat')
-        AND opc.opcname LIKE '%vector%' OR opc.opcname LIKE '%halfvec%' OR opc.opcname LIKE '%sparsevec%' OR opc.opcname LIKE 'bit_%'
+        AND (opc.opcname LIKE '%vector%' OR opc.opcname LIKE '%halfvec%' OR opc.opcname LIKE '%sparsevec%' OR opc.opcname LIKE 'bit_%')
     ORDER BY pg_relation_size(i.oid) DESC;
 
 `reloptions` shows build params: `{m=32,ef_construction=128}` for HNSW, `{lists=2000}` for IVFFlat.
@@ -672,19 +682,19 @@ Common stacks:
 
 ## Gotchas
 
-1. **`vector(2000+)` cannot be HNSW-indexed.** Hard limit: 2,000 dimensions for `vector` index. Workaround: use `halfvec(N)` (4,000-dim limit) or sub-vector via `subvector()` expression index.
+1. **`vector` indexes support up to 2,000 dimensions.** Above that, use `halfvec(N)` (4,000-dimension index limit) or a subvector expression index.
 
 2. **`sparsevec` works with HNSW only.** IVFFlat does NOT support `sparsevec`. Returns error at index creation.
 
-3. **`bit` works with HNSW only.** Same — IVFFlat does NOT support `bit_hamming_ops` or `bit_jaccard_ops`.
+3. **IVFFlat supports `bit_hamming_ops`; HNSW also supports `bit_jaccard_ops`.** See <https://github.com/pgvector/pgvector/blob/v0.8.7/README.md#ivfflat>.
 
 4. **Filtered ANN under-recalls pre-0.8.0.** Top-`ef_search` candidates get `WHERE` filter applied, often returning fewer than `LIMIT` rows. Set `hnsw.iterative_scan = strict_order` (0.8.0+) OR use partial indexes OR over-fetch.
 
-5. **`hnsw.ef_search < LIMIT` returns fewer rows than requested.** `ef_search` must be ≥ `LIMIT`. Default 40 means `LIMIT 100` may silently return only 40 rows.
+5. **A small `hnsw.ef_search` can limit results.** With iterative scans off, the default candidate list of 40 can make `LIMIT 100` return fewer rows. Iterative scans can continue beyond the initial candidate list.
 
 6. **IVFFlat built on empty table is useless.** K-means needs data to partition. README: *"Add the data first, then create the index."*
 
-7. **`lists` has no default for IVFFlat.** Must specify `WITH (lists = N)`. Recommended: `rows / 1000` for <1M, `sqrt(rows)` for ≥1M.
+7. **IVFFlat defaults to 100 lists.** Tune `lists`: upstream suggests `rows / 1000` for up to 1M rows and `sqrt(rows)` above that.
 
 8. **Cosine distance on zero-magnitude vector returns NaN.** `'[0,0,0]' <=> '[1,2,3]'` → NaN (division by zero in normalization). Filter out zero vectors at insertion or during ANN.
 
@@ -692,11 +702,11 @@ Common stacks:
 
 10. **HNSW build memory must fit in `maintenance_work_mem`.** Default 64MB causes disk-spill — orders of magnitude slower. Raise to 4-16GB for typical builds.
 
-11. **Index build params (`m`, `ef_construction`, `lists`) bake at CREATE INDEX.** Cannot change via `ALTER INDEX`. Must `DROP INDEX` + `CREATE INDEX CONCURRENTLY` with new params.
+11. **Index build parameters affect the graph or clustering built on disk.** To change them, set the index reloptions and rebuild the index; plan for build cost and availability. See <https://github.com/pgvector/pgvector/blob/v0.8.7/src/hnsw.c>.
 
 12. **`hnsw.ef_search` and `ivfflat.probes` are session GUCs.** Per-role via `ALTER ROLE … SET`. Per-query via `SET LOCAL` inside transaction. pgBouncer transaction-mode pools do NOT propagate session GUCs — see [`81-pgbouncer.md`](./81-pgbouncer.md).
 
-13. **`CREATE INDEX CONCURRENTLY` does NOT parallelize.** PG18 added parallel CIC for B-tree but pgvector HNSW CIC remains single-threaded. For initial bulk build, prefer non-CONCURRENTLY with `max_parallel_maintenance_workers` raised.
+13. **Concurrent builds still require extra work and waits.** pgvector implements parallel HNSW builds, but actual worker use depends on the build and PostgreSQL settings. Measure build time and use `CONCURRENTLY` when writes must continue. See <https://github.com/pgvector/pgvector/blob/v0.8.7/src/hnswbuild.c> and <https://www.postgresql.org/docs/18/sql-createindex.html>.
 
 14. **`pg_upgrade` requires pgvector binary on target cluster BEFORE starting.** New cluster must have `pgvector` extension package installed for matching PG major. Otherwise startup fails with "could not load library".
 

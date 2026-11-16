@@ -106,7 +106,7 @@ Direct TLS negotiation (PG17+ with `sslnegotiation=direct`) skips step 2 entirel
 
 | GUC | Default | Notes |
 |---|---|---|
-| `ssl` | `off` | Master switch. Must be `on` for any TLS to occur. Context `postmaster` — restart required to **change between on/off**; reloadable for cert/key file path changes once enabled[^ssl-context]. |
+| `ssl` | `off` | Master switch. Must be `on` for TLS; it is reloadable in PG16.[^ssl-context] |
 | `ssl_ca_file` | empty | PEM-format CA certificate(s) for verifying client certs. Required for `clientcert=verify-ca` / `verify-full` or auth method `cert`[^ssl-ca-file]. |
 | `ssl_cert_file` | `server.crt` | Server certificate. Relative paths resolved against `$PGDATA`[^ssl-cert-file]. |
 | `ssl_crl_file` | empty | Certificate Revocation List (PEM). Optional but recommended in environments that revoke client certs[^ssl-crl-file]. |
@@ -206,7 +206,7 @@ Verbatim warning for Windows:
 
 > *"On Windows, `ssl_passphrase_command_supports_reload` must be set to `on` to allow the passphrase command to be re-run during a reload, otherwise the reload will fail."*[^ssl-passphrase-reload]
 
-The certificate file paths themselves cannot be changed via reload (changing `ssl_cert_file` is a `postmaster`-context GUC and requires restart on **some** versions; check `pg_settings.context` for your version before assuming).
+Certificate and key paths can also be changed through configuration reload in PG16. Check the server log after reload: if the new SSL configuration is invalid, the old SSL configuration remains in use.
 
 ### `require_auth` and client-side hardening (PG16+)
 
@@ -221,12 +221,11 @@ Values:
 - `md5` — MD5 challenge (deprecated)
 - `scram-sha-256` — SCRAM
 - `gss` / `sspi` — Kerberos
-- `cert` — TLS client certificate (no password)
-- `none` — `trust` (no authentication)
+- `none` — the server must not send an authentication challenge; TLS client-certificate authentication and GSS-encrypted transport stay allowed
 - Comma-separated combinations: `scram-sha-256,gss`
 - Negation: `!password` accepts everything except cleartext password
 
-Production-hardening recipe: every application connection string should include `require_auth=scram-sha-256` (or `scram-sha-256,cert` if some services use TLS client certs). This defends against a hostile or misconfigured server that downgrades the auth method.
+For SCRAM services, `require_auth=scram-sha-256` rejects a weaker authentication exchange. For certificate-only authentication, `require_auth=none` permits an authentication without a password challenge; it does not prove the server validated the client certificate. Verify the server's HBA and certificate settings independently.
 
 ### TLS 1.3 ciphers and `ssl_groups` (PG18)
 
@@ -487,7 +486,7 @@ Verify all clients support TLS 1.3 *before* applying this — libpq 11+ does; so
 ```sql
 SELECT name, setting, source, context
 FROM pg_settings
-WHERE name LIKE 'ssl%' OR name LIKE 'password_encryption' OR name = 'scram_iterations'
+WHERE (name LIKE 'ssl%' OR name = 'password_encryption' OR name = 'scram_iterations')
   AND source <> 'default'
 ORDER BY name;
 ```
@@ -572,7 +571,7 @@ WARNING: **Anyone with read access to that file can decrypt every captured sessi
 
 9. **`hostssl` matches the negotiated protocol, not the *requested* protocol.** A client asking for TLS that negotiation fails on falls back to plaintext (with `sslmode=prefer`), which then matches a `host` rule, not `hostssl`. Pair `sslmode=verify-full` with a final `host ... reject` row.
 
-10. **PG17 `sslnegotiation=direct` requires ALPN.** OpenSSL must be 1.0.2+ (it is, on modern systems) AND must be configured to support ALPN. Falls back to standard negotiation if either side lacks ALPN — silently slower, but not broken.
+10. **PG17 `sslnegotiation=direct` requires ALPN and a compatible server.** It does not silently fall back to traditional PostgreSQL SSL negotiation; use the default negotiation for older servers.
 
 11. **`sslrootcert=system` only works on PG16+ libpq.** On PG≤15 the value `system` is interpreted as a literal file path, which will not exist, causing connect failures.
 
@@ -582,7 +581,7 @@ WARNING: **Anyone with read access to that file can decrypt every captured sessi
 
 14. **`pg_stat_ssl` shows the encryption state but does not log historical sessions.** To audit "was this connection encrypted?" after the fact, you need `log_connections = on` (PG17+ logs every accepted connection, including `trust` connections that previously left no log line[^pg17-trust-log]) plus a log line parser.
 
-15. **Reload does not change `ssl=on/off` itself in some configurations.** Toggling `ssl` between `on` and `off` requires a restart on most builds. Toggling the cert/key *paths* (or the file contents at the same path) is reloadable.
+15. **`ssl` is reloadable in PG16.** A valid change takes effect after reload; verify server logs and new connections.
 
 16. **Self-signed certificates pinned via `sslrootcert` are operationally fragile.** Cert expiry rotates secretly until a connection fails. Use a real CA (internal CA or Let's Encrypt) for any persistent environment.
 
@@ -590,7 +589,7 @@ WARNING: **Anyone with read access to that file can decrypt every captured sessi
 
 18. **`ssl_passphrase_command` runs at server start.** If the command requires interactive input (e.g., prompts on a TTY), the server will hang during startup. Use `pass` (the password manager), a secrets-vault sidecar, or a script that pulls from a secrets API.
 
-19. **Cert rotation through reload requires the file *paths* unchanged.** Changing `ssl_cert_file` to point to a new path is a postmaster-context GUC and may require a restart.
+19. **Certificate paths need not remain unchanged for reload.** In PG16, `ssl_cert_file` and `ssl_key_file` are reloadable; verify the new configuration loaded successfully.
 
 20. **PG18 `sslkeylogfile` is a debugging feature, not a logging feature.** Any TLS captures with the key log file can be decrypted — never enable it on production.
 

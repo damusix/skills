@@ -52,9 +52,9 @@ Five rules drive every pgbench run.
 
 **Rule 3 — `-c N -j M -T S`: N clients, M threads, S seconds.** Threads ≤ clients (one thread serves multiple clients). Threads beyond `nproc` waste CPU on context-switch. Time-based `-T` preferred over transaction-count `-t` for steady-state.
 
-**Rule 4 — custom `.sql` scripts via `-f` with `\set` + `\setrandom`.** Each script = one "transaction" pgbench reports. Variables interpolated as `:varname`. Multiple `-f` scripts run weighted (`-f script1.sql@70 -f script2.sql@30` runs script1 70% / script2 30%).
+**Rule 4 — custom `.sql` scripts use `\set` expressions such as `random(1, 100)`.** Each script execution is one transaction in pgbench's report. Variables interpolate as `:varname`. Multiple `-f` scripts run weighted: `-f script1.sql@70 -f script2.sql@30` picks script1 for about 70% of transactions and script2 for about 30%.
 
-**Rule 5 — `--rate N` caps cluster aggregate TPS, `--latency-limit MS` skips long transactions.** Rate-limited runs reveal latency at fixed throughput. Latency-limit reveals what fraction of transactions exceed SLA. Saturated runs (no rate limit) reveal maximum throughput.
+**Rule 5 — `--rate N` targets aggregate TPS, and `--latency-limit MS` counts late transactions.** With rate limiting, transactions already too late to meet the limit are skipped before being sent.
 
 ## Decision Matrix
 
@@ -70,7 +70,7 @@ Five rules drive every pgbench run.
 | Test prepared-statement performance | `-M prepared` | `-M simple` then claiming representative latency |
 | Test extended protocol | `-M extended` | `-M simple` (default) when app uses `PREPARE` |
 | Validate autovacuum tuning | Long run (`-T 3600`) + monitor `pg_stat_user_tables` | Short run (autovacuum may never trigger) |
-| Test under PG15+ serialization isolation | `--default-transaction-isolation=serializable` + observe retry counters | Ignoring retries, then claiming SERIALIZABLE TPS |
+| Test serializable isolation | Set `default_transaction_isolation` via `PGOPTIONS` or in the script and observe retry counters | Ignoring retries, then claiming SERIALIZABLE TPS |
 | Force disconnect-on-error PG17+ | `--exit-on-abort` | Continuing past unexpected aborts (skews TPS) |
 | Reproduce HOT-update behavior | Custom script that updates non-indexed columns | Default TPC-B (updates `aid`-related rows) |
 
@@ -121,7 +121,7 @@ Init options:
 | `--no-vacuum` | Skip post-init VACUUM | runs VACUUM |
 | `--tablespace=NAME` | Place tables in named tablespace | default |
 | `--index-tablespace=NAME` | Place indexes in named tablespace | default |
-| `--initialize-steps=STEPS` | Same as `-I` | full init |
+| `--init-steps=STEPS` | Same as `-I` | `dtgvp` |
 
 > [!NOTE] PostgreSQL 13
 > `--partitions` + `--partition-method` added in PG13. Partitioning the accounts table tests partition pruning + per-partition autovacuum behavior. Cross-reference [`35-partitioning.md`](./35-partitioning.md).
@@ -238,7 +238,7 @@ Default for built-in scripts = uniform. Override with custom `.sql` to test real
 | `-l` | Log each transaction's start time + latency to file |
 | `--aggregate-interval=SEC` | When using `-l`, aggregate log into SEC-second buckets |
 | `--log-prefix=PREFIX` | Prefix for log filename |
-| `--latency-limit=MS` | Count transactions exceeding MS as "skipped" |
+| `--latency-limit=MS` | Count late transactions; with `--rate`, skip transactions already too late to send |
 | `--sampling-rate=RATE` | Sample fraction of transactions for `-l` (0.0 to 1.0) |
 
 Output structure (typical):
@@ -268,7 +268,7 @@ Output structure (typical):
 `--latency-limit MS`:
 
 - Any transaction starting more than MS ms late (because the schedule queue is backed up) is skipped + reported.
-- Only meaningful with `--rate`. Without rate limit, no schedule queue exists.
+- Without `--rate`, pgbench still counts completed transactions exceeding the limit as late.
 - Final report shows `number of transactions skipped: X` + `maximum number of tries: Y`.
 
 Combined pattern (capacity test): `--rate 5000 --latency-limit 50` runs at 5000 TPS target, skips transactions whose schedule slips past 50ms. If skipped fraction > 1%, cluster cannot sustain 5000 TPS within 50ms SLA.
@@ -289,7 +289,7 @@ Inside the pipeline, statements queued + sent in batches without waiting for ind
 > [!NOTE] PostgreSQL 17
 > `\syncpipeline` meta-command added — sends a sync message in the middle of a pipeline. Useful for breaking a long pipeline into commit boundaries without ending it. Pre-PG17 the only way to sync was `\endpipeline`.
 
-Restriction: cannot mix transaction-control statements (BEGIN/COMMIT) inside a pipeline block — the pipeline is its own transaction unit.
+Pipeline synchronization groups statements; use explicit transaction control when transaction boundaries are required.
 
 ### Connection / protocol
 
@@ -375,7 +375,7 @@ Rate-limited at 75% of max with SLA check:
 
     pgbench -c 64 -j 16 -T 300 -P 10 --rate=4000 --latency-limit=50 mydb
 
-If `number of transactions skipped` < 1% of total and p99 < 50ms, the cluster sustainably handles 4000 TPS. If skipped > 5%, lower the rate.
+Compare skipped and late transactions with the latency objective. Obtain p99 separately from per-transaction logs; the standard summary does not report percentiles.
 
 ### Recipe 5 — multi-script weighted workload
 
@@ -416,7 +416,7 @@ Capture latency distribution every 10 seconds for plotting:
             -l --aggregate-interval=10 \
             --log-prefix=mytest mydb
 
-Produces `mytest.<pid>` files with one line per 10-second bucket: timestamp, transaction count, sum of latency, sum-of-squares of latency, min latency, max latency. Load into pandas / Grafana for p50/p99 over time.
+Produces `mytest.<pid>` files with aggregate count, sum, sum of squares, minimum and maximum per interval. These aggregates cannot reconstruct p50 or p99; collect per-transaction logs for percentiles.
 
 ### Recipe 8 — validate autovacuum tuning under sustained load
 
@@ -448,10 +448,9 @@ The 7-10× drop quantifies the case for pgBouncer. Cross-reference [`80-connecti
 
 Stress-test SSI conflict resolution:
 
-    pgbench \
+    PGOPTIONS='-c default_transaction_isolation=serializable' pgbench \
       -f workload.sql \
       -c 32 -j 8 -T 300 \
-      --default-isolation-level=serializable \
       --max-tries=10 -P 10 mydb
 
 Final report shows:
@@ -523,7 +522,7 @@ When iterating on tuning, skip the expensive parts:
 - `d` — drop existing tables
 - `t` — create tables
 - `g` — generate data
-- `G` — generate data (client-side, slower but cross-version safe)
+- `G` — generate data on the server
 - `p` — create primary keys
 - `f` — create foreign keys
 - `v` — vacuum after load
@@ -582,7 +581,7 @@ Pre-PG18 only showed aggregate failed-count. PG18+ lets you isolate which script
 
 12. **PG17 `-d` flag remap breaks pre-PG17 scripts.** `-d` was `--debug`; now it's `--dbname`. Pre-PG17 scripts using `pgbench -d mydb` silently treat `mydb` as the database name (was: enable debug, then look for default db). Test scripts on PG17 before relying.
 
-13. **`--latency-limit` is per-script, per-transaction, not per-statement.** A 500ms script with one 450ms statement at 50ms limit is skipped entirely. Use `-r` to find per-statement latency.
+13. **`--latency-limit` applies to complete transactions, not individual statements.** With `--rate`, transactions already too late to meet the limit are skipped before execution; completed late transactions are counted separately. Use `-r` for per-statement averages.
 
 14. **`-D var=value` sets variable on command line.** Useful for parameterizing scripts without editing them, e.g., `-D tenant=42`. Inside the script: `\set base_tenant :tenant`.
 

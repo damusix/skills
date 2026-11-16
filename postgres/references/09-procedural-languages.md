@@ -57,7 +57,7 @@ In practice:
 | Property | Trusted PL | Untrusted PL |
 |---|---|---|
 | Suffix convention | bare name (`plperl`, `pltcl`) | `u` suffix (`plperlu`, `pltclu`, `plpython3u`) |
-| Who can create functions | Any role with `USAGE` on the language (granted to `PUBLIC` by default for trusted languages)[^createlang-usage] | Only superuser, or via `SECURITY DEFINER` wrapper |
+| Who can create functions | Any role with `USAGE` on the language (granted to `PUBLIC` by default for trusted languages)[^createlang-usage] | Only superusers |
 | What the language can do | Only operations the back end can validate as memory- and database-safe; no filesystem, no network, no environment, no loading arbitrary modules | Anything the OS user running the postmaster can do — including reading files, opening sockets, spawning processes |
 | Registration syntax | `CREATE EXTENSION plperl;` (control file declares the language `TRUSTED`) | `CREATE EXTENSION plperlu;` |
 | Use case | Pure compute that should run on behalf of any caller | Code that genuinely needs the host OS |
@@ -85,7 +85,7 @@ Two corollaries that surprise developers:
 | PL/Rust | External (`plrust`) | `plrust` (sandboxed via WASM-like restrictions) | n/a | Memory-safe Rust bodies; relatively new. |
 
 > [!WARNING] Removed/Deprecated
-> `plpythonu` and `plpython2u` (PL/Python on Python 2) are obsolete. PG13 dropped support for Python 2.5.X and earlier;[^pg13-py25] subsequent releases progressively removed support for the rest of Python 2.x as Python 2 itself reached end of life (Jan 2020) and packagers stopped shipping it. Any documentation or third-party post mentioning `plpython2u` predates the PG13 era. **Use `plpython3u`** — that is the only PL/Python you should be writing today.
+> `plpythonu` and `plpython2u` (PL/Python on Python 2) are obsolete. PG13 dropped support for Python 2.5.X and earlier,[^pg13-py25] and PG15 removed `plpython2u` and `plpythonu` entirely; PG14 is the last release that supports Python 2.[^pg15-py2] Any documentation or third-party post mentioning `plpython2u` predates PG15. **Use `plpython3u`** — that is the only PL/Python you should be writing today.
 
 ### Installing a procedural language
 
@@ -120,7 +120,7 @@ You can confirm what is installed:
     FROM pg_extension
     ORDER BY extname;
 
-After `DROP EXTENSION plperl;` any function previously written `LANGUAGE plperl` is gone — `DROP EXTENSION` cascades to dependent objects. Run it inside a transaction so you can `ROLLBACK` if too much disappears.
+`DROP EXTENSION plperl` defaults to `RESTRICT` and refuses dependent functions. `CASCADE` also drops dependent objects; inspect dependencies before using it.
 
 ### Calling SPI from a PL
 
@@ -145,7 +145,7 @@ That means:
 
 - Anything `import os; os.system(...)` can do — read `/etc/passwd`, fork a shell, open a socket — is allowed.
 - Only a superuser can `CREATE FUNCTION ... LANGUAGE plpython3u` directly.
-- The standard way to give untrusted callers a controlled slice of PL/Python is `SECURITY DEFINER` on a function whose body is small, well-validated, and whose `search_path` is pinned (see [06-functions.md](./06-functions.md#security-definer-hardening)).
+- Grant `EXECUTE` on a reviewed function to callers who need it. Use `SECURITY DEFINER` only if the operation genuinely needs the owner's database privileges, and harden its search path.
 
 Minimum runnable example:
 
@@ -172,10 +172,11 @@ Type mapping (the most-used cells):
 | `text`, `varchar`, `char`, `name` | `str` |
 | `bytea` | `bytes` |
 | `int2`, `int4`, `int8` | `int` |
-| `float4`, `float8`, `numeric` | `float` (or `decimal.Decimal` for `numeric` when imported) |
+| `float4`, `float8` | `float` |
+| `numeric` | `decimal.Decimal` |
 | `bool` | `bool` |
-| `date`, `timestamp`, `timestamptz` | `datetime.date` / `datetime.datetime` |
-| `jsonb` | `dict` / `list` / scalar (decoded automatically) |
+| `date`, `timestamp`, `timestamptz` | `str`; parse explicitly when native Python objects are needed |
+| `jsonb` | `str` by default; with the `jsonb_plpython3u` extension and `TRANSFORM FOR TYPE jsonb` on the function, `dict` / `list` / scalars[^jsonb-plpython] |
 | `array[T]` | `list[python(T)]` |
 | `record` / composite | `dict` |
 | `NULL` | `None` |
@@ -299,8 +300,8 @@ None of these is shipped with the core distribution; each is a separate extensio
                 - plpython3u for stdlib breadth + popular libraries
                 - plperlu for CPAN-heavy shops
                 - pltclu only if your shop is Tcl-native
-               You will need superuser to create the function, or wrap it
-               in a SECURITY DEFINER function created by a superuser.
+               A superuser must create the function; grant EXECUTE only
+               to callers who should run the reviewed body.
         No   → continue below.
 
     Body is mostly SQL with thin control flow / DECLARE + variables?
@@ -312,9 +313,8 @@ None of these is shipped with the core distribution; each is a separate extensio
         No   → continue below.
 
     Need stdlib breadth (statistics, parsing, RFC formats) without the OS?
-        Yes  → no good answer in stock PostgreSQL. plpython3u is the answer
-               for "stdlib breadth" but only as a superuser-installed *u*
-               language. Wrap it in SECURITY DEFINER.
+        Yes  → no good sandboxed answer in stock PostgreSQL. A superuser
+               can create a reviewed plpython3u function and grant EXECUTE.
 
     Need JSON manipulation that goes beyond jsonb operators?
         Yes  → plv8 if you can install it. Otherwise plpython3u or PL/pgSQL
@@ -349,11 +349,11 @@ A common case: cleaning user-entered identifiers down to a canonical form.
     SELECT canonical_slug('Café — Niño''s Place!');
     -- => 'cafe-nino-s-place'
 
-This uses the Python stdlib's Unicode NFKD decomposition, which is materially more complete than what `unaccent` (the contrib extension) gives you. Mark `IMMUTABLE STRICT` so the planner can use it in an expression index — `CREATE INDEX ON places ((canonical_slug(name)));` is a viable pattern. Note that `IMMUTABLE` is a *promise* — if you change the body so it stops producing the same output for the same input, indexes built on it silently rot. See [06-functions.md](./06-functions.md#volatility-classes).
+This uses the Python stdlib's Unicode NFKD decomposition, which is materially more complete than what `unaccent` (the contrib extension) gives you. Mark `IMMUTABLE STRICT` so the planner can use it in an expression index — `CREATE INDEX ON places ((canonical_slug(name)));` is a viable pattern. Note that `IMMUTABLE` is a *promise* — if you change the body so it stops producing the same output for the same input, indexes built on it silently rot. See [06-functions.md](./06-functions.md#volatility-volatile--stable--immutable).
 
 ### 3. PL/Python: calling a stdlib library safely
 
-Generating a v7 UUID (time-ordered) is straightforward in Python ≥ 3.13. Until your PG18 backend's bundled Python gets that version, you can emulate v7:
+Python 3.14 introduced `uuid.uuid7()`. When that version is unavailable, an implementation can construct a v7 UUID:
 
     CREATE OR REPLACE FUNCTION uuid_v7()
     RETURNS uuid
@@ -373,7 +373,7 @@ Generating a v7 UUID (time-ordered) is straightforward in Python ≥ 3.13. Until
     $py$;
 
 > [!NOTE] PostgreSQL 18
-> PG18 added a *native* `uuidv7()` SQL function in core — use that on PG18 in preference to a PL/Python implementation.[^pg18-uuidv7] The PL/Python version is appropriate when you are stuck on PG ≤ 17 and cannot install the `pg_uuidv7` contrib extension.
+> PG18 added a native `uuidv7()` SQL function. For older servers, evaluate an external UUIDv7 extension or a reviewed implementation.[^pg18-uuidv7]
 
 ### 4. PL/Python: SPI access (plpy.execute, plpy.prepare)
 
@@ -402,7 +402,7 @@ The right way — prepare once per session, cache the plan in a globals dict so 
         return list(rv)
     $py$;
 
-`SD` is the per-function shared dictionary that persists for the life of the backend (`GD` is database-global across functions). Cached plans inherit the same generic-vs-custom planning rules described in [13-cursors-and-prepares.md](./13-cursors-and-prepares.md).
+`SD` is the per-function dictionary that persists for the life of the backend; `GD` is shared across PL/Python functions in that backend, not database-wide.
 
 ### 5. PL/Python: error handling and subtransactions
 
@@ -425,7 +425,7 @@ PL/Python exceptions map to PostgreSQL errors via `plpy.SPIError`. To recover fr
             raise
     $py$;
 
-Like in PL/pgSQL, each `with plpy.subtransaction():` block creates a real PostgreSQL subtransaction, consumes a XID, and stresses the `pg_subtrans` SLRU under high write rate. See [08-plpgsql.md](./08-plpgsql.md#exception-handling) for the same gotcha in the SQL-level language.
+Like in PL/pgSQL, each `with plpy.subtransaction():` block creates a real PostgreSQL subtransaction. It is assigned a subxid only when it writes, and subcommitted subxids stay in the 64-entry per-backend cache until the top-level transaction ends (only aborts remove them), so a loop of writing blocks overflows the cache and visibility checks then read `pg_subtrans`. See [08-plpgsql.md](./08-plpgsql.md#exception-handling) for the same gotcha in the SQL-level language.
 
 ### 6. PL/Python: set-returning function
 
@@ -452,7 +452,7 @@ Return rows by `yield`-ing or by returning an iterable:
     --  beta   | 2
     --  gamma  | 1
 
-Compare with `RETURNS TABLE(...)` syntax described in [06-functions.md](./06-functions.md#returns-table-and-out-parameters).
+Compare with `RETURNS TABLE(...)` syntax described in [06-functions.md](./06-functions.md#recipe-4--table-function-with-named-output-columns).
 
 ### 7. PL/Python: trigger function
 
@@ -632,13 +632,13 @@ For a security review or upgrade pre-flight:
                           WHERE c LIKE 'search\_path=%'))
       AND n.nspname NOT IN ('pg_catalog', 'information_schema');
 
-The last query is the same `SECURITY DEFINER` hardening audit recommended in [06-functions.md](./06-functions.md#security-definer-hardening). Every untrusted-PL function flagged is a candidate for review before a PG major upgrade.
+The last query is the same `SECURITY DEFINER` hardening audit recommended in [06-functions.md](./06-functions.md#recipe-11--audit-security-definer-functions-without-a-pinned-search_path). Every untrusted-PL function flagged is a candidate for review before a PG major upgrade.
 
 ## Gotchas / Anti-patterns
 
-1. **PL/Python is untrusted by definition.** There is no `plpythonu` route to a sandboxed Python. If a caller can `CREATE FUNCTION ... LANGUAGE plpython3u`, that caller can `os.system("rm -rf /")`. Restrict creation to a small set of trusted authors and rely on `SECURITY DEFINER` wrappers for everything callable by application roles.[^plpython-untrusted]
+1. **PL/Python is untrusted by definition.** Only superusers can create its functions, which execute with the database server's OS privileges. Grant execution only on reviewed functions; use `SECURITY DEFINER` only when elevated database privileges are necessary.[^plpython-untrusted]
 
-2. **`SECURITY DEFINER` on a `plpython3u` function without a pinned `search_path` is a working exploit.** PG17 made the maintenance path safer (see [06-functions.md](./06-functions.md#pg17-search-path-during-maintenance)), but a Python body that runs `SELECT foo()` is still vulnerable to schema-injection if `search_path` isn't fixed. Always `SET search_path = pg_catalog, public` on the function definition.
+2. **`SECURITY DEFINER` on a `plpython3u` function without a pinned `search_path` risks schema injection.** Pin a path containing only trusted schemas, with `pg_temp` last; do not include a schema writable by untrusted users.[^plpython-untrusted]
 
 3. **Untrusted PLs are usually disabled on managed services.** Most managed providers either omit `plpython3u` / `plperlu` / `pltclu` entirely or hide them behind a paid SKU. **Class of limitation:** anything that needs OS access. Categorical answer: write the logic in a trusted PL (PL/pgSQL, PL/Perl, PL/v8 if available) or move it out of the database. See [101-managed-vs-baremetal.md](./101-managed-vs-baremetal.md).
 
@@ -646,7 +646,7 @@ The last query is the same `SECURITY DEFINER` hardening audit recommended in [06
 
 5. **PL/Java, PL/R, PL/Lua, PL/Rust are also out-of-tree.** Their PG-version-compatibility matrices lag the core release. Before scheduling a major PG upgrade, check upstream support for every non-core PL you depend on.
 
-6. **`plpython2u` / `plpythonu` are obsolete.** PG13 dropped the older Python 2 lines.[^pg13-py25] Modern PG ships with Python 3 only. If a vendored function uses `plpython2u`, it must be ported to `plpython3u` (which is mostly mechanical — Python 3 syntax, `print(...)`, `bytes`/`str` distinction) before the next major upgrade.
+6. **`plpython2u` / `plpythonu` are obsolete.** PG15 removed both languages and Python 2 support; PG14 still supports Python 2. Port older functions to `plpython3u` before upgrading past PG14.[^pg15-py2]
 
 7. **Per-language interpreter state is backend-scoped and grows unbounded.** PL/Python `SD`/`GD`, PL/Perl `$_SHARED`, PL/v8's V8 isolate, and PL/Java's JVM all persist for the lifetime of the backend. Two risks: (a) in transaction-mode pooling (see [81-pgbouncer.md](./81-pgbouncer.md)), the same backend serves many app sessions — cached state from one session can leak into the next; (b) stuffing request data into `GD` leaks memory across calls. Cache only what is invariant (prepared plans, parsed regex, compiled validators). Use session-mode pooling for procedures that rely on per-backend state.
 
@@ -656,11 +656,11 @@ The last query is the same `SECURITY DEFINER` hardening audit recommended in [06
 
 11. **Returning rows from a SETOF PL function: data type must match exactly.** PL/Python returns `dict`s keyed by column name; PL/Perl returns hashrefs keyed by column name; PL/Tcl returns lists matching the column order. Misalignment between body and `RETURNS TABLE(...)` produces a runtime error, not a parse error.
 
-12. **Custom function bodies are stored as `text` in `pg_proc.prosrc`** regardless of language. `pg_dump` round-trips them as text. Editing them in place via `CREATE OR REPLACE FUNCTION` will invalidate cached plans across backends only after `DISCARD PLANS` or the next plan cache miss — same caveat as [06-functions.md](./06-functions.md#alter-and-replace).
+12. **Function replacement and cached plans.** PostgreSQL invalidates dependent cached plans after definition changes; in-flight calls and persistent interpreter state still require rollout care. See [06-functions.md](./06-functions.md#lock-level-summary-for-function-ddl).
 
-13. **Triggers in an untrusted PL look like a fast way to add side effects, but they punch a hole through the trust model.** A row insert on a table can fire an `AFTER INSERT` trigger that runs `plpython3u` code with the *trigger owner's* privileges (which is typically a superuser, because that's who installed the language). Audit every trigger that uses an untrusted PL.
+13. **Untrusted-language triggers can perform OS-level side effects.** A trigger function runs as the invoking role by default, or as its owner if declared `SECURITY DEFINER`; the interpreter still has the server process's OS privileges. Audit trigger bodies and execution privileges.
 
-14. **Subtransactions in PL bodies stress `pg_subtrans`** the same way `EXCEPTION` blocks in PL/pgSQL do. `plpy.subtransaction()`, PL/Perl `eval { ... }; spi_rollback`, PL/Tcl `catch { ... }`, PL/v8 `plv8.subtransaction()` — all of these consume XIDs and contribute to subtrans SLRU pressure. Don't put them in tight loops. See [08-plpgsql.md](./08-plpgsql.md#exception-handling-and-subtransactions) for the same gotcha in PL/pgSQL.
+14. **Subtransactions in PL bodies stress `pg_subtrans`** the same way `EXCEPTION` blocks in PL/pgSQL do. `plpy.subtransaction()`, PL/Perl `eval { ... }; spi_rollback`, PL/Tcl `catch { ... }`, PL/v8 `plv8.subtransaction()` all create subtransactions. Each one that writes gets a subxid that stays in the 64-entry per-backend cache until the top-level transaction ends unless it aborts, so writing loops overflow the cache and push visibility checks to `pg_subtrans`. Don't put them in tight loops. See [08-plpgsql.md](./08-plpgsql.md#exception-handling) for the same gotcha in PL/pgSQL.
 
 15. **No way to share types between PLs without going through SQL.** If a PL/Python body returns a Python `dict`, it is serialised through Postgres's wire types into the SQL row; PL/Perl on the other side sees a hashref it built from scratch. There is no shared in-process object.
 
@@ -702,6 +702,10 @@ The last query is the same `SECURITY DEFINER` hardening audit recommended in [06
 [^pg13-trusted-ext]: PostgreSQL 13 Release Notes. Quote: *"Allow extensions to be specified as trusted (Tom Lane). Such extensions can be installed in a database by users with database-level CREATE privileges, even if they are not superusers. This change also removes the `pg_pltemplate` system catalog."* https://www.postgresql.org/docs/release/13.0/
 
 [^pg13-py25]: PostgreSQL 13 Release Notes. Quote: *"Remove support for Python versions 2.5.X and earlier (Peter Eisentraut)."* https://www.postgresql.org/docs/release/13.0/
+
+[^pg15-py2]: PostgreSQL 15 Release Notes. Quote: *"Remove server-side language plpython2u and generic Python language plpythonu (Andres Freund). Python 2.x is no longer supported."* https://www.postgresql.org/docs/release/15.0/
+
+[^jsonb-plpython]: PostgreSQL 16 — Section 8.14.6 "Transforms". Quote: *"The extension for PL/Python is called jsonb_plpython3u. If you use it, jsonb values are mapped to Python dictionaries, lists, and scalars, as appropriate."* https://www.postgresql.org/docs/16/datatype-json.html
 
 [^ext-trusted]: PostgreSQL 16 — Section 38.17.1 "Extension Files", `trusted` control-file parameter. Quote: *"This parameter, if set to true (which is not the default), allows some non-superusers to install an extension that has superuser set to true. Specifically, installation will be permitted for anyone who has CREATE privilege on the current database."* and *"When the user executing `CREATE EXTENSION` is not a superuser but is allowed to install by virtue of this parameter, then the installation or update script is run as the bootstrap superuser, not as the calling user."* https://www.postgresql.org/docs/16/extend-extensions.html
 

@@ -50,7 +50,7 @@ Five rules drive every Patroni decision:
 | K8s deployment | K8s operator (CNPG / Zalando) | Standalone Patroni in K8s | Operator handles PVC + Service + StatefulSet lifecycle; Patroni-direct works but more YAML |
 | 2-node cluster | Patroni + 3-node DCS quorum on **separate** hosts | DCS on same hosts as PG | Quorum requires majority; co-locating DCS with PG breaks the fencing model |
 | RTO target ~10s | Patroni + watchdog + sync replication | Manual promotion | Patroni's HA loop default `loop_wait=10s` + DCS TTL `30s` ≈ 10-30s detect + promote |
-| RPO target = 0 | `synchronous_mode: on` + `synchronous_node_count >= 1` | Async-only | Sync replication is the only zero-data-loss mode; trade-off is write availability |
+| Minimize acknowledged-write loss | `synchronous_mode: on` + `synchronous_mode_strict: true` | Async-only | Strict mode blocks ordinary synchronous commits without an eligible standby; manual failover, transaction overrides, and concurrent failures require separate planning. |
 | Read-only routing | HAProxy + `/replica` health check + `noloadbalance` tag | TCP-only health check | `/replica` returns 503 on primary; TCP health check thinks primary is replica |
 | Cascading replication | `tags: replicatefrom: <member>` on the leaf | Manual `primary_conninfo` edit | Manual edit fights Patroni; tag persists across promotions |
 | Maintenance window without failover | `patronictl pause` | Stop Patroni daemon | Pause leaves PG running, blocks automatic actions; stopping daemon triggers leader expiry → failover |
@@ -228,7 +228,7 @@ Twelve dynamic settings catalog:
 | `synchronous_node_count` | 1 | How many sync standbys (with `synchronous_mode: on`) |
 | `synchronous_mode_strict` | false | Block writes if no sync standby available |
 | `failsafe_mode` | false | Prevents demoting leader on DCS outage if all healthy replicas vote yes |
-| `check_timeline` | true | Don't promote a node on a divergent timeline |
+| `check_timeline` | false | When enabled, prevents automatic promotion of a node on a divergent timeline |
 | `postgresql.use_pg_rewind` | false | Use `pg_rewind` for re-attaching diverged former primary |
 | `postgresql.parameters.*` | (cluster-wide PG GUCs synced to every node's `postgresql.conf`) | |
 
@@ -385,7 +385,7 @@ Twelve common commands:
 **Scheduled switchover example:**
 
     patronictl switchover \
-      --master pg-node-1 \
+      --leader pg-node-1 \
       --candidate pg-node-2 \
       --scheduled '2026-05-13T22:00:00' \
       --force
@@ -543,7 +543,7 @@ Hub-and-spoke pattern for geographic distribution:
     patronictl -c /etc/patroni/patroni.yml list
     # Verify pg-node-1 is leader, all replicas in sync, no lag
 
-    patronictl switchover --master pg-node-1 --candidate pg-node-2 --force
+    patronictl switchover --leader pg-node-1 --candidate pg-node-2 --force
 
     # Verify new state
     patronictl list
@@ -630,7 +630,7 @@ If that fails, manually demote in DCS:
 
 ### 10. Detect split-brain (two nodes both think they're leader)
 
-This should be impossible with watchdog enabled. If observed:
+Watchdog reduces the risk but is not an unconditional guarantee. If observed, fence unauthorized writers and preserve both data directories before any rewind:
 
     patronictl list
     # Both pg-node-1 and pg-node-2 marked Leader → split-brain
@@ -645,7 +645,7 @@ Recovery (manual, **do not delay**):
 
        ssh pg-node-2 systemctl stop patroni postgresql
 
-3. On the stopped node, use `pg_rewind` to re-attach to the real leader (cross-reference `89-pg-rewind.md`).
+3. Preserve the stopped node's data and investigate divergence before choosing a survivor or running `pg_rewind`, which overwrites divergent data.
 
 4. Start Patroni on the stopped node — it will rejoin as replica.
 
@@ -696,7 +696,7 @@ Wire `/metrics` into Prometheus + alert on `patroni_cluster_unlocked == 1` (no l
 4. **`loop_wait + 2 * retry_timeout > ttl` is rejected.** Verbatim rule. Default 10+20≤30 sits at the boundary.
 5. **DCS quorum must live on hosts separate from PG.** Co-locating DCS with PG defeats the fencing model — a partition that splits PG also splits DCS the same way.
 6. **2-node Patroni clusters cannot achieve quorum.** Always 3 nodes minimum (or 3-node DCS quorum + 2 PG nodes — but then DCS quorum survives 1 failure, PG cluster doesn't).
-7. **`synchronous_mode: on` with 1 standby blocks writes if that standby is down.** Use `synchronous_node_count: 1` + `synchronous_mode_strict: false` to allow degradation to async. Or `quorum` with N>=2.
+7. **`synchronous_mode: on` without strict mode may accept writes without a synchronous standby.** Enable `synchronous_mode_strict: true` if ordinary synchronous writes must block when none is eligible. [Patroni replication modes](https://patroni.readthedocs.io/en/latest/replication_modes.html).
 8. **`maximum_lag_on_failover: 1MB` (default) means lagging replicas can't be promoted.** A reporting replica with `nosync: true` that falls behind can't be a failover candidate — by design. Tune per workload.
 9. **Patroni manages `postgresql.conf` — your manual edits are overwritten.** All PG GUCs go through `postgresql.parameters` in dynamic config.
 10. **`replicatefrom` is a hint, not a hard constraint.** If the named upstream is unavailable, Patroni falls back to the primary. Tag survives across promotions.

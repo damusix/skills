@@ -212,7 +212,7 @@ GiST is **lossy** for trigram — bitmap signatures lose information. Index matc
 | Read speed | Fast (~10× GiST on substring) | Slower |
 | Write speed | Slow, write amplification | Faster |
 | Index size | Larger (~2-5× heap) | Smaller (~10-20% heap) |
-| Lossy / recheck | Lossless | Lossy (recheck always) |
+| Lossy / recheck | Predicate recheck may be required | Signature approximation can require recheck |
 | KNN `<->` distance ordering | NO | YES |
 | `LIKE` / `ILIKE` / regex | YES | YES |
 | `%` / `<%` / `<<%` predicates | YES | YES |
@@ -224,7 +224,7 @@ Rule of thumb: **GIN unless you need KNN or write rate is so high GIN can't keep
 
 ### LIKE / ILIKE / Regex Acceleration
 
-Both opclasses accelerate `LIKE`, `ILIKE`, `~`, `~*` patterns. Planner picks index when pattern has 2+ contiguous non-wildcard characters.
+Both opclasses accelerate `LIKE`, `ILIKE`, `~`, `~*` when the pattern yields useful trigrams. A pattern with no extractable trigrams degenerates to a full-index scan; the planner may instead choose a sequential scan ([pgtrgm.html][pgtrgm-16]).
 
     -- All four accelerate via gin_trgm_ops / gist_trgm_ops:
     SELECT * FROM users WHERE name LIKE '%alice%';
@@ -235,9 +235,13 @@ Both opclasses accelerate `LIKE`, `ILIKE`, `~`, `~*` patterns. Planner picks ind
     -- Anchored prefix LIKE 'foo%' — trigram works but B-tree text_pattern_ops faster:
     SELECT * FROM users WHERE name LIKE 'al%';
 
-    -- Single-character pattern '%a%' — too short, won't use index:
-    SELECT * FROM users WHERE name LIKE '%a%';
-    -- Sequential scan. Need at least 2 contiguous characters.
+    -- No extractable trigram: a word-character run with a wildcard (% or _) on
+    -- both sides is not padded, so it needs 3 consecutive word characters.
+    -- '%ab%' extracts nothing; '%abc%' extracts 'abc'. A run that touches the
+    -- pattern start or end, or a non-word character, is padded with spaces,
+    -- so 'ab%' still extracts '  a' and ' ab'.
+    SELECT * FROM users WHERE name LIKE '%ab%';
+    -- Full-index scan or sequential scan; inspect the plan.
 
 `EXPLAIN ANALYZE` to verify trigram index used:
 
@@ -378,8 +382,8 @@ Audit query to find all trigram indexes:
     -- For word-level matching (multi-word free-text):
     SELECT description, word_similarity('database', description) AS sim
     FROM articles
-    WHERE description <% 'database'
-    ORDER BY description <<-> 'database'
+    WHERE 'database' <% description
+    ORDER BY 'database' <<-> description
     LIMIT 10;
 
 ### 6. Multi-column fuzzy via concatenation
@@ -412,22 +416,15 @@ Audit query to find all trigram indexes:
 
 ### 8. Post-PG18-upgrade REINDEX after non-libc default
 
-    -- One-shot loop for any cluster where default collation provider is non-libc
-    DO $$
-    DECLARE r record;
-    BEGIN
-        FOR r IN
-            SELECT format('%I.%I', n.nspname, c.relname) AS idx
-            FROM pg_index i
-            JOIN pg_class c ON c.oid = i.indexrelid
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_opclass o ON o.oid = ANY(i.indclass)
-            WHERE o.opcname IN ('gin_trgm_ops', 'gist_trgm_ops')
-        LOOP
-            EXECUTE format('REINDEX INDEX CONCURRENTLY %s', r.idx);
-            RAISE NOTICE 'Reindexed %', r.idx;
-        END LOOP;
-    END $$;
+    -- Generate commands in psql; execute each outside a transaction block.
+    SELECT DISTINCT format('REINDEX INDEX CONCURRENTLY %I.%I;', n.nspname, c.relname)
+    FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_opclass o ON o.oid = ANY(i.indclass)
+    WHERE o.opcname IN ('gin_trgm_ops', 'gist_trgm_ops')
+      AND c.relkind = 'i'
+    \gexec
 
     -- Alternative if you also have FTS indexes — pair with iter 65/26 cross-reference
     -- See 65-collations-encoding.md for full collation-version monitoring
@@ -633,7 +630,7 @@ Five clear signals you should NOT use pg_trgm:
 
 2. **`pg_trgm.similarity_threshold` is per-session.** Cluster-wide change via `ALTER SYSTEM` + reload. Changing threshold changes which rows the `%` operator returns. Tests pass at threshold 0.3 may fail at 0.5.
 
-3. **Patterns under 2 contiguous characters can't use trigram index.** `LIKE '%a%'`, `LIKE 'a%b%c'` (single-char fragments) sequential-scan. Need at least one 2-char run.
+3. **Patterns with no extractable trigrams can require a full-index scan.** Selectivity depends on the pattern, including word boundaries; inspect the actual plan. See <https://www.postgresql.org/docs/16/pgtrgm.html>.
 
 4. **GIN does NOT support KNN distance ordering.** `ORDER BY col <-> 'q' LIMIT 10` on `gin_trgm_ops` produces a Sort node, not an index scan with KNN. Use `gist_trgm_ops` for KNN.
 
@@ -671,7 +668,7 @@ Five clear signals you should NOT use pg_trgm:
 
 21. **Concatenated-column indexes need transitivity care.** `CREATE INDEX ... USING gin ((a || ' ' || b) gin_trgm_ops)` works but query must use exact expression. Mid-string spaces matter: `'foo bar' || ' ' || 'baz'` → `'foo bar baz'`; concatenating `'foo'` + `'bar baz'` gives the same trigrams but different word boundaries.
 
-22. **PG18 parallel GIN build doesn't help CREATE INDEX CONCURRENTLY.** CIC always single-threaded regardless of `max_parallel_maintenance_workers`. Parallel GIN helps offline `CREATE INDEX` and `REINDEX`. See [`26-index-maintenance.md`](./26-index-maintenance.md).
+22. **PG18 supports parallel GIN builds, including concurrent builds.** Only the first table scan of a concurrent build can be parallel. Worker availability and planner choices affect actual parallelism. See <https://www.postgresql.org/docs/18/sql-createindex.html>.
 
 23. **No partial trigram operators.** No way to ask "trigrams starting with X" via operator. Must use `LIKE` or regex.
 

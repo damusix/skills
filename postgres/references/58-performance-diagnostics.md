@@ -36,7 +36,7 @@ This file is the **picker** for which view answers which question. The per-view 
 
 1. **`pg_stat_activity` is the "what's happening right now?" view.** One row per backend (client connection, autovacuum worker, replication walsender, parallel worker, logical-replication apply worker). Filter by `state`, group by `wait_event_type`/`wait_event`, join to `pg_blocking_pids()` to find blocking chains. Every diagnostic walk starts here.
 
-2. **`wait_event_type` and `wait_event` route every "why is this slow?" investigation.** A backend in `state = 'active'` with `wait_event_type IS NULL` is on CPU. With `wait_event_type = 'Lock'` it is blocked on a heavyweight lock (route to [`43-locking.md`](./43-locking.md)). With `wait_event_type = 'IO'` it is waiting on disk (route to [`32-buffer-manager.md`](./32-buffer-manager.md) and [`33-wal.md`](./33-wal.md)). With `wait_event_type = 'LWLock'` it is waiting on an internal lightweight lock (route to the specific lock name).
+2. **`wait_event_type` and `wait_event` help route slow-query investigations.** A NULL wait event means no instrumented wait is currently reported, not necessarily that the backend is executing on CPU. `Lock`, `IO`, and `LWLock` indicate different kinds of waits.
 
 3. **Cumulative views accumulate since the last reset, not since cluster start.** `pg_stat_database`, `pg_stat_user_tables`, `pg_stat_user_indexes`, `pg_statio_*`, `pg_stat_bgwriter`, `pg_stat_checkpointer`, `pg_stat_io`, `pg_stat_wal` — all carry `stats_reset` columns or rely on `pg_stat_reset_*()`. A rate calculation requires two snapshots; absolute values without a baseline are nearly useless on a long-running cluster.
 
@@ -45,7 +45,7 @@ This file is the **picker** for which view answers which question. The per-view 
 5. **The view-catalog has version-introduced columns and version-renamed columns.** PG14 added `pg_stat_wal` + `pg_stat_replication_slots` + `pg_locks.waitstart` + session columns on `pg_stat_database`. PG15 added `pg_stat_subscription_stats`. PG16 added `pg_stat_io` + `last_seq_scan`/`last_idx_scan` columns + `n_tup_newpage_upd`. PG17 split `pg_stat_checkpointer` out of `pg_stat_bgwriter` (and removed `buffers_backend`/`buffers_backend_fsync`), renamed `pg_stat_progress_vacuum.max_dead_tuples` to `max_dead_tuple_bytes`, and renamed `pg_stat_statements.blk_*_time` to `shared_blk_*_time`. PG18 added bytes columns to `pg_stat_io` (and removed `op_bytes`), added WAL rows to `pg_stat_io`, added `pg_stat_get_backend_io()`, added `parallel_workers_to_launch`/`parallel_workers_launched` to `pg_stat_database`, added `num_done` and `slru_written` to `pg_stat_checkpointer`, and added the `pg_aios` async-I/O view.
 
 > [!WARNING] Monitoring queries written for PG16 break on PG17 and PG18
-> The PG17 `pg_stat_checkpointer` split, the PG17 `pg_stat_progress_vacuum` column renames, and the PG18 `pg_stat_io.op_bytes` removal all silently produce zero-row or null-column results when an unmodified PG16-era query runs against the newer cluster. Audit your monitoring after any major-version upgrade. See [Gotcha #6](#gotchas--anti-patterns) and the recipes for side-by-side rewrites.
+> The PG17 `pg_stat_checkpointer` split, PG17 vacuum-progress column renames, and PG18 `pg_stat_io.op_bytes` removal break queries that directly reference the old columns. Audit monitoring after major-version upgrades.
 
 ## Decision Matrix
 
@@ -59,7 +59,7 @@ This file is the **picker** for which view answers which question. The per-view 
 | Tables needing autovacuum attention | `pg_stat_user_tables` | `WHERE n_dead_tup > 10000 ORDER BY n_dead_tup::float / NULLIF(n_live_tup, 0) DESC` | hard cutoffs without considering table size |
 | Unused indexes | `pg_stat_user_indexes` | `WHERE idx_scan = 0 AND NOT pg_index.indisunique` | dropping without checking replica index usage |
 | Table/index buffer hit rate | `pg_statio_user_tables` / `pg_statio_user_indexes` | `heap_blks_hit::float / NULLIF(heap_blks_hit + heap_blks_read, 0)` | conflating "hit rate" with "performance" |
-| Per-relation I/O attribution (PG16+) | `pg_stat_io` | `GROUP BY backend_type, context` | pre-PG16 (use pg_stat_bgwriter + pg_statio_*) |
+| I/O by backend type and context (PG16+) | `pg_stat_io` | `GROUP BY backend_type, context` | assuming it identifies individual relations; use `pg_statio_*` for relation counters |
 | WAL volume rate (PG14+) | `pg_stat_wal` | two snapshots over time | reading without time delta |
 | Long-running VACUUM | `pg_stat_progress_vacuum` JOIN `pg_stat_activity` | `WHERE wait_event_type IS NOT NULL` flags blocking | confusing with VACUUM FULL (PG14–18: use `pg_stat_progress_cluster`; PG19: `pg_stat_progress_repack`) |
 | Long-running CREATE INDEX (CONCURRENTLY) | `pg_stat_progress_create_index` | `WHERE phase = 'waiting for writers before build'` flags long-running-tx blocker | reading without `xact_start` join |
@@ -110,7 +110,7 @@ Key columns (PG16):
 | `client_addr` / `client_hostname` / `client_port` | inet / text / integer | Network identification of the client |
 | `backend_start` | timestamptz | When this backend started |
 | `xact_start` | timestamptz | When the current transaction started, or NULL if not in a transaction |
-| `query_start` | timestamptz | When the current query started, or for `idle`/`idle in transaction` when the previous query ended |
+| `query_start` | timestamptz | When the current query started, or when the last query started if not active |
 | `state_change` | timestamptz | When the state last changed |
 | `wait_event_type` | text | Type of event the backend is waiting on (NULL = not waiting) |
 | `wait_event` | text | Specific event name |
@@ -333,14 +333,14 @@ Verbatim docs rule:[^monitoring-chapter] *"When a server process is asked to dis
 
 In practice:
 
-- **Within a transaction**, every `pg_stat_*` view returns the values from the first read in the transaction. To get fresh data without committing, call `SELECT pg_stat_clear_snapshot();` first.
+- **Within a transaction**, accumulated statistics are cached according to `stats_fetch_consistency`; activity information has separate snapshot behavior. Use `pg_stat_clear_snapshot()` or a new transaction to refresh cached information.[^monitoring-chapter]
 - **`pg_stat_reset()`** resets all per-database stats (table, index, function counters in the current database). Per-cluster views (`pg_stat_bgwriter`, `pg_stat_checkpointer`, `pg_stat_wal`, `pg_stat_io`, `pg_stat_archiver`) reset independently with `pg_stat_reset_shared(target text)` where `target` is one of `bgwriter`, `checkpointer`, `archiver`, `wal`, `io`.
 - **`pg_stat_reset_single_table_counters(relid oid)`** resets one table.
 - **`pg_stat_reset_replication_slot(slot_name text)`** resets one logical-decoding slot's `pg_stat_replication_slots` row (PG14+).
 - **`pg_stat_reset_subscription_stats(subid oid)`** resets one subscription's error counts (PG15+).
 - **`pg_stat_reset_backend_stats(pid integer)`** resets per-backend I/O (PG18+).
 
-Stats persist across clean restart (written to `pg_stat/` directory at shutdown). A crash loses statistics for the current statistics-collector reporting interval — at most a few seconds.
+Stats persist across clean restart. After an unclean shutdown, crash, base backup, or point-in-time recovery, cumulative statistics counters reset.[^monitoring-chapter]
 
 ### Per-version timeline
 
@@ -378,7 +378,7 @@ ORDER BY query_start;
 
 Reading the output:
 
-- `state = 'active'` AND `wait_event_type IS NULL` → backend is on CPU.
+- `state = 'active'` AND `wait_event_type IS NULL` → no instrumented wait is reported; this is not proof of CPU execution.
 - `state = 'active'` AND `wait_event_type = 'IO'` → waiting on disk (route to [`32-buffer-manager.md`](./32-buffer-manager.md)).
 - `state = 'active'` AND `wait_event_type = 'Lock'` → blocked on a heavyweight lock (route to Recipe 2).
 - `state = 'idle in transaction'` → application started a transaction and is sitting on it (cross-reference [`41-transactions.md`](./41-transactions.md) for `idle_in_transaction_session_timeout`).
@@ -390,14 +390,14 @@ SELECT
     blocked.pid                         AS blocked_pid,
     blocked.usename                     AS blocked_user,
     LEFT(blocked.query, 60)             AS blocked_query,
-    blocking.pid                        AS blocking_pid,
+    blocking_pid                        AS blocking_pid,
     blocking.usename                    AS blocking_user,
     blocking.state                      AS blocking_state,
     LEFT(blocking.query, 60)            AS blocking_query,
     now() - blocked.xact_start          AS blocked_xact_age
 FROM pg_stat_activity blocked
 CROSS JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS blocking_pid
-JOIN pg_stat_activity blocking ON blocking.pid = blocking_pid
+LEFT JOIN pg_stat_activity blocking ON blocking.pid = blocking_pid
 WHERE pg_blocking_pids(blocked.pid) != '{}'
 ORDER BY blocked.xact_start;
 ```
@@ -530,7 +530,7 @@ Phase interpretation:
 - `vacuuming indexes` — Per-index cleanup. If `index_vacuum_count > 1` for one VACUUM run, `maintenance_work_mem` is too small and VACUUM has to scan indexes multiple times to clean accumulated dead tuples.
 - `vacuuming heap` / `cleaning up indexes` / `truncating heap` / `performing final cleanup` — Wrap-up phases.
 
-If `wait_event_type = 'Lock'` or `wait_event_type = 'BufferPin'` (PG14–18; `wait_event_type = 'Buffer' AND wait_event = 'BufferCleanup'` on PG19) for a long-running anti-wraparound VACUUM, something is blocking it. Anti-wraparound VACUUM cannot be canceled by `lock_timeout` (cross-reference [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md) gotcha #4).
+If an anti-wraparound VACUUM waits on a lock or buffer pin, investigate the blocker. A conflicting DDL statement's `lock_timeout` cancels that waiting statement, not the vacuum. Explicit cancellation or termination of the worker remains possible but jeopardizes wraparound protection; resolve the blocker and ensure vacuum completes.
 
 ### Recipe 8: Streaming replication lag per standby
 
@@ -550,7 +550,7 @@ FROM pg_stat_replication
 ORDER BY pg_wal_lsn_diff(sent_lsn, replay_lsn) DESC;
 ```
 
-The verbatim docs note (paraphrased from `pg_stat_replication`): the `*_lag` time columns are NULL when the standby has nothing pending. Reading `replay_lag IS NULL` as "no lag" is correct; reading `replay_lag IS NULL` while `pg_wal_lsn_diff(sent_lsn, replay_lsn) > 0` means the lag exists in bytes but the time has not yet been computed because the standby has not yet ACKed. Cross-reference [`73-streaming-replication.md`](./73-streaming-replication.md).
+The lag time columns can become NULL on an idle, caught-up standby, but NULL alone does not establish health or absence of lag. Check connection state, reply freshness, and LSN positions together. Cross-reference [`73-streaming-replication.md`](./73-streaming-replication.md).
 
 ### Recipe 9: Slot WAL retention — abandoned slots burning disk
 
@@ -595,7 +595,7 @@ ORDER BY l.relation, l.granted DESC, a.xact_start;
 
 This combines lock-level visibility with session-level activity. The first row (`granted = true`) for each `relation` is the holder; subsequent rows (`granted = false`) are the queue. Cross-reference [`43-locking.md`](./43-locking.md) Recipe 1.
 
-### Recipe 11: PG16+ per-relation I/O attribution via pg_stat_io
+### Recipe 11: PG16+ I/O attribution by backend type and context
 
 ```sql
 -- PG16-17 (op_bytes column exists):
@@ -662,7 +662,7 @@ SELECT pg_terminate_backend(<pid>);
 
 ## Gotchas / Anti-patterns
 
-1. **`pg_stat_activity` snapshots are transaction-cached.** Reading the view twice in the same transaction returns identical results. Use `SELECT pg_stat_clear_snapshot();` to discard the snapshot or run each query in autocommit mode (the default in psql).
+1. **Activity information is transaction-cached.** Use `pg_stat_clear_snapshot()` or a new transaction for a fresh view; accumulated counters follow `stats_fetch_consistency`.
 
 2. **`state = 'active'` does NOT mean "on CPU."** Active backends can be waiting on `Lock`, `IO`, `LWLock`, `IPC`, etc. Always check `wait_event_type` alongside state.
 
@@ -672,9 +672,9 @@ SELECT pg_terminate_backend(<pid>);
 
 5. **`idx_scan = 0` is NOT proof the index is unused.** It is proof the index has not been scanned since the last `pg_stat_reset()` ON THIS NODE. Replicas track independently. Stats reset on `pg_upgrade`. The `last_idx_scan` column (PG16+) gives a more honest "never used since this column was introduced" signal.
 
-6. **Monitoring queries written for PG≤16 break on PG17+ in three ways:** (a) `pg_stat_bgwriter.buffers_backend` / `buffers_backend_fsync` removed — read `pg_stat_io` instead; (b) `pg_stat_bgwriter.checkpoints_*` columns moved to `pg_stat_checkpointer`; (c) `pg_stat_progress_vacuum.max_dead_tuples` / `num_dead_tuples` renamed to `max_dead_tuple_bytes` / `num_dead_item_ids`. The PG16-era query silently returns NULL or zero from these columns instead of erroring.
+6. **Monitoring queries written for PG≤16 break on PG17+** when they reference removed or renamed columns. Such direct references raise a missing-column error; update queries for `pg_stat_io`, `pg_stat_checkpointer`, and the new vacuum progress columns.
 
-7. **`pg_stat_io.op_bytes` was removed in PG18.** Computing volume as `reads * op_bytes` returns NULL on PG18. Use `read_bytes` / `write_bytes` / `extend_bytes` directly.
+7. **`pg_stat_io.op_bytes` was removed in PG18.** Direct references fail with a missing-column error. Use `read_bytes` / `write_bytes` / `extend_bytes` directly.
 
 8. **`pg_stat_progress_vacuum` does NOT show `VACUUM FULL`.** On PG14–18, VACUUM FULL is implemented as a CLUSTER and reports through `pg_stat_progress_cluster` with `command = 'VACUUM FULL'`. PG19 reports it through `pg_stat_progress_repack`.
 
@@ -686,9 +686,9 @@ SELECT pg_terminate_backend(<pid>);
 
 12. **Cumulative counters wrap at bigint, eventually.** `pg_stat_database.tup_returned`, `pg_stat_user_tables.seq_tup_read`, `pg_stat_wal.wal_records` are bigints. On extremely-high-traffic clusters, they wrap after years of uptime. A negative `delta = current - prior` between two snapshots is a wraparound signal, not a bug.
 
-13. **`stats_reset` is per-collector-target, not per-view.** Resetting `pg_stat_database` does not reset `pg_stat_user_tables` or `pg_stat_user_indexes`. Each per-database stat target resets together; cross-cluster shared stats (bgwriter, checkpointer, wal, io, archiver) reset independently via `pg_stat_reset_shared(target text)`.
+13. **Statistics have separate reset scopes.** `pg_stat_reset()` resets counters for the current database, including its table and index counters; shared targets such as WAL and I/O have separate reset functions.
 
-14. **`pg_stat_replication.replay_lag` is NULL on idle standbys.** A standby that has caught up to the primary's LSN and is waiting has `replay_lag = NULL`. Reading this as "no lag" is correct, but it is NOT equivalent to "the standby is healthy" — a stopped standby also has `replay_lag = NULL` because no recent WAL has been streamed.
+14. **`pg_stat_replication.replay_lag` may be NULL on an idle standby.** NULL alone does not prove the standby is caught up or healthy; inspect LSNs and reply freshness as well.
 
 15. **`pg_stat_progress_create_index` shows `phase = 'waiting for writers before build'` indefinitely if a long transaction is open.** CREATE INDEX CONCURRENTLY's wait-for-writers phase is the most common cause of stuck CIC. Identify the blocker via `current_locker_pid` joined to `pg_stat_activity`. Cross-reference [`26-index-maintenance.md`](./26-index-maintenance.md) Recipe 8.
 
@@ -696,15 +696,15 @@ SELECT pg_terminate_backend(<pid>);
 
 17. **`pg_stat_wal.wal_buffers_full > 0` on a busy cluster signals undersized `wal_buffers`.** Cross-reference [`33-wal.md`](./33-wal.md) for `wal_buffers` tuning.
 
-18. **`pg_stat_database.conflicts > 0` only matters on standbys.** On the primary, this is always zero. Recovery conflicts on a standby (a primary VACUUM removed rows that a standby query was using) are normal under load; raise them above zero by setting `hot_standby_feedback = on` (with cost — see [`73-streaming-replication.md`](./73-streaming-replication.md)).
+18. **`pg_stat_database.conflicts` counts recovery conflicts on standbys.** `hot_standby_feedback` can reduce cleanup-related conflicts but can also increase primary bloat and does not prevent every type of conflict; inspect the conflict breakdown before tuning.
 
 19. **`pg_stat_database.checksum_failures > 0` is an emergency.** This is page-level corruption. Cross-reference [`88-corruption-recovery.md`](./88-corruption-recovery.md). Treat the cluster as compromised until you have isolated the corrupted relation via `pg_amcheck`.
 
 20. **`pg_stat_user_indexes.idx_tup_fetch` is zero for Index Only Scans without heap fetches.** A working index-only-scan plan increments `idx_tup_read` but not `idx_tup_fetch`. Concluding "this index is not returning rows" from `idx_tup_fetch = 0` is wrong; check `idx_scan` and `idx_tup_read` instead.
 
-21. **`pg_stat_progress_basebackup` only shows server-side basebackup operations.** A client-side `pg_basebackup` running in another network namespace does not appear here.
+21. **`pg_stat_progress_basebackup` reports the server-side WAL sender streaming a base backup.** A remote `pg_basebackup` appears there while its server-side backup is active.[^progress-reporting]
 
-22. **`pg_stat_activity.backend_type = 'client backend'` excludes background workers** but INCLUDES parallel workers (with non-NULL `leader_pid`). Filter `leader_pid IS NULL` to count only true client backends and not double-count parallel groups.
+22. **`backend_type = 'client backend'` excludes parallel workers.** They have `backend_type = 'parallel worker'` and identify their leader through `leader_pid`.[^pg-stat-activity]
 
 23. **`pg_stat_*` queries themselves perturb the statistics they read.** A monitoring agent that runs Recipe 1 every second adds 60 backends/minute of `state = 'active'` activity to `pg_stat_activity` and increments `xact_commit` on `pg_stat_database` (assuming each query is its own transaction). For very-high-cardinality cluster-wide monitoring, sample at intervals matching your retention granularity rather than continuously.
 

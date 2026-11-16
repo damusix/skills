@@ -121,15 +121,15 @@ Full set of keys (PG16):
 | Key | Required | Default | Meaning |
 |---|---|---|---|
 | `comment` | no | empty | Description shown in `\dx` |
-| `default_version` | yes | — | Version selected if `CREATE EXTENSION foo` (no `VERSION` clause) |
+| `default_version` | no | — | Default version for `CREATE EXTENSION`; required if the command omits `VERSION` |
 | `module_pathname` | no | — | Substituted for `MODULE_PATHNAME` token in `.sql` scripts |
 | `directory` | no | `extension` | Subdirectory of `$SHAREDIR` where install/upgrade scripts live |
 | `requires` | no | — | Comma-separated list of required extensions |
-| `superuser` | no | true | Pre-PG13: install requires superuser. PG13+: prefer `trusted` flag |
-| `trusted` | no | false | PG13+ — non-superuser may install if they have `CREATE` on the database |
+| `superuser` | no | true | Installation and update require superuser unless trusted installation applies |
+| `trusted` | no | false | When `superuser = true`, permits installation by a non-superuser with `CREATE` on the database; scripts run as bootstrap superuser |
 | `relocatable` | no | false | Can be moved between schemas via `ALTER EXTENSION SET SCHEMA` |
 | `schema` | no | — | Pin to specific schema; mutually exclusive with `relocatable = true` |
-| `encoding` | no | — | Restrict to specific database encoding (rare) |
+| `encoding` | no | — | Encoding of installation and update scripts; converted to database encoding |
 | `no_relocate` | no | — | PG16+ — comma-separated list of required extensions whose schema this extension references via the `@extschema:name@` syntax[^pg16-no-relocate] |
 
 > [!NOTE] PostgreSQL 16
@@ -503,7 +503,7 @@ Long-running in-process tasks. Register from `_PG_init()` when loaded via `share
         RegisterBackgroundWorker(&worker);
     }
 
-Workers count against `max_worker_processes`. Set higher than the sum of all extension workers + parallel-query workers + autovacuum workers. Cross-reference [`63-internals-architecture.md`](./63-internals-architecture.md) for the worker budget formula.[^bgworker]
+Workers count against `max_worker_processes`. Budget extension, parallel-query and logical-replication workers together; autovacuum workers have separate slots. Cross-reference [`63-internals-architecture.md`](./63-internals-architecture.md).[^bgworker]
 
 ### Custom Scan Providers
 
@@ -549,7 +549,7 @@ Required callbacks for read-only FDW:
 | `ReScanForeignScan` | Reset for re-execution |
 | `EndForeignScan` | Cleanup |
 
-For writable FDW, add `AddForeignUpdateTargets`, `PlanForeignModify`, `BeginForeignModify`, `ExecForeignInsert`/`Update`/`Delete`, `ExecForeignBatchInsert` (PG14+), `GetForeignModifyBatchSize` (PG14+), `EndForeignModify`. For TRUNCATE (PG14+), add `ExecForeignTruncate`. For async (PG14+), add `IsForeignScanParallelSafe`, `ForeignAsyncRequest`, `ForeignAsyncConfigureWait`, `ForeignAsyncNotify`.[^fdw-handler]
+For writable FDW, add the modification callbacks described in [PG16 FDW callbacks](https://www.postgresql.org/docs/16/fdw-callbacks.html). `IsForeignScanParallelSafe` concerns parallel query; asynchronous execution has distinct `IsForeignPathAsyncCapable` and `ForeignAsync*` callbacks.
 
 ### Logical Decoding Output Plugins
 
@@ -559,7 +559,7 @@ Callbacks an output plugin defines:
 
 | Callback | Required | Purpose |
 |---|---|---|
-| `startup_cb` | yes | One-time setup |
+| `startup_cb` | no | One-time setup |
 | `shutdown_cb` | no | Cleanup |
 | `begin_cb` | yes | Begin transaction |
 | `change_cb` | yes | Per-row INSERT/UPDATE/DELETE |
@@ -918,7 +918,7 @@ After installation and load:
     -------------+---------+----------------------
      heartbeat   | 1.0.0   | $libdir/heartbeat.so
 
-Pre-PG18 you only see `file_name` via `pg_get_loaded_modules` (and the function returned only one column).
+`pg_get_loaded_modules()` was added in PG18; it is unavailable on earlier releases.
 
 ### Recipe 7: Trusted extension
 
@@ -1073,7 +1073,7 @@ For an extension that needs `libcurl`:
     include $(PGXS)
 
 > [!WARNING] Linking against libpq from inside the backend
-> Do not link a backend extension against `libpq`. Use SPI for in-process SQL. `libpq` from inside the backend bypasses transaction state, opens a new connection on every call, and forks the postmaster from inside itself if connecting to the same cluster — all wrong.
+> For SQL in the current backend and transaction, use SPI. A `libpq` connection is a separate session and transaction; use it only when that separation is intentional and account for connection and failure handling.
 
 ### Recipe 14: PG16 symbol visibility — adding PGDLLEXPORT
 
@@ -1148,7 +1148,7 @@ Avoids picking up whatever `pg_config` is in `$PATH`. Critical when packaging fo
 
 21. **`PG_TRY/PG_CATCH` is for cleanup, not recovery.** The only sane action in `PG_CATCH` is to free resources and `PG_RE_THROW()`. To recover transaction state, use subtransactions via `BeginInternalSubTransaction()` / `ReleaseCurrentSubTransaction()` / `RollbackAndReleaseCurrentSubTransaction()`.
 
-22. **Background workers count against `max_worker_processes`.** A cluster with three extensions each spawning two workers + `max_parallel_workers = 8` + `autovacuum_max_workers = 3` needs `max_worker_processes >= 17`. Cross-reference [`63-internals-architecture.md`](./63-internals-architecture.md).
+22. **Background workers count against `max_worker_processes`.** Budget extension, parallel and logical replication workers together. Autovacuum workers use a separate allocation. [PG16 background workers](https://www.postgresql.org/docs/16/bgworker.html)
 
 23. **`bgw_library_name` must match the `.so` basename without extension.** `myext` not `myext.so` not `$libdir/myext`. Same for `bgw_function_name` — symbol name only, no quoting.
 
@@ -1182,8 +1182,6 @@ Avoids picking up whatever `pg_config` is in `$PATH`. Critical when packaging fo
 [^spi]: PG16 docs, "Server Programming Interface." [https://www.postgresql.org/docs/16/spi.html](https://www.postgresql.org/docs/16/spi.html)
 
 [^bgworker]: PG16 docs, "Background Worker Processes." [https://www.postgresql.org/docs/16/bgworker.html](https://www.postgresql.org/docs/16/bgworker.html)
-
-[^fdw-handler]: PG16 docs, "Writing a Foreign Data Wrapper." [https://www.postgresql.org/docs/16/fdwhandler.html](https://www.postgresql.org/docs/16/fdwhandler.html)
 
 [^output-plugin]: PG16 docs, "Logical Decoding Output Plugins." [https://www.postgresql.org/docs/16/logical-replication-output-plugin.html](https://www.postgresql.org/docs/16/logical-replication-output-plugin.html)
 

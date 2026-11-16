@@ -3,7 +3,7 @@
 Comprehensive monitoring stack for PostgreSQL: Prometheus + `postgres_exporter` + `pgbouncer_exporter` + Grafana, key metrics by four-tier framework (workload / efficiency / saturation / capacity), log-based metrics via `auto_explain` + structured logging, alerting thresholds + sampling strategies. Covers PostgreSQL 14-18 with explicit version-introduced view + column annotations.
 
 > [!WARNING] PG17 + PG18 silently break PG16-era monitoring queries
-> Three discrete upgrade traps: (1) **PG17 split `pg_stat_bgwriter` → `pg_stat_checkpointer`** — `buffers_backend` + `buffers_backend_fsync` removed; queries return NULL silently. (2) **PG17 renamed `pg_stat_progress_vacuum` columns** — `max_dead_tuples` → `max_dead_tuple_bytes`, `num_dead_tuples` → `num_dead_item_ids`. (3) **PG18 removed `pg_stat_io.op_bytes`** (always equaled `BLCKSZ`) — replaced with `read_bytes` / `write_bytes` / `extend_bytes`. Plus PG18 relocated WAL I/O timing from `pg_stat_wal` to `pg_stat_io` (removed `wal_write` / `wal_sync` / `wal_write_time` / `wal_sync_time` columns). Audit dashboards before upgrade.
+> Three upgrade traps: PG17 removed `pg_stat_bgwriter.buffers_backend` and `buffers_backend_fsync`, and changed `pg_stat_progress_vacuum` columns; PG18 replaced `pg_stat_io.op_bytes` and relocated WAL I/O counters. Direct SQL referencing removed columns errors; dashboards may instead show missing data. Audit queries before upgrading.
 
 ## Table of Contents
 
@@ -244,16 +244,16 @@ shared_preload_libraries = 'pg_stat_statements, auto_explain'
 auto_explain.log_min_duration = '1s'              # Plans for queries >1s
 auto_explain.log_analyze = on                     # Include actual row counts
 auto_explain.log_buffers = on                     # Buffer accounting
-auto_explain.log_timing = on                      # Per-node timing (expensive)
+auto_explain.log_timing = off                     # Avoid per-node clock reads unless needed
 auto_explain.log_verbose = on                     # Include output columns
 auto_explain.log_format = 'json'                  # Structured for parsing
 auto_explain.log_nested_statements = on           # Include SQL inside functions
 auto_explain.sample_rate = 1.0                    # 1.0 = log every slow query
-auto_explain.log_parameter_max_length = 4096      # PG16+ — capture bind values
+auto_explain.log_parameter_max_length = 0         # Avoid logging parameter values
 ```
 
 > [!WARNING] auto_explain.log_analyze overhead
-> Setting `log_analyze = on` makes Postgres execute `EXPLAIN ANALYZE` for slow queries — adds per-row timing instrumentation. On busy OLTP clusters this can add 5-10% latency to logged queries. Mitigate via `sample_rate = 0.1` (log 10% of slow queries) on high-QPS workloads.
+> With `log_analyze = on`, sampled statements are instrumented even if they are too fast to be logged. Per-node timing can be very expensive. Measure overhead; consider `log_timing = off` and a lower `sample_rate`.[^auto-explain]
 
 Cross-reference [`56-explain.md`](./56-explain.md) for plan interpretation + [`57-pg-stat-statements.md`](./57-pg-stat-statements.md) for aggregate query stats.
 
@@ -562,7 +562,6 @@ pg_database_xid_age:
       age(datfrozenxid) AS xid_age,
       2147483647 - age(datfrozenxid) AS xid_age_to_wraparound
     FROM pg_database
-    WHERE datallowconn = true
   metrics:
     - datname:
         usage: LABEL
@@ -573,6 +572,8 @@ pg_database_xid_age:
         usage: GAUGE
         description: "Transactions remaining until wraparound"
 ```
+
+Monitor every database, including databases that disallow connections. The estimate measures distance to the wraparound point, not to PostgreSQL's write stop, which occurs roughly 3 million XIDs earlier. Tune alert delays to transaction consumption rate and monitor MultiXact age separately. See [PG16 wraparound protection](https://www.postgresql.org/docs/16/routine-vacuuming.html#VACUUM-FOR-WRAPAROUND).
 
 ### Recipe 6 — Long-running transaction detector
 
@@ -660,7 +661,7 @@ grep -r 'pg_backend_memory_contexts.*parent' \
   /etc/prometheus/rules/ /var/lib/grafana/dashboards/
 ```
 
-Update queries before upgrading cluster to PG17/PG18 or dashboards return NULL silently.
+Update SQL and dashboards before upgrading: direct references to removed columns raise errors, and failed scrapes may leave missing data.
 
 ### Recipe 9 — `pg_activity` for incident response
 
@@ -822,19 +823,19 @@ Cross-reference [`57-pg-stat-statements.md`](./57-pg-stat-statements.md) Recipe 
 
 ## Gotchas / Anti-patterns
 
-1. **Monitoring queries break silently on PG17 upgrade.** `pg_stat_bgwriter.buffers_backend` returns NULL after PG17 because column moved to `pg_stat_io`. Same for `buffers_backend_fsync`. **Audit dashboards via Recipe 8 BEFORE upgrading.**
+1. **Monitoring queries can fail on PG17 upgrade.** `pg_stat_bgwriter.buffers_backend` and `buffers_backend_fsync` were removed; use applicable `pg_stat_io` counters instead.
 
-2. **PG18 removes `pg_stat_io.op_bytes`.** Queries using `op_bytes` to compute total bytes return NULL. Replace with `read_bytes` + `write_bytes` + `extend_bytes` columns.
+2. **PG18 removes `pg_stat_io.op_bytes`.** SQL referencing it errors; use `read_bytes`, `write_bytes`, and `extend_bytes`.
 
 3. **PG18 relocates `pg_stat_wal` timing columns to `pg_stat_io`.** `wal_write_time` / `wal_sync_time` / `wal_write` / `wal_sync` columns REMOVED from `pg_stat_wal`. Find WAL I/O timing in `pg_stat_io` rows where `backend_type LIKE 'wal%'`.
 
-4. **PG17 renames `pg_stat_progress_vacuum` columns.** `max_dead_tuples` → `max_dead_tuple_bytes` (now in bytes, not tuples!); `num_dead_tuples` → `num_dead_item_ids`. Old queries return NULL.
+4. **PG17 changes `pg_stat_progress_vacuum` columns.** Queries referencing the removed `max_dead_tuples` or `num_dead_tuples` columns error; adapt to `max_dead_tuple_bytes` and `num_dead_item_ids`.
 
 5. **`pg_stat_statements` cardinality explosion in Prometheus.** A cluster with 10k+ distinct `queryid`s exported as Prometheus labels = scrape time > 30s, Prometheus rule eval fails. **Sample top-N by `total_exec_time` instead** (Recipe 11).
 
 6. **PG15 `log_checkpoints` default flipped from `off` to `on`.** Verbatim release-note caveat: "This will cause even an idle server to generate some log output"[^pg15-log-checkpoints]. Resource-constrained clusters need explicit `log_checkpoints = off` post-upgrade.
 
-7. **`auto_explain.log_analyze = on` adds 5-10% latency on busy OLTP.** Mitigate via `sample_rate = 0.1` to log 10% of slow queries.
+7. **`auto_explain.log_analyze` instruments sampled statements even below the logging threshold.** Measure overhead and consider disabling per-node timing or reducing `sample_rate`.[^auto-explain]
 
 8. **`pg_monitor` predefined role grants seeing query text from all roles.** A user-level role granted `pg_monitor` can read other users' queries via `pg_stat_activity`. Lock down `pg_monitor` to dedicated monitoring service accounts only.
 

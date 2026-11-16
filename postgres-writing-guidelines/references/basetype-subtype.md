@@ -95,7 +95,7 @@ See [Cross-Table Constraints](cross-table-constraints.md) for the full pattern. 
             WHERE account_no = NEW.account_no AND type = 'savings'
         ) THEN
             RAISE EXCEPTION 'savings_account requires account.type = ''savings'''
-                USING ERRCODE = 'P0010';
+                USING ERRCODE = 'Z0010';
         END IF;
         RETURN NEW;
     END;
@@ -119,18 +119,11 @@ Create base + subtype atomically in one PROCEDURE:
     )
     LANGUAGE plpgsql AS $$
     BEGIN
-        PERFORM fn_assert_not_in_transaction();
-
         INSERT INTO account(type, owner_id) VALUES ('savings', p_owner_id)
         RETURNING account_no INTO p_account_no;
 
         INSERT INTO savings_account(account_no, interest_rate, min_balance)
         VALUES (p_account_no, p_interest_rate, p_min_balance);
-
-        COMMIT;
-    EXCEPTION WHEN OTHERS THEN
-        ROLLBACK;
-        RAISE;
     END;
     $$;
 

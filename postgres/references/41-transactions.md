@@ -44,7 +44,7 @@ Cross-references: [`27-mvcc-internals.md`](./27-mvcc-internals.md) for xmin/xmax
 
 Five rules drive every transaction decision:
 
-1. **Without `BEGIN`, every statement is its own transaction.** Verbatim: *"By default (without BEGIN), PostgreSQL executes transactions in 'autocommit' mode, that is, each statement is executed in its own transaction and a commit is implicitly performed at the end of the statement (if execution was successful, otherwise a rollback is done)."*[^begin] An explicit `BEGIN` starts a *transaction block*; every statement until `COMMIT` or `ROLLBACK` is part of the same transaction with a single XID and snapshot.
+1. **Without `BEGIN`, each statement normally runs in its own transaction.** An explicit transaction groups statements atomically. At READ COMMITTED each statement gets a new snapshot; REPEATABLE READ and SERIALIZABLE retain a transaction snapshot.[^begin][^set-tx]
 
 2. **Savepoints are subtransactions; subtransactions cost real money.** Each `SAVEPOINT` (and each PL/pgSQL `EXCEPTION` block) starts a subtransaction. Verbatim from the internals chapter: *"Up to 64 open subxids are cached in shared memory for each backend; after that point, the storage I/O overhead increases significantly due to additional lookups of subxid entries in pg_subtrans."*[^subxacts] Beyond 64, `pg_subtrans` SLRU lookups dominate latency and an EXCEPTION-in-tight-loop becomes pathological. See [Subtransactions and Their Cost](#subtransactions-and-their-cost).
 
@@ -68,7 +68,7 @@ Five rules drive every transaction decision:
 | Bound a single lock-acquisition wait                                 | `SET LOCAL lock_timeout = '500ms'`                        | NOWAIT for *every* lock                     | NOWAIT errors immediately even on transient contention; lock_timeout gives one bounded wait     |
 | Prevent sessions stuck idle inside a transaction                     | `idle_in_transaction_session_timeout` cluster-wide        | Manual `pg_terminate_backend()` cron        | Server-side timeout fires precisely when idle threshold passes; no polling                       |
 | Prevent leaked connections                                           | `idle_session_timeout` (PG14+)                            | Idle-in-transaction timeout alone           | idle_session_timeout catches sessions outside any transaction                                    |
-| Bound *total* transaction duration                                   | `transaction_timeout` (PG17+)                             | Combining statement_timeout + idle_in_tx    | transaction_timeout aborts at wall-clock duration regardless of per-statement state              |
+| Bound *total* transaction duration                                   | `transaction_timeout` (PG17+)                             | Combining statement_timeout + idle_in_tx    | Terminates the session if transaction duration exceeds the limit |
 | Run a long read-only report on serializable without abort risk       | `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE` | Plain SERIALIZABLE                          | DEFERRABLE waits for a safe snapshot then runs with no serialization-failure risk                |
 | Run two parallel sessions over the same snapshot (pg_dump-style)     | `pg_export_snapshot()` + `SET TRANSACTION SNAPSHOT`       | Manual `BEGIN ISOLATION LEVEL REPEATABLE READ` in each session | Manual won't give *identical* snapshots                                              |
 | Do atomic two-phase commit across two PG databases                   | `PREPARE TRANSACTION` + `COMMIT PREPARED` on each side    | Application-level retry/compensation        | 2PC gives genuine atomic global commit (with risks; see Gotchas)                                 |
@@ -77,7 +77,7 @@ Five rules drive every transaction decision:
 Three smell signals that you reached for the wrong tool:
 
 - **Per-row `BEGIN`/`COMMIT` inside a single business operation** — each statement that needs to commit-or-rollback together belongs in one transaction. Repeatedly committing midway through fragments atomicity and quadruples WAL volume.
-- **Catching `unique_violation` per row in a PL/pgSQL FOREACH loop** — each `EXCEPTION` block creates a subtransaction. At 1000 rows you get 1000 subxids, 16× the overflow threshold. Move to `INSERT ... ON CONFLICT DO NOTHING` (set-based), see [`08-plpgsql.md`](./08-plpgsql.md) Recipe 8.
+- **Catching `unique_violation` per row in a PL/pgSQL loop** — each `EXCEPTION` block starts a subtransaction. One that writes and completes without error keeps its subxid in the backend's 64-entry cache until the top-level transaction ends; only a rolled-back subtransaction leaves the cache. A 1000-row loop where most inserts succeed overflows it, and visibility checks against this backend's XIDs then read `pg_subtrans`.[^subxacts] Move to set-based `INSERT ... ON CONFLICT DO NOTHING`, see [`08-plpgsql.md`](./08-plpgsql.md) Recipe 1.
 - **Setting `statement_timeout` in `postgresql.conf`** — it kills pg_dump, REINDEX CONCURRENTLY, autovacuum, and every legitimate long-running maintenance. Use per-role or `SET LOCAL` instead.
 
 ## Syntax and Mechanics
@@ -113,7 +113,7 @@ COMMIT [ WORK | TRANSACTION ] [ AND [ NO ] CHAIN ]
 ROLLBACK [ WORK | TRANSACTION ] [ AND [ NO ] CHAIN ]
 ```
 
-`COMMIT` makes the transaction's changes visible to other sessions and durable. Verbatim: *"COMMIT commits the current transaction. All changes made by the transaction become visible to others and are guaranteed to be durable if a crash occurs."*[^commit] Whether durability requires a `fsync` at COMMIT time is controlled by `synchronous_commit` — see [`33-wal.md`](./33-wal.md).
+`COMMIT` makes changes visible. With `synchronous_commit = off`, acknowledgment may precede WAL flush, so a crash can lose recently acknowledged transactions; use the durability settings described in [`33-wal.md`](./33-wal.md).
 
 `ROLLBACK` discards everything. Verbatim: *"ROLLBACK rolls back the current transaction and causes all the updates made by the transaction to be discarded."*[^rollback]
 
@@ -178,14 +178,14 @@ Verbatim from the internals chapter: *"Subtransactions are started inside transa
 
 **Subxids only consume resources if they write.** Verbatim: *"Read-only subtransactions are not assigned subxids, but once they attempt to write, they will be assigned one. This also causes all of a subxid's parents, up to and including the top-level transaction, to be assigned non-virtual transaction ids."*[^subxacts]
 
-**The 64-subxact threshold.** This is the canonical operational rule. Verbatim: *"The more subtransactions each transaction keeps open (not rolled back or released), the greater the transaction management overhead. Up to 64 open subxids are cached in shared memory for each backend; after that point, the storage I/O overhead increases significantly due to additional lookups of subxid entries in pg_subtrans."*[^subxacts]
+**The 64-subxact threshold.** This is the canonical operational rule. Verbatim: *"The more subtransactions each transaction keeps open (not rolled back or released), the greater the transaction management overhead. Up to 64 open subxids are cached in shared memory for each backend; after that point, the storage I/O overhead increases significantly due to additional lookups of subxid entries in pg_subtrans."*[^subxacts] A released (subcommitted) subxid still counts: it stays in the backend's cache until the top-level transaction ends, because `XidCacheRemoveRunningXids()` is called only from `RecordTransactionAbort()` (`src/backend/access/transam/xact.c`, REL_16_STABLE).
 
 Operational consequences:
 
-- More than 64 *active* subxids per backend pushes lookups into the `pg_subtrans` SLRU. SLRU contention shows up as `SubtransSLRU` wait events in `pg_stat_activity.wait_event`.
+- More than 64 cached subxids per backend pushes lookups into the `pg_subtrans` SLRU. SLRU contention shows up as `SubtransSLRU` wait events in `pg_stat_activity.wait_event`.
 - The threshold is per-backend, not cluster-wide; the SLRU is shared so contention from many backends compounds.
-- Releasing or rolling back a savepoint frees its subxid. The threshold counts *active* subxids, not lifetime created.
-- PL/pgSQL `EXCEPTION` blocks always create subxacts — even when they catch no exception in a particular iteration — so a loop of 1000 iterations with an EXCEPTION block creates 1000 subxids in sequence (released as each iteration completes the inner BEGIN block).
+- Only rolling back a savepoint frees its subxid from the cache. `RELEASE` keeps it until the top-level transaction ends, so the threshold counts every XID-assigned subtransaction that was not rolled back, not only those still open.
+- PL/pgSQL `EXCEPTION` blocks always create subxacts — even when they catch no exception in a particular iteration — so a loop of 1000 iterations with an EXCEPTION block creates 1000 subtransactions. Each one that writes and completes normally keeps its subxid cached until the top-level transaction ends, so the loop overflows the cache.
 
 > [!NOTE] PostgreSQL 16
 > PG16 added `pg_stat_get_backend_subxact()` to report per-backend subxid usage live. Verbatim release note: *"Add function pg_stat_get_backend_subxact() to report on a session's subtransaction cache (Dilip Kumar)."*[^pg16-subxact] Pre-PG16 the only way to detect overflow was watching SubtransSLRU wait events.
@@ -242,7 +242,7 @@ Two parallel sessions can share an exact snapshot. Session A exports the snapsho
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 SELECT pg_export_snapshot();         -- returns e.g. '00000003-00000007-1'
 
--- Session B (within 60s or so)
+-- Session B, while session A's exporting transaction remains open
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 SET TRANSACTION SNAPSHOT '00000003-00000007-1';
 -- now sees exactly what session A sees
@@ -402,7 +402,7 @@ WHERE state = 'idle in transaction'
 ORDER BY state_change ASC;
 ```
 
-The leftmost (oldest `state_change`) row is the one holding the xmin horizon back. Terminate it with `SELECT pg_terminate_backend(<pid>);` after confirming. Better: set `idle_in_transaction_session_timeout` so this never lingers in the first place.
+Sort by idle time to find candidates, not necessarily the oldest xmin. Inspect `backend_xmin`, `backend_xid`, locks, and application context before terminating a session.
 
 ### 4. Subtransaction overflow audit
 
@@ -415,15 +415,15 @@ SELECT
     a.application_name,
     a.state,
     s.subxact_count,
-    s.subxact_overflow,
+    s.subxact_overflowed,
     a.query
-FROM pg_stat_activity a
-CROSS JOIN LATERAL pg_stat_get_backend_subxact(a.backend_xid) s
-WHERE s.subxact_count > 32
+FROM pg_stat_get_backend_idset() AS b(backend_id)
+JOIN pg_stat_activity a ON a.pid = pg_stat_get_backend_pid(b.backend_id)
+CROSS JOIN LATERAL pg_stat_get_backend_subxact(b.backend_id) s
 ORDER BY s.subxact_count DESC;
 ```
 
-`subxact_overflow = true` means this backend has overflowed past 64 subxids; lookups now hit pg_subtrans SLRU. Cross-reference [`08-plpgsql.md`](./08-plpgsql.md) for the EXCEPTION-block-in-loop anti-pattern that produces this.
+`subxact_overflowed = true` means the backend's subtransaction cache overflowed; transaction visibility checks may require `pg_subtrans` lookups.
 
 Pre-PG16 audit (less precise):
 
@@ -437,26 +437,18 @@ ORDER BY 4 DESC;
 
 ### 5. SAVEPOINT for retry-on-conflict
 
+Savepoint control belongs in the client transaction, not inside a PL/pgSQL `DO` block. On a recoverable error, issue `ROLLBACK TO SAVEPOINT` and then `RELEASE SAVEPOINT`; inspect the result of each statement in the client before choosing the next action.[^rollback-to]
+
 ```sql
 BEGIN;
-INSERT INTO orders (...) VALUES (...);
-
 SAVEPOINT before_inventory;
 UPDATE inventory SET qty = qty - 1 WHERE sku = 'A123' AND qty > 0;
--- Did the inventory check fail (zero rows updated)?
-DO $$
-BEGIN
-    IF NOT FOUND THEN
-        ROLLBACK TO SAVEPOINT before_inventory;
-        INSERT INTO backorders (...) VALUES (...);
-    END IF;
-END $$;
+-- Client checks the affected-row count. If zero, issue:
+ROLLBACK TO SAVEPOINT before_inventory;
+INSERT INTO backorders (sku) VALUES ('A123');
 RELEASE SAVEPOINT before_inventory;
-
 COMMIT;
 ```
-
-The `ROLLBACK TO SAVEPOINT` discards the failed UPDATE but keeps the original INSERT. The savepoint is then released, merging the recovered state into the parent transaction.
 
 ### 6. SET LOCAL for one-statement overrides
 
@@ -531,23 +523,23 @@ If you have no external transaction manager (XA coordinator, distributed-tx midd
 ### 11. Bound a maintenance command with `transaction_timeout` (PG17+)
 
 ```sql
-BEGIN;
-SET LOCAL transaction_timeout = '10min';
-SET LOCAL lock_timeout = '30s';
+SET transaction_timeout = '10min';
+SET lock_timeout = '30s';
 VACUUM (VERBOSE, ANALYZE) target_table;
-COMMIT;
+RESET transaction_timeout;
+RESET lock_timeout;
 ```
 
-`transaction_timeout` aborts the whole transaction (statement and idle time combined) once `10min` of wall clock elapses, regardless of whether `statement_timeout` has fired. Note: prepared transactions are not subject to this timeout (they can't be — they're not attached to any session).
+`transaction_timeout` terminates the session once the transaction exceeds `10min`, including active and idle time. A shorter applicable `statement_timeout` can fire first. Prepared transactions are not subject to this timeout.[^transaction-timeout]
 
 ### 12. AND CHAIN for repeated read-only batches
 
 ```sql
 BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
-INSERT INTO archive_buffer SELECT * FROM source WHERE batch_id = 1;
+SELECT count(*) FROM source WHERE batch_id = 1;
 COMMIT AND CHAIN;
 
-INSERT INTO archive_buffer SELECT * FROM source WHERE batch_id = 2;
+SELECT count(*) FROM source WHERE batch_id = 2;
 COMMIT AND CHAIN;
 
 -- ... no need to re-state REPEATABLE READ READ ONLY each iteration ...
@@ -583,7 +575,7 @@ ORDER BY name;
 
 4. **`RELEASE` cannot run when the transaction is in an aborted state.** Verbatim: *"It is not possible to release a savepoint when the transaction is in an aborted state; to do that, use ROLLBACK TO SAVEPOINT."*[^release] You must roll back to the savepoint first, then release.
 
-5. **A PL/pgSQL `EXCEPTION` block in a tight loop blows past 64 subxids fast.** 1000 iterations = 1000 subxids (each released, but pressure builds). Wait events tell the story: `SubtransSLRU`. Move to set-based DML or `INSERT ... ON CONFLICT DO NOTHING`. Cross-reference [`08-plpgsql.md`](./08-plpgsql.md) gotcha #9.
+5. **A PL/pgSQL `EXCEPTION` block in a tight loop can overflow the 64-entry subxid cache.** The count that matters is subtransactions that were assigned an XID (they wrote) and were not rolled back. A subcommitted subxid stays in the backend's `PGPROC` cache until the top-level transaction commits or aborts (`XidCacheRemoveRunningXids()` runs only on subtransaction abort, `src/backend/access/transam/xact.c`, REL_16_STABLE). So 1000 iterations whose blocks write and complete normally overflow the cache even though each block finished before the next began. Wait events tell the story: `SubtransSLRU`. Move to set-based DML or `INSERT ... ON CONFLICT DO NOTHING`. Cross-reference [`08-plpgsql.md`](./08-plpgsql.md) gotcha #1.[^subxacts]
 
 6. **`idle_in_transaction_session_timeout = 0` (default) is dangerous for OLTP.** A client that hangs (network drop, client deadlock, debugger) keeps a transaction open forever; `xmin` is pinned; VACUUM can't reclaim dead tuples. Set this. Always.
 

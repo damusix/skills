@@ -161,14 +161,14 @@ For triggers that raise on invalid state, assert the EXCEPTION:
 
         await expect(
             db.query("INSERT INTO savings_account(account_no, ...) VALUES (1, ...)")
-        ).rejects.toMatchObject({ code: 'P0010' });
+        ).rejects.toMatchObject({ code: 'Z0010' });
     });
 
 Match on the SQLSTATE, not the message — messages can change, codes are the contract.
 
 ## Testing Procedures and Functions
 
-Procedures that own their transactions (`COMMIT` inside) cannot be called from within a test transaction. Two options:
+Procedures that leave the transaction to the caller (the default) run inside a test transaction like any other statement. Batch procedures that own their transactions (`COMMIT` inside) cannot: the `COMMIT` fails with `2D000`. Two options for those:
 
 **A. Test against a clean DB and truncate between tests.** Slower but accurate.
 

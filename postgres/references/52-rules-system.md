@@ -39,7 +39,7 @@ If you want updatable views, see [`05-views.md`](./05-views.md) — auto-updatab
 
 ## Mental Model — Five Rules
 
-1. **Rules rewrite queries at parse time; triggers fire at execution time.** A rule transforms the parsed query tree *before* the planner sees it. A trigger runs *after* the planner has produced a plan, when the executor actually touches a row (or statement). This is the single most consequential distinction: rules see the *query*, triggers see the *data*. A rule fires zero, one, or N times depending on what the rewrite produces; a trigger fires per-row or per-statement based on its declaration. Cross-reference [`39-triggers.md`](./39-triggers.md) for the trigger surface.
+1. **Rules rewrite queries before planning; triggers fire during execution.** The rewriter transforms the query tree, possibly producing zero or more queries. Their actions execute later and can process multiple matching rows. Triggers execute per row or per statement according to their declaration.[^rules-update]
 
 2. **Views are implemented via `ON SELECT DO INSTEAD`.** Verbatim: *"Views in PostgreSQL are implemented using the rule system. A view is basically an empty table (having no actual storage) with an `ON SELECT DO INSTEAD` rule."*[^rules-views] The rule's conventional name is `_RETURN`. `CREATE VIEW v AS SELECT ...` and `CREATE TABLE v (...); CREATE RULE "_RETURN" AS ON SELECT TO v DO INSTEAD SELECT ...` were operationally equivalent through PG15, but PG16 removed the ability to construct views manually that way — see the per-version timeline.
 
@@ -57,9 +57,9 @@ If you want updatable views, see [`05-views.md`](./05-views.md) — auto-updatab
 | Make an updatable view (simple cases) | Auto-updatable view (PG9.3+) | `CREATE RULE ON INSERT DO INSTEAD ...` | PG auto-generates the right rules when the view meets simple-updatability rules; see [`05-views.md`](./05-views.md) |
 | Make an updatable view (complex cases) | `INSTEAD OF` trigger | `CREATE RULE ON INSERT DO INSTEAD ...` | Triggers are easier to reason about and verbatim *"easier for novices to get right"*[^rules-triggers] |
 | Validate / reject DML on a table | `BEFORE` trigger with `RAISE EXCEPTION` | `CREATE RULE ... WHERE ... DO INSTEAD NOTHING` | Rules cannot raise errors meaningfully; verbatim *"If checks for valid values are required, and in the case of an invalid value an error message should be generated, it must be done by a trigger."*[^rules-triggers] |
-| Audit/log every row changed | `AFTER` trigger writing to audit table; or transition tables for set-based audit | `CREATE RULE ON UPDATE DO ALSO INSERT INTO audit ...` | Triggers see NEW/OLD per row; rules see only the query tree and only fire once per statement |
+| Audit/log every row changed | `AFTER` trigger writing to an audit table or using transition tables | `CREATE RULE ON UPDATE DO ALSO INSERT INTO audit ...` | Rule actions can process multiple matching rows, but rewrite and repeated evaluation make their semantics harder to audit |
 | Implement RLS-like row filtering | RLS policies (`CREATE POLICY`) | `CREATE RULE ON SELECT DO INSTEAD SELECT ... WHERE owner = current_user` | RLS is purpose-built for this since PG9.5; rules require `security_barrier` to be safe and are harder to compose |
-| Make a non-updatable view writable to a different target table | `INSTEAD OF` trigger on the view | `CREATE RULE ON INSERT DO INSTEAD INSERT INTO other_tab ...` | Triggers compose with constraints, RETURNING, and `WITH CHECK OPTION` cleanly; rules have subtle interaction quirks |
+| Make a non-updatable view writable to a different target table | `INSTEAD OF` trigger on the view | `CREATE RULE ON INSERT DO INSTEAD INSERT INTO other_tab ...` | Triggers can implement explicit checks and `RETURNING`; `WITH CHECK OPTION` is not supported directly on trigger-updatable views |
 | Implement set-based statement audit | `AFTER STATEMENT` trigger with `REFERENCING NEW TABLE / OLD TABLE` (PG10+) | `ON UPDATE DO ALSO INSERT ...` rule | Transition tables give you the changed-row set without requiring per-row trigger fan-out; see [`39-triggers.md`](./39-triggers.md) Recipe 4 |
 | Cascade an INSERT to a partition or shard | Declarative partitioning or `INSTEAD OF` trigger | Hand-rolled `ON INSERT DO INSTEAD` rule fan-out | Partitioning is the modern answer; if you have multiple targets, an `INSTEAD OF` trigger composes more cleanly with `RETURNING` |
 | Maintain pre-PG9.1 legacy code that uses rules for DML | Keep the rules running; document them | Migrating without understanding the rewrite semantics | Rules and triggers fire at different phases — silently swapping a rule for a trigger can change behavior |
@@ -67,9 +67,9 @@ If you want updatable views, see [`05-views.md`](./05-views.md) — auto-updatab
 
 **Three smell signals** that you have reached for a rule when you should not have:
 
-- **Your rule has `WHERE` clauses that need to inspect column values.** Rules see the query tree, not the data; complex per-row conditional logic is a trigger problem.
+- **Your rule has complex `WHERE` conditions and side effects.** Qualifications can filter individual rows, but rewriting and repeated evaluation of volatile expressions can make the result surprising; consider a trigger.
 - **You are using `ON INSERT DO INSTEAD` on a view to redirect writes.** This is the legacy idiom that `INSTEAD OF` triggers (PG9.1+) and auto-updatable views (PG9.3+) replaced. Migrate.
-- **You are writing `ON UPDATE DO ALSO INSERT INTO audit_log ...` to capture row deltas.** The audit will not see NEW/OLD on a per-row basis; it will fire once per statement against the *query tree*. Use a trigger.
+- **You are writing `ON UPDATE DO ALSO INSERT INTO audit_log ...` to capture row deltas.** A rule action can process multiple matching rows, but it runs as a rewritten query rather than a row trigger. Use triggers or transition tables when their execution semantics are required.
 
 ## CREATE RULE Grammar
 
@@ -162,13 +162,13 @@ Verbatim from the rewriter's substitution algorithm:[^rules-update]
 
 > *"For any reference to NEW, the target list of the original query is searched for a corresponding entry. If found, that entry's expression replaces the reference. Otherwise, NEW means the same as OLD (for an UPDATE) or is replaced by a null value (for an INSERT). Any reference to OLD is replaced by a reference to the range-table entry that is the result relation."*
 
-**Critical distinction from triggers:** `NEW` and `OLD` in rules are *substituted at parse-time* into the rewritten query tree. They are not row variables. The rule does not "see" actual values; it produces SQL that references columns. This is why rules cannot perform per-row conditional logic the way triggers can — the substitution happens once per statement, not once per row.
+**Critical distinction from triggers:** `NEW` and `OLD` are substituted into the rewritten query tree, not passed as trigger records. The resulting expressions and qualifications can be evaluated for each matching row, and volatile expressions may be evaluated more than once.[^rules-update]
 
 | Event | `NEW` references resolve to | `OLD` references resolve to |
 |---|---|---|
-| `INSERT` | The inserted row's column expressions (from the INSERT's VALUES or SELECT) | NULL (no pre-existing row) |
+| `INSERT` | The inserted row's column expressions (from the INSERT's VALUES or SELECT) | Not available |
 | `UPDATE` | The new column expressions (from the UPDATE's SET) | The existing row's columns (range-table entry) |
-| `DELETE` | The existing row's columns (rules treat NEW as OLD for DELETE per docs) | The existing row's columns (range-table entry) |
+| `DELETE` | Not available | The existing row's columns (range-table entry) |
 | `SELECT` | Not applicable | Not applicable |
 
 ## Rules and Privileges
@@ -211,10 +211,10 @@ The docs include an entire section (`rules-triggers.html`) dedicated to this com
 |---|---|---|
 | When | Parse time (query rewrite) | Execution time (per row or per statement) |
 | Granularity | Per statement (modifies the query) | Per row (`FOR EACH ROW`) or per statement (`FOR EACH STATEMENT`) |
-| Sees data values? | No — sees only the query tree | Yes — `NEW`/`OLD` are actual row variables |
-| Can RAISE EXCEPTION? | Effectively no (rules can't see data to validate) | Yes, with `RAISE EXCEPTION` |
-| Can enforce FK-like constraints? | Not for cross-table validation | Yes |
-| Cost model | Adds queries; cost scales with query, not row count | Fires per row; cost scales with row count |
+| Sees data values? | Rewriter substitutes expressions; generated queries evaluate them against matching rows | Row triggers receive `NEW`/`OLD` records |
+| Can reject invalid data? | Qualified rules can filter actions, but do not provide trigger-style per-row rejection | Triggers can raise an exception |
+| Can enforce FK-like constraints? | Prefer declared constraints or triggers | Constraints or triggers can enforce cross-table checks |
+| Cost model | Generated queries execute set-based work whose cost depends on data and plan | Row triggers execute per row; statement triggers execute once per statement |
 | Best for | Large set-based rewrites where one extra query replaces N triggers | Per-row logic, validation, audit with NEW/OLD |
 | Easier to reason about? | No (per docs) | Yes (per docs) |
 
@@ -353,7 +353,7 @@ CREATE TRIGGER v_users_insert_trg
     FOR EACH ROW EXECUTE FUNCTION v_users_insert_fn();
 ```
 
-The trigger form composes correctly with `RETURNING`, allows constraint checks, and supports `WITH CHECK OPTION`. The rule form had subtle interactions with all three. Cross-reference [`05-views.md`](./05-views.md) for INSTEAD OF trigger details and [`39-triggers.md`](./39-triggers.md) for the trigger surface.
+The trigger form can support `RETURNING` and explicit constraint checks. `WITH CHECK OPTION` is not supported directly on trigger-updatable views; enforce any necessary condition in the trigger. See [CREATE VIEW](https://www.postgresql.org/docs/16/sql-createview.html).
 
 ### Recipe 5 — Use ALSO for fan-out (legacy pattern; prefer triggers)
 
@@ -420,7 +420,7 @@ Views with simple `SELECT * FROM tab WHERE ...` are auto-updatable. Complex view
 SELECT v.viewname, v.definition,
        t.is_insertable_into, t.is_updatable
 FROM pg_views v
-JOIN information_schema.tables t
+JOIN information_schema.views t
   ON t.table_schema = v.schemaname AND t.table_name = v.viewname
 WHERE v.schemaname NOT IN ('pg_catalog', 'information_schema')
   AND t.is_insertable_into = 'NO';
@@ -486,7 +486,7 @@ CREATE RULE orders_audit_rule AS ON UPDATE TO orders
     DO ALSO INSERT INTO orders_audit (order_id) VALUES (NEW.id);
 ```
 
-**Problems with this rule:** (a) the rewriter inserts a single audit row per *statement*, not per row — `UPDATE orders SET ...` affecting 1000 rows generates only 1 audit row, with `NEW.id` referring to the rewritten target list (the audit row gets the *last* row's id, not all of them); (b) `ON UPDATE DO ALSO` runs the rule's action *before* the original UPDATE per the rules-update.html ordering rule, so the audit doesn't see post-UPDATE state; (c) zero-row UPDATEs still fire the rule.
+The rewrite produces an additional set-based INSERT whose qualification includes the original UPDATE condition. It can insert one audit row per matching order, including zero rows when none match. The action runs before the UPDATE and volatile expressions can be evaluated more than once.[^rules-update]
 
 The modern equivalent uses a statement-level trigger with transition tables:
 
@@ -547,13 +547,13 @@ The expanded `\d+` output includes a "Rules:" section listing all rules on the r
 
 ## Gotchas / Anti-patterns
 
-1. **`DO INSTEAD NOTHING` silently swallows commands with no error or log line.** A misconfigured rule that blocks INSERTs returns `INSERT 0 0` to the client — no exception, no warning. The application thinks it succeeded. Use `REVOKE` for permission enforcement or a `BEFORE` trigger with `RAISE EXCEPTION` for application-level rejection.
+1. **`DO INSTEAD NOTHING` discards matching commands without an exception.** A suppressed INSERT can return `INSERT 0 0`; normal statement logging may still record it. Use privileges or a trigger that raises an exception when explicit rejection is needed.
 
-2. **Rules cannot validate data values.** Verbatim: *"If checks for valid values are required, and in the case of an invalid value an error message should be generated, it must be done by a trigger."*[^rules-triggers] Rules see the query tree, not row data; there is no clean way to inspect a column value and reject the operation.
+2. **A rule qualification can inspect row values, but filtering is not the same as rejecting invalid input.** Use a constraint or a trigger that raises an exception when invalid data must produce an error.[^rules-triggers]
 
-3. **Rules fire at parse time, not execution time.** A rule that writes to an audit table runs whether or not the original command actually affects any rows. An `ON UPDATE DO ALSO INSERT INTO audit ...` rule fires on `UPDATE t SET x = 1 WHERE false` — zero rows updated, one audit row inserted. Triggers fire per-row and don't have this issue.
+3. **Rules rewrite a statement before execution.** Their generated queries execute later and carry the original qualification; an action referring to `NEW` or `OLD` can affect multiple rows or none.[^rules-update]
 
-4. **`NEW` and `OLD` in rules are substituted at parse time, not row variables.** A rule cannot inspect actual row values to make conditional decisions. The `WHERE` clause on the rule can reference `NEW`/`OLD` columns, but the comparison happens per-statement against the rewritten query, not per-row.
+4. **`NEW` and `OLD` in rules are substituted into the rewritten query.** They are not trigger record variables, but their expressions can still be evaluated for each matching row.
 
 5. **ON INSERT vs ON UPDATE/DELETE have opposite ordering.** Verbatim: *"For ON INSERT rules, the original query (if not suppressed by INSTEAD) is done before any actions added by rules ... But for ON UPDATE and ON DELETE rules, the original query is done after the actions added by rules."*[^rules-update] An INSERT rule's audit insert sees the new rows; an UPDATE rule's audit insert sees the rows *before* the UPDATE applies. Easy to get wrong.
 
@@ -569,19 +569,19 @@ The expanded `\d+` output includes a "Rules:" section listing all rules on the r
 
 11. **`ALTER RULE` only renames.** To change a rule's body, you must DROP it and re-create, or use `CREATE OR REPLACE RULE`. There is no `ALTER RULE ... ACTION` form.
 
-12. **Rules cannot fire conditionally per row.** A rule's `WHERE` clause filters statement-level: it either applies or doesn't, based on the query tree, not the row data. A trigger with a `WHEN` clause filters per-row. For row-level conditional logic, use a trigger.
+12. **A rule qualification can filter individual affected rows.** The rewriter incorporates the qualification into the generated query; it does not decide once for the entire statement.[^rules-update]
 
 13. **Rules and `INSTEAD OF` triggers conflict.** Verbatim: *"Rules are evaluated first, rewriting the original query before it is planned and executed. Therefore, if a view has INSTEAD OF triggers as well as rules on INSERT, UPDATE, or DELETE, then the rules will be evaluated first, and depending on the result, the triggers may not be used at all."*[^rules-views] If a rule's INSTEAD action eliminates the original query, the INSTEAD OF trigger never fires. Pick one mechanism.
 
 14. **`pg_get_ruledef()` may return a reconstruction, not the original text.** The catalog stores rules in internal parse-tree form; reconstruction renders cleanly but may rearrange clauses or add explicit casts. Cross-reference [`64-system-catalogs.md`](./64-system-catalogs.md) for `pg_get_*def()` function semantics.
 
-15. **DROP RULE does not cascade to view storage.** Dropping `_RETURN` on a view leaves an empty table-like object with no data and no rules. Use `DROP VIEW` to remove a view cleanly.
+15. **Do not drop a view's `_RETURN` rule.** The view depends on it, so `DROP RULE "_RETURN" ON v` fails with a dependency error. Use `DROP VIEW` instead.
 
-16. **Rules cannot reference WITH (CTE) constructs.** A rule's action is a self-contained command, not a CTE. To use CTE-style logic, write a function and have the rule call it (or just use a trigger).
+16. **Data-modifying `WITH` statements cannot target tables with most rules.** Verbatim: *"At present, any table used as the target of a data-modifying statement in WITH must not have a conditional rule, nor an ALSO rule, nor an INSTEAD rule that expands to multiple statements."*[^queries-with] This restricts the original query, not CTEs inside a rule action.
 
 17. **CASCADE rule drops can be surprising.** `DROP RULE r ON t CASCADE` will drop any objects depending on rule `r` — usually nothing, but if other rules reference values computed by `r`, the cascade can be wider than expected. Use `RESTRICT` (the default) and address dependencies explicitly.
 
-18. **Rules do not honor session_replication_role = replica.** Unlike triggers (which have `ENABLE REPLICA TRIGGER` semantics — cross-reference [`39-triggers.md`](./39-triggers.md) gotcha #9), rules cannot be selectively disabled per session_replication_role. Logical-replication apply workers running with `session_replication_role = replica` still fire rules.
+18. **Rule firing depends on `session_replication_role`.** As with triggers, ordinary enabled rules fire in origin/local mode, while `ENABLE REPLICA` and `ENABLE ALWAYS` change that behavior. `ON SELECT` rules are always applied so views continue to work. See [ALTER TABLE](https://www.postgresql.org/docs/16/sql-altertable.html).
 
 19. **Auto-updatable views (PG9.3+) generate auto-updatable rules behind the scenes.** These don't appear in `pg_rewrite` as user-visible rules; they are synthesized by the rewriter at query time. If `is_updatable` says YES but you see no rule in `pg_rewrite` other than `_RETURN`, the view is auto-updatable.
 
@@ -637,3 +637,5 @@ The expanded `\d+` output includes a "Rules:" section listing all rules on the r
 [^pg18-release]: PostgreSQL 18.0 release notes — confirmed by direct fetch to contain **zero** rules-system-related items. The rules chapter was renumbered from chapter 41 (PG16) to chapter 39 (PG18) due to broader manual reorganization, but the content is byte-identical. https://www.postgresql.org/docs/release/18.0/
 
 [^create-view-rules]: PostgreSQL 16 documentation, `CREATE VIEW` reference page. Verbatim: *"If the view or any of its base relations has an INSTEAD rule that causes the INSERT or UPDATE command to be rewritten, then all check options will be ignored in the rewritten query, including any checks from automatically updatable views defined on top of the relation with the INSTEAD rule."* and *"You can get the effect of an updatable view by creating INSTEAD OF triggers on the view, which must convert attempted inserts, etc. on the view into appropriate actions on other tables. For more information see CREATE TRIGGER. Another possibility is to create rules (see CREATE RULE), but in practice triggers are easier to understand and use correctly."* https://www.postgresql.org/docs/16/sql-createview.html
+
+[^queries-with]: PostgreSQL 16 documentation, section 7.8.4 "Data-Modifying Statements in WITH". Verbatim: *"At present, any table used as the target of a data-modifying statement in WITH must not have a conditional rule, nor an ALSO rule, nor an INSTEAD rule that expands to multiple statements."* https://www.postgresql.org/docs/16/queries-with.html

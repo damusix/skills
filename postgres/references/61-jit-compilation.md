@@ -42,7 +42,7 @@ Load this file when:
 > PostgreSQL 19 changes `jit` to be disabled by default; the documented default is `off`. The release notes state that this change requires sites that run many large analytical queries to enable JIT manually (for example `ALTER SYSTEM SET jit = on;` or per role). The "on by default since PG12" statements in this file hold for PG12–18.[^pg19-jit-default]
 
 > [!WARNING] LLVM version floor rises with each major
-> JIT requires `--with-llvm` at build time. The minimum LLVM version is **not constant across PG majors** — building or running with too old an LLVM silently produces a server with `jit_provider = ''` (empty) and `SHOW jit;` returns `off` regardless of the GUC setting. Floors: **PG16 = LLVM 3.9+**, **PG17 = LLVM 10+** (verbatim *"Require LLVM version 10 or later (Thomas Munro)"*[^pg17-llvm10]), **PG18 = LLVM 14+** (verbatim *"If LLVM is enabled, require version 14 or later (Thomas Munro)"*[^pg18-llvm14]). On `pg_upgrade` to PG17 or PG18, the new server binary may refuse to JIT-compile if the host still has only an older LLVM installed.
+> LLVM JIT support must be built with a compatible LLVM version. PG17 requires LLVM 10+[^pg17-llvm10]; PG18 requires LLVM 14+[^pg18-llvm14]. Verify the new PostgreSQL package and its provider dependencies before upgrading. `jit_provider` is a configuration value, not an availability test.
 
 
 ## Syntax / Mechanics
@@ -52,9 +52,9 @@ Load this file when:
 
 PostgreSQL's JIT engine rests on five rules. Each rule names a misconception that surfaces in production tuning conversations.
 
-1. **JIT is opt-in at build time, and on by default at runtime in PG12–18 (off by default again in PG19).** The PostgreSQL distribution does not include LLVM. A binary built **without** `--with-llvm` cannot JIT-compile anything; the `jit` GUC silently has no effect. To verify your build supports JIT: `SELECT pg_jit_available();` returns `true` only if the JIT provider library loaded successfully. Distributions vary: the official Debian/Ubuntu `postgresql-NN` packages ship JIT in a separate `postgresql-NN-jit` package on some channels; the official Docker image includes JIT in the main image. Verify before tuning.[^pg-jit-available]
+1. **LLVM JIT is opt-in at build time; `jit` defaults on in PG12–18 and off in PG19.** `pg_jit_available()` returns true only when JIT is enabled and a provider is available in the current backend. A false result does not by itself identify why JIT is unavailable.[^pg-jit-available]
 
-2. **JIT decision is per-query, made at plan time, based on the planner's total cost estimate.** The verbatim docs rule: *"the total estimated cost of a query ... is used. The estimated cost of the query will be compared with the setting of jit_above_cost. If the cost is higher, JIT compilation will be performed."*[^jit-decision] Three independent cost thresholds (`jit_above_cost`, `jit_inline_above_cost`, `jit_optimize_above_cost`) each gate one phase. The decision is at **plan time, not execution time** — for prepared statements with generic plans, the GUC values **at PREPARE time** apply, not the values at EXECUTE time.[^jit-decision]
+2. **JIT cost decisions are made when the plan is built.** A cached generic plan retains those decisions until replanning; a custom plan is generated for a particular execution. The `jit` switch itself also has an execution-time effect.[^jit-decision]
 
 3. **JIT compiles expression evaluation and tuple deforming — not the plan itself.** It does not rewrite the plan tree; it generates LLVM IR for the inner loop of each scan / filter / aggregate. Verbatim: *"Currently PostgreSQL's JIT implementation has support for accelerating expression evaluation and tuple deforming. Several other operations could be accelerated in the future."*[^jit-reason] The win is mostly on long analytical queries that touch many tuples and evaluate many expressions per tuple. A short OLTP query that processes 10 rows sees the compilation overhead but no real benefit.
 
@@ -78,13 +78,13 @@ PostgreSQL's JIT engine rests on five rules. Each rule names a misconception tha
 | Inspect JIT phase cost for one query | `EXPLAIN (ANALYZE, VERBOSE, BUFFERS) SELECT ...` | — | The `JIT:` section reports Functions count and per-phase timing | Running on a non-warm cache (timing is misleading) |
 | Identify JIT-paying queries cluster-wide | Query `pg_stat_statements.jit_*` columns | — | PG15+; PG17+ adds `jit_deform_*` | Filtering by `mean_exec_time` alone misses high-frequency low-mean queries |
 | Check whether JIT is available in this build | `SELECT pg_jit_available();` | — | Must return `t` before tuning JIT | Assuming JIT is available because `jit = on` |
-| See the JIT provider in use | `SHOW jit_provider;` | `llvmjit` | Empty string means no JIT provider loaded | Setting `jit_provider` to anything other than the built-in |
+| Inspect configured JIT provider | `SHOW jit_provider;` | `llvmjit` | This is a configured library name, not a loaded-provider test | Inferring availability from the name |
 
 Three smell signals that JIT is hurting more than helping:
 
 1. **High `jit_*_time` totals on queries with `calls > 10000` and `mean_exec_time < 10 ms`** — JIT compilation overhead exceeds savings on each call. Raise `jit_above_cost` or disable JIT for the calling role.
-2. **`EXPLAIN ANALYZE` shows `Total Time: 250 ms` in the JIT section on a query whose execution is 100 ms** — compilation cost dominates; the query's planner cost crossed `jit_above_cost` but the workload doesn't benefit.
-3. **`pg_stat_activity.wait_event = 'JIT'` is frequent** — backends are blocked on JIT compilation; raise the thresholds or disable for the affected role.
+2. **JIT generation accounts for a large fraction of execution time.** Compare representative executions with JIT enabled and disabled before changing thresholds.
+3. **Frequently executed queries accumulate high JIT time.** Inspect the `pg_stat_statements` counters and compare with a controlled no-JIT run.
 
 
 ### What JIT Compiles
@@ -132,8 +132,8 @@ Planner computes total_cost
 
 The verbatim docs version: *"To determine whether JIT compilation should be used, the total estimated cost of a query ... is used. The estimated cost of the query will be compared with the setting of jit_above_cost. If the cost is higher, JIT compilation will be performed. Two further decisions are then needed. Firstly, if the estimated cost is more than the setting of jit_inline_above_cost, short functions and operators used in the query will be inlined. Secondly, if the estimated cost is more than the setting of jit_optimize_above_cost, expensive optimizations are applied to improve the generated code."*[^jit-decision]
 
-> [!WARNING] Plan-time decision, not execution-time
-> The verbatim rule: *"These cost-based decisions will be made at plan time, not execution time. This means that when prepared statements are in use, and a generic plan is used (see PREPARE), the values of the configuration parameters in effect at prepare time control the decisions, not the settings at execution time."*[^jit-decision] An OLTP application that prepares its statements at startup will lock in the JIT decision for those statements based on the GUC values **at preparation time** — changing `jit_above_cost` later in the session does nothing for those prepared statements. See `13-cursors-and-prepares.md` for plan-cache mechanics.
+> [!WARNING] Cached plans and JIT settings
+> JIT cost thresholds are evaluated when a plan is built. SQL `PREPARE` parses and rewrites the statement; planning occurs at `EXECUTE`, and PostgreSQL may choose custom or cached generic plans. A cached generic plan retains its cost-based JIT decisions until replanned. The JIT docs say the settings *"in effect at prepare time"* control a generic plan;[^jit-decision] read that as the settings in effect when the generic plan is built, which happens during an `EXECUTE`, not during SQL `PREPARE`. Setting `jit = off` also disables JIT at execution time, independently of those decisions. See [PREPARE](https://www.postgresql.org/docs/16/sql-prepare.html) and [When to JIT](https://www.postgresql.org/docs/16/jit-decision.html).
 
 To disable JIT for any individual phase, set its cost GUC to `-1`. Setting `jit_above_cost = -1` disables JIT entirely (without setting `jit = off`).[^cost-gucs]
 
@@ -193,7 +193,7 @@ How to read each field:
     - **Emission** — compiling IR to native code and loading it
     - **Total** — sum of the above
 
-The single most important read: **compare Total JIT time to Execution Time**. If `Total > Execution Time`, JIT cost dominates and the query is being hurt, not helped, by JIT. The fix is to raise `jit_above_cost` so this query no longer crosses the threshold, OR to set `jit = off` for the role / session running this query.
+Compare JIT time with total execution time, which includes JIT work. A large fraction suggests testing with JIT disabled, but only a representative comparison can establish whether compilation pays for itself.
 
 A second important read: if `Inlining` and `Optimization` together account for most of the JIT time and `Functions` is small (< 10), the inlining/optimization is over-eager — raising `jit_inline_above_cost` and `jit_optimize_above_cost` (or setting them to `-1`) cuts JIT time while keeping basic expression compilation. This is the canonical knob for *narrow* JIT control without disabling JIT outright.
 
@@ -323,10 +323,9 @@ This forces all three JIT phases for every query in the session. Useful for meas
 ### Recipe 5: Verify JIT is actually available in this build
 
 ```sql
-SELECT pg_jit_available();          -- returns t if --with-llvm was used at build time
-SHOW jit;                            -- the GUC, defaults to on in PG12-18 and off in PG19
-SHOW jit_provider;                   -- 'llvmjit' on supported builds, empty otherwise
--- If pg_jit_available() returns false but jit=on, the binary was built without LLVM.
+SELECT pg_jit_available();          -- true when enabled and a provider is available
+SHOW jit;
+SHOW jit_provider;                  -- configured provider name, normally llvmjit
 ```
 
 On managed services, `pg_jit_available()` may return false even though `jit = on` — the binary is shipped without LLVM. Verify before tuning.
@@ -384,10 +383,10 @@ SELECT pg_jit_available();
 
 -- If false, the new LLVM minimum may not be met
 -- PG17 needs LLVM 10+; PG18 needs LLVM 14+
--- Check the server log for "could not load JIT provider"
+-- A missing provider library is logged only at DEBUG1
 ```
 
-If `pg_jit_available()` returns `false` after upgrade, install a newer LLVM and restart Postgres. On distros, the package is typically `llvm-NN-dev` matching the Postgres `--with-llvm` version. Alternatively set `jit = off` cluster-wide if JIT isn't critical to the workload — the server runs fine without JIT, just with the cost model accelerated.
+If `pg_jit_available()` returns false, check `jit`, the installed PostgreSQL JIT provider package, compatible LLVM runtime dependencies, and server logs. A missing provider library raises no error and logs only at `DEBUG1` (*"provider not available, disabling JIT for current session"*), so confirm that `$libdir/llvmjit.so` exists (`pg_config --pkglibdir` prints `$libdir`). A provider load error can require fixing the installation; installing an arbitrary LLVM development package is not sufficient.
 
 
 ### Recipe 9: Configure JIT cost thresholds for an analytic workload
@@ -447,7 +446,7 @@ Surfaces every role with any `jit*` setting in its `rolconfig` or per-database o
 
 ### Recipe 12: Detect JIT compilation as a wait event
 
-In `pg_stat_activity`, backends actively in JIT compilation may show `wait_event_type IS NULL` and `state = 'active'` (because compilation is CPU work, not a wait). However, on PG17+ there are explicit JIT wait events when backends contend on shared JIT provider state:
+JIT compilation is CPU work, not a dedicated `pg_stat_activity` wait event. A NULL wait event does not identify which code is running:
 
 ```sql
 SELECT pid, state, wait_event_type, wait_event, query
@@ -476,11 +475,12 @@ Each slow query now appears in the server log with its full `JIT:` section, incl
 
 ### Recipe 14: JIT and prepared-statement plan caching
 
-When a query is prepared via libpq's extended-protocol PREPARE (or via PL/pgSQL embedded SQL), the plan is cached and reused. The JIT decision is locked in at PREPARE time. To re-evaluate JIT after changing a cost GUC:
+Prepared statements can use custom plans planned per execution or a cached generic plan. To compare a new threshold with a freshly built plan in a diagnostic session:
 
 ```sql
--- Inside a session using prepared statements:
-DEALLOCATE ALL;          -- drop all prepared statements
+-- In a diagnostic session that already prepared q. DISCARD PLANS keeps
+-- prepared statements, so re-preparing q would fail; deallocate it instead.
+DEALLOCATE q;
 SET jit_above_cost = 50000;
 PREPARE q(int) AS SELECT count(*) FROM big WHERE x > $1;
 EXPLAIN (ANALYZE, VERBOSE) EXECUTE q(100);
@@ -490,22 +490,17 @@ EXPLAIN (ANALYZE, VERBOSE) EXECUTE q(100);
 For PL/pgSQL: `DISCARD PLANS;` flushes the per-session plan cache used by embedded SQL inside PL/pgSQL functions. See `08-plpgsql.md` and `13-cursors-and-prepares.md` for plan-cache details.
 
 
-### Recipe 15: Bump LLVM after PG18 upgrade
+### Recipe 15: Check JIT provider after a major upgrade
 
-PG18 requires LLVM 14+. If the host has only LLVM 12 (which worked on PG14-17), the upgrade silently runs without JIT until LLVM is updated.
+PG18 builds with LLVM require LLVM 14+. Install the PostgreSQL distribution's matching JIT provider and runtime dependencies; package names and supported versions vary by distribution.
 
-```bash
-# Debian/Ubuntu
-sudo apt install llvm-14
-# RHEL/Rocky 9: LLVM 15 is the default
-sudo dnf install llvm-libs
-
-# Verify after restart:
-psql -c "SELECT pg_jit_available();"
-# Should now return t
+```sql
+SHOW jit;
+SHOW jit_provider;
+SELECT pg_jit_available();
 ```
 
-The server logs an error at startup when it cannot load the JIT provider, but does not refuse to start — JIT is silently unavailable. Always check `pg_jit_available()` after a Postgres major upgrade or an LLVM upgrade.
+After a major or LLVM upgrade, check `jit`, provider availability, package compatibility, and server logs. Do not infer availability from `SHOW jit_provider`.
 
 
 ## Gotchas / Anti-patterns
@@ -516,7 +511,7 @@ The server logs an error at startup when it cannot load the JIT provider, but do
 
 3. **Setting `jit_above_cost = 0` forces JIT for every query.** This is a debugging tool, never a production setting. Even trivial single-row lookups will pay the compilation cost.
 
-4. **JIT decisions are at PLAN TIME, not EXECUTION TIME.** For prepared statements (`13-cursors-and-prepares.md`), the GUC values **at PREPARE time** apply. Changing `jit_above_cost` after the statement is prepared has no effect on that statement. To re-evaluate, `DEALLOCATE` and `PREPARE` again, or use `DISCARD PLANS`.
+4. **JIT cost thresholds are evaluated at planning time.** Prepared statements may use freshly planned custom plans or cached generic plans; SQL `PREPARE` itself does not necessarily build the execution plan. `jit = off` also acts at execution time. Use `DISCARD PLANS` or reprepare the specific statement when a fresh plan is needed.
 
 5. **`jit_inline_above_cost` and `jit_optimize_above_cost` are independent of `jit_above_cost`.** Setting `jit_above_cost = 100000` and `jit_inline_above_cost = 50000` is meaningful — the docs note *"It is not meaningful to set this to less than jit_above_cost"* — but the GUC system does not reject it. The inline threshold simply has no effect below `jit_above_cost` because JIT itself doesn't fire.
 
@@ -534,7 +529,7 @@ The server logs an error at startup when it cannot load the JIT provider, but do
 
 12. **JIT compilation is in-process, not cached across backends.** Each backend that runs a query compiles its own copy of the JIT functions. JIT is *not* shared across processes via shared memory. Two backends running the same query both pay the full compilation cost (and the cost is visible in each backend's `EXPLAIN ANALYZE` independently).
 
-13. **Per-backend memory cost for JIT functions is non-trivial.** Each JIT-compiled module holds LLVM IR plus native code in the backend's local memory. A backend that executes many distinct JIT-compiled queries accumulates this memory. The `max_locks_per_transaction` and `work_mem` GUCs are unrelated.
+13. **JIT compilation uses backend memory.** Account for concurrent JIT compilation when sizing the workload; do not assume compiled code for every previously executed query remains resident indefinitely.
 
 14. **`pg_stat_statements.jit_*` columns are PG15+**. On PG14 and earlier, the only way to measure JIT cost is `EXPLAIN ANALYZE` per query.
 
@@ -550,11 +545,11 @@ The server logs an error at startup when it cannot load the JIT provider, but do
 
 20. **JIT does not accelerate I/O.** A query that is bottlenecked on disk read time (high `Buffers: shared read=` in `EXPLAIN (BUFFERS)`) will not be faster with JIT. JIT helps CPU-bound queries. See `32-buffer-manager.md` for I/O diagnosis.
 
-21. **JIT cost is paid even on cached queries.** A second execution of the same query in the same session re-pays the JIT compilation cost — unless the plan is in the plan cache (`13-cursors-and-prepares.md`). For prepared statements, the JIT compilation happens once at preparation and is reused for each execution.
+21. **A cached plan does not imply cached generated machine code.** JIT compilation can be paid again on execution of a prepared plan; measure repeated executions rather than assuming preparation amortizes compilation.
 
 22. **The default `jit_above_cost = 100000` is conservative.** It is roughly the cost of scanning ~1 GB of table or running a moderately complex aggregate. Most short OLTP queries do not cross this threshold and therefore do not pay JIT cost. If your OLTP queries cross it (large WHERE expressions, many CASE branches, complex projections), the threshold likely needs raising for that workload.
 
-23. **`SHOW jit_provider;` may return empty.** On builds without `--with-llvm`, or when LLVM is missing at runtime, the provider is unset. The `jit` GUC value is irrelevant in that case.
+23. **`SHOW jit_provider` reports a configured provider name.** It does not establish that JIT is enabled or available; check `pg_jit_available()` in the relevant session.
 
 
 ## See Also
@@ -566,7 +561,7 @@ The server logs an error at startup when it cannot load the JIT provider, but do
 - `46-roles-privileges.md` — per-role GUC overrides via `ALTER ROLE SET`
 - `53-server-configuration.md` — GUC precedence rules and contexts
 - `41-transactions.md` — `SET LOCAL` semantics inside a transaction
-- `13-cursors-and-prepares.md` — JIT decisions for prepared statements are at PREPARE time
+- `13-cursors-and-prepares.md` — custom and generic prepared plans and replanning
 - `54-memory-tuning.md` — JIT modules live in per-backend memory (not shared)
 - `32-buffer-manager.md` — JIT does not accelerate I/O
 - `31-toast.md` — TOAST de-TOASTing not accelerated by JIT (referenced in What JIT Compiles)

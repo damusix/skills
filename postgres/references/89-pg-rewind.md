@@ -57,7 +57,7 @@ Wrong tool: source + target initdb'd separately (no shared LSN history — use `
 
 4. **Target must be cleanly shut down before rewind.** PG13+ auto-recovers if target is crashed (starts in single-user mode, replays WAL, stops). Pre-PG13 you must `pg_ctl start` + `pg_ctl stop` manually first. After rewind, target stays stopped — start it as standby pointing at source.
 
-5. **Operates on entire data directory atomically.** Not selective — cannot rewind one table or one tablespace. Tablespaces outside `PGDATA` are also rewound. If rewind aborts mid-way, target is unusable — restore from your byte-level backup.
+5. **Operates on the entire cluster, not atomically.** Tablespaces outside `PGDATA` are also rewound. If rewind aborts mid-way, rebuild from a fresh backup or restore the preserved target copy.
 
 ---
 
@@ -104,7 +104,7 @@ From PG16/17/18 docs (verbatim):
 4. **Copy auxiliary files** — pg_control, configuration files, pg_clog/pg_xact files, WAL segments needed for next startup.
 5. **Update pg_control** — target's pg_control is replaced with the source's plus a minimum recovery point set so target knows it must replay WAL from source on first start.
 
-After rewind, target's data files are byte-equivalent to source's data files **as of source's current LSN**. Target's pg_wal contains source's WAL segments — target replays them on first startup as if it had been a streaming standby all along.
+After rewind, the target is analogous to an online base backup, not a byte-identical snapshot. Startup must replay source WAL from the last checkpoint before divergence to reach consistency. Ensure any source WAL not copied by rewind remains available through `restore_command`. <https://www.postgresql.org/docs/16/app-pgrewind.html>
 
 ### Prerequisites
 
@@ -180,14 +180,14 @@ Inspect timelines:
 -- On either cluster:
 SELECT * FROM pg_control_checkpoint();
 
--- On source (new primary):
-SELECT timeline_id, latest_lsn FROM pg_control_recovery();
+-- On the source, inspect the current WAL position:
+SELECT pg_current_wal_lsn();
 ```
 
 Timeline history files in `pg_wal/`:
 
 ```
-00000001.history  (timeline 1 — original)
+Timeline 1 is the initial timeline and has no history file.
 00000002.history  (timeline 2 — created at first failover)
 00000003.history  (timeline 3 — created at second failover)
 ```
@@ -219,7 +219,7 @@ PG13 release note (Alexey Kondratov):
 When using `--source-server`, the connecting role needs **one of**:
 
 - Superuser, OR
-- Membership in `pg_read_all_settings` + `pg_read_all_stats` + `pg_signal_backend`, AND `EXECUTE` on the pg_rewind helper functions
+- `EXECUTE` on the pg_rewind helper functions below.
 
 Minimum non-superuser setup on source:
 
@@ -249,7 +249,7 @@ If `restore_command` references a shell helper that depends on running-server co
 
 ### Recovery Configuration
 
-After rewind, target is byte-equivalent to source. Target must be configured to start as a standby of source.
+After rewind, the target still requires WAL replay to become consistent. Configure it as a standby of the source before starting it.
 
 Manual approach:
 
@@ -309,8 +309,9 @@ Scenario: cluster A (old primary) failed over to cluster B (new primary). A is n
 # Confirm A is stopped, OR let pg_rewind auto-run single-user recovery.
 pg_ctl -D /var/lib/postgresql/16/main stop -m fast
 
-# Take byte-level backup BEFORE rewinding (in case of split-brain writes).
-cp -a /var/lib/postgresql/16/main /var/backup/main.pre-rewind.$(date +%F)
+# Back up the stopped target independently, including PGDATA, external
+# tablespaces and WAL directories. A plain cp -a of PGDATA preserves symlinks
+# but does not back up the data behind them.
 
 # Run pg_rewind. Dry-run first.
 pg_rewind \
@@ -326,6 +327,10 @@ pg_rewind \
   --write-recovery-conf \
   --progress
 
+# --write-recovery-conf uses the rewind connection. Before starting, replace
+# primary_conninfo with credentials for a LOGIN REPLICATION role and configure
+# replication authentication on the new primary; see the streaming setup.
+#
 # Start as standby:
 pg_ctl -D /var/lib/postgresql/16/main start
 ```
@@ -482,6 +487,8 @@ grep primary_conninfo /var/lib/postgresql/16/main/postgresql.auto.conf
 
 Pre-PG18 the `dbname=` part was stripped. PG18+ keeps it — useful for connection-name attribution in logs.
 
+The generated connection uses `rewind_role`; replace it with credentials authorized for physical replication before starting the standby. See <https://www.postgresql.org/docs/16/warm-standby.html#STREAMING-REPLICATION-AUTHENTICATION>.
+
 ### 9. PG14+ rewind a standby (not just former primary)
 
 PG14 enabled rewinding **any** diverged node, not just former primaries. Useful when a cascading standby diverged from its upstream.
@@ -496,6 +503,8 @@ pg_rewind \
   --source-server='host=replica-a.internal user=rewind_role' \
   --write-recovery-conf
 ```
+
+Before starting, replace the generated `primary_conninfo` with a connection authorized for physical replication.
 
 ### 10. Diagnose "no rewind required"
 
@@ -533,17 +542,19 @@ psql -h new-primary -c "CHECKPOINT;"
 
 Patroni invokes pg_rewind automatically during automatic failover if `use_pg_rewind: true` in the `postgresql` section of `patroni.yml`. See [`79-patroni.md`](./79-patroni.md).
 
-Manual invocation (when Patroni declines to rewind, e.g., wal_log_hints off):
+Example configuration (Patroni-managed, not manual invocation). Leave automatic removal disabled when split-brain writes may need investigation:
 
 ```yaml
 # patroni.yml
 postgresql:
   use_pg_rewind: true
-  remove_data_directory_on_rewind_failure: true   # if rewind fails, fall back to pg_basebackup
-  remove_data_directory_on_diverged_timelines: true
+  remove_data_directory_on_rewind_failure: false
+  remove_data_directory_on_diverged_timelines: false
   parameters:
     wal_log_hints: 'on'
 ```
+
+Setting either removal option to `true` permits Patroni to delete the diverged data directory automatically. Use it only after explicitly accepting loss of local writes and ensuring independent backups. See <https://patroni.readthedocs.io/en/latest/yaml_configuration.html>.
 
 ### 13. Dry-run to estimate work
 
@@ -575,7 +586,7 @@ Verbatim docs (`--dry-run`):
 
 4. **Target's WAL since divergence must be present in `pg_wal/` OR fetchable via `restore_command`.** If target ran `pg_archivecleanup` aggressively post-failover, segments may be gone. Use `--restore-target-wal` PG13+.
 
-5. **pg_rewind discards target's post-divergence writes silently.** No warning, no audit. Always: byte-level backup target first via `cp -a`. Optionally extract via `pg_waldump` + `pg_dump` if split-brain suspected.
+5. **pg_rewind discards target's post-divergence writes.** Preserve an independent offline copy of PGDATA, all external tablespaces and external WAL before rewinding. Investigate and reconcile split-brain writes before rejoining.
 
 6. **`--source-pgdata` requires source cleanly shut down.** Crashed-but-not-restarted source = error. Verify via `pg_controldata | grep state` — wants `shut down`, not `in production` or `shut down in recovery`.
 
@@ -597,13 +608,13 @@ Verbatim docs (`--dry-run`):
 
 15. **Source-server role needs SCRAM-SHA-256 + `pg_hba.conf` entry.** Common oversight: role created but `pg_hba.conf` not edited → `FATAL: no pg_hba.conf entry`. Reload after editing.
 
-16. **pg_rewind is atomic per relation block but NOT atomic at the data-directory level.** If killed mid-rewind, target is left in an indeterminate state. Restore from your `cp -a` byte-level backup.
+16. **pg_rewind is not atomic.** If killed mid-rewind, the target is indeterminate. Preserve an independent offline backup of PGDATA, every external tablespace and WAL directory before attempting it.
 
 17. **`--dry-run` prints to stdout, does not modify target.** Use to estimate work + permissions before real run.
 
 18. **`pg_basebackup` is preferred for small clusters (< 50 GB) — setup cost of pg_rewind exceeds savings.** pg_rewind shines on TB-scale clusters with small divergence.
 
-19. **`max_replication_slots` + `max_wal_senders` on source need slots for pg_rewind connections.** Default sufficient; tune if running multiple parallel rewinds (rare). See [`75-replication-slots.md`](./75-replication-slots.md).
+19. **A source-server rewind uses a normal database connection.** Account for connection capacity; pg_rewind itself does not require a replication slot. A subsequently configured standby may require its own slot.
 
 20. **PG14+ supports rewinding standbys.** Pre-PG14 only former primaries. If using older PG version, plan accordingly.
 
@@ -611,7 +622,7 @@ Verbatim docs (`--dry-run`):
 
 22. **PG17+ `--sync-method`** matches `pg_basebackup --sync-method` for tuning fsync behavior at end of rewind. Default `fsync` for durability — only change if you understand tradeoffs.
 
-23. **pg_rewind does NOT migrate logical replication slots from source to target.** Slots are recreated as part of the rewound directory's catalog state, but their position is set to source's current LSN. If you have failover slots PG17+ (`failover=true`), they sync via the standby slot-sync mechanism, not via pg_rewind. See [`75-replication-slots.md`](./75-replication-slots.md).
+23. **pg_rewind does not copy source replication slots, and skips `pg_replslot/`, so the target keeps its own stale slots.** After the rejoin, drop stale slots on the target that no longer have a consumer, because they retain WAL. Plan slot recreation or, on PG17+, configure and verify failover-slot synchronization separately. See <https://www.postgresql.org/docs/16/app-pgrewind.html>.
 
 ---
 
@@ -619,13 +630,13 @@ Verbatim docs (`--dry-run`):
 
 - [`33-wal.md`](./33-wal.md) — WAL fundamentals, `wal_log_hints`, `full_page_writes`, segments, timelines
 - [`73-streaming-replication.md`](./73-streaming-replication.md) — physical streaming replication setup
-- [`75-replication-slots.md`](./75-replication-slots.md) — slots survive pg_rewind via catalog; logical-slot failover via PG17+ sync
+- [`75-replication-slots.md`](./75-replication-slots.md) — slot management and PG17+ logical-slot synchronization
 - [`77-standby-failover.md`](./77-standby-failover.md) — `pg_promote()`, timeline switch, controlled switchover
 - [`78-ha-architectures.md`](./78-ha-architectures.md) — pg_rewind's role in HA toolchains
 - [`79-patroni.md`](./79-patroni.md) — Patroni's `use_pg_rewind` flag + `remove_data_directory_on_rewind_failure` fallback
 - [`84-backup-physical-pitr.md`](./84-backup-physical-pitr.md) — `pg_basebackup` as the fallback when pg_rewind cannot run
 - [`86-pg-upgrade.md`](./86-pg-upgrade.md) — cross-version impossibility; in-place major-version upgrade alternatives
-- [`87-major-version-upgrade.md`](./87-major-version-upgrade.md) — pg_rewind as the recommended rollback path after a failed pg_upgrade or blue/green cutover
+- [`87-major-version-upgrade.md`](./87-major-version-upgrade.md) — major-version upgrade and rollback planning; pg_rewind cannot cross major versions
 - [`88-corruption-recovery.md`](./88-corruption-recovery.md) — `pg_checksums --enable` offline conversion to satisfy pg_rewind prerequisite; byte-level-backup discipline before destructive tools
 - [`90-disaster-recovery.md`](./90-disaster-recovery.md) — full DR runbook incorporating pg_rewind for re-attachment phase
 - [`46-roles-privileges.md`](./46-roles-privileges.md) — non-superuser source-server role

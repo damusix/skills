@@ -1,7 +1,7 @@
 # Procedure Structure
 
 
-Postgres distinguishes **PROCEDUREs** (can `COMMIT`/`ROLLBACK` inside; cannot be called from within an explicit transaction) from **FUNCTIONs** (always run inside a transaction; cannot `COMMIT`/`ROLLBACK`). Postgres's transaction model enforces most boundaries naturally.
+Postgres distinguishes **PROCEDUREs** (can `COMMIT`/`ROLLBACK`, but only when `CALL` runs in its own transaction) from **FUNCTIONs** (always run inside a transaction; cannot `COMMIT`/`ROLLBACK`). By default a procedure leaves the transaction to its caller: it does the work, raises on failure, and the caller's transaction rolls back.
 
 ## Table of Contents
 
@@ -10,7 +10,7 @@ Postgres distinguishes **PROCEDUREs** (can `COMMIT`/`ROLLBACK` inside; cannot be
 - [FUNCTION — Reads and Pure Computations](#function--reads-and-pure-computations)
 - [The 4-Block Structure](#the-4-block-structure)
 - [EXCEPTION Block Patterns](#exception-block-patterns)
-- [SAVEPOINT for Selective Rollback](#savepoint-for-selective-rollback)
+- [Selective Rollback with a Nested Block](#selective-rollback-with-a-nested-block)
 - [AddOrModify with INSERT ... ON CONFLICT](#addormodify-with-insert--on-conflict)
 - [Naming and Verbs](#naming-and-verbs)
 
@@ -20,32 +20,22 @@ Postgres distinguishes **PROCEDUREs** (can `COMMIT`/`ROLLBACK` inside; cannot be
 
 Never wrap one explicit `BEGIN` inside another. Postgres prevents most accidental nesting at the engine layer:
 
-- A PROCEDURE that does `COMMIT`/`ROLLBACK` cannot be called from within an explicit transaction — Postgres errors with `2D000`.
+- A PROCEDURE that runs `COMMIT`/`ROLLBACK` while `CALL` is inside an explicit transaction block fails at that statement with `2D000` (`invalid_transaction_termination`). Transaction control works only when `CALL` runs in its own transaction, or under a chain of `CALL`/`DO` with no other command in between.
 - `BEGIN` inside `BEGIN` (in psql or a session) issues a warning ("there is already a transaction in progress") and ignores the inner one.
+- A PL/pgSQL block with an `EXCEPTION` clause runs as a subtransaction, so `COMMIT` or `ROLLBACK` inside it fails.
 
-What's left to enforce: top-level operations that *assume* they own their transaction. Use a small assertion helper:
+Most procedures never end the transaction, so a caller can run them anywhere. A batch procedure that commits between chunks must be called outside an explicit transaction. PostgreSQL enforces this at the first `COMMIT` with `2D000`, so the procedure needs no guard of its own:
 
-    CREATE OR REPLACE FUNCTION fn_assert_not_in_transaction()
-    RETURNS VOID AS $$
-    BEGIN
-        IF pg_current_xact_id_if_assigned() IS NOT NULL THEN
-            RAISE EXCEPTION 'must not be called inside an explicit transaction'
-                USING ERRCODE = 'P0012';
-        END IF;
-    END;
-    $$ LANGUAGE plpgsql;
-
-Call at the top of any PROCEDURE that owns its transaction:
-
-    CREATE OR REPLACE PROCEDURE pr_transfer_funds(...)
+    CREATE OR REPLACE PROCEDURE pr_archive_old_orders(p_batch_size integer)
     LANGUAGE plpgsql AS $$
     BEGIN
-        PERFORM fn_assert_not_in_transaction();
-        -- ... rest of procedure
+        -- ... loop: archive one batch, then COMMIT (outside any EXCEPTION block)
     END;
     $$;
 
-For selective rollback within a single logical unit, use `SAVEPOINT` — never a nested `BEGIN`.
+    CALL pr_archive_old_orders(1000);  -- top level, not inside BEGIN
+
+For selective rollback within a single logical unit, use a nested `BEGIN ... EXCEPTION ... END` block, never a second transaction. PL/pgSQL has no `SAVEPOINT` command; `SAVEPOINT` works only in client-side SQL sessions.
 
 ## PROCEDURE — Mutations With Transaction Control
 
@@ -55,7 +45,7 @@ Use a PROCEDURE when you need:
 - Explicit `COMMIT`/`ROLLBACK` mid-procedure (long-running batch jobs)
 - Multi-table coordination
 
-A PROCEDURE is invoked with `CALL`, not `SELECT`:
+A PROCEDURE is invoked with `CALL`, not `SELECT`. This one does not commit: a bare `CALL` runs in its own implicit transaction, and a caller can wrap several calls in one `BEGIN`/`COMMIT`. Any raised error rolls back the whole transaction:
 
     CREATE OR REPLACE PROCEDURE pr_transfer_funds(
         p_from_account_no  account_no,
@@ -67,31 +57,44 @@ A PROCEDURE is invoked with `CALL`, not `SELECT`:
         v_from_balance money_amount;
     BEGIN
         -- BLOCK 1: GUARD
-        PERFORM fn_assert_not_in_transaction();
-
         IF p_from_account_no IS NULL OR p_to_account_no IS NULL THEN
             RAISE EXCEPTION 'account numbers required'
-                USING ERRCODE = 'P0001';
+                USING ERRCODE = 'Z0001';
+        END IF;
+
+        IF p_from_account_no = p_to_account_no THEN
+            RAISE EXCEPTION 'source and destination accounts must differ'
+                USING ERRCODE = 'Z0001';
         END IF;
 
         IF p_amount <= 0 THEN
             RAISE EXCEPTION 'amount must be positive'
-                USING ERRCODE = 'P0001';
+                USING ERRCODE = 'Z0001';
         END IF;
 
         -- BLOCK 2: VALIDATE STATE
-        SELECT balance INTO v_from_balance
-        FROM account WHERE account_no = p_from_account_no
+        -- Lock both rows in account_no order so opposite-direction transfers cannot deadlock.
+        PERFORM 1 FROM account
+        WHERE account_no IN (p_from_account_no, p_to_account_no)
+        ORDER BY account_no
         FOR UPDATE;
+
+        SELECT balance INTO v_from_balance
+        FROM account WHERE account_no = p_from_account_no;
 
         IF NOT FOUND THEN
             RAISE EXCEPTION 'source account not found: %', p_from_account_no
-                USING ERRCODE = 'P0002';
+                USING ERRCODE = 'Z0002';
+        END IF;
+
+        IF NOT EXISTS (SELECT 1 FROM account WHERE account_no = p_to_account_no) THEN
+            RAISE EXCEPTION 'destination account not found: %', p_to_account_no
+                USING ERRCODE = 'Z0002';
         END IF;
 
         IF v_from_balance < p_amount THEN
             RAISE EXCEPTION 'insufficient funds'
-                USING ERRCODE = 'P0005';
+                USING ERRCODE = 'Z0005';
         END IF;
 
         -- BLOCK 3: APPLY
@@ -103,15 +106,10 @@ A PROCEDURE is invoked with `CALL`, not `SELECT`:
 
         INSERT INTO ledger_entry(from_account_no, to_account_no, amount)
         VALUES (p_from_account_no, p_to_account_no, p_amount);
-
-        -- BLOCK 4: COMMIT
-        COMMIT;
-
-    EXCEPTION WHEN OTHERS THEN
-        ROLLBACK;
-        RAISE;  -- re-raise so caller sees the error
     END;
     $$;
+
+    CALL pr_transfer_funds(1001, 1002, 250.00);
 
 ## FUNCTION — Reads and Pure Computations
 
@@ -145,12 +143,14 @@ FUNCTIONs always run in a transaction (the caller's, or implicit if invoked bare
 
 Every PROCEDURE follows the same shape:
 
-1. **GUARD** — `fn_assert_not_in_transaction()`, NULL checks, type checks, simple input validation. Fail fast with `P0001`.
-2. **VALIDATE STATE** — read current state under appropriate locks (`FOR UPDATE`, `FOR SHARE`); raise `P0002`/`P0005` if state precludes the operation.
+1. **GUARD** — NULL checks, type checks, simple input validation. Fail fast with `Z0001`.
+2. **VALIDATE STATE** — read current state under appropriate locks (`FOR UPDATE`, `FOR SHARE`); raise `Z0002`/`Z0005` if state precludes the operation.
 3. **APPLY** — DML statements that change state. Each `UPDATE`/`DELETE` should be checked with `IF NOT FOUND THEN ...` if the row count matters.
-4. **COMMIT** — explicit `COMMIT` (PROCEDUREs only). Wrap the whole body in `EXCEPTION WHEN OTHERS THEN ROLLBACK; RAISE;` for safety.
+4. **COMMIT** — usually absent. The caller owns the transaction, and a raised error rolls it back. Only a procedure that deliberately owns batch boundaries (a long-running batch that commits per chunk) calls `COMMIT`, is called outside an explicit transaction, and keeps every `COMMIT` outside any block with an `EXCEPTION` clause.
 
-FUNCTIONs follow the same logical flow but skip the COMMIT block — the caller's transaction handles that.
+Never wrap a body in `EXCEPTION WHEN OTHERS THEN ROLLBACK; RAISE;`. The `ROLLBACK` fails inside an exception block. Without the `ROLLBACK`, the handler re-raises an error that would propagate anyway, and adds a subtransaction to every call.
+
+FUNCTIONs follow the same logical flow and never commit.
 
 ## EXCEPTION Block Patterns
 
@@ -161,15 +161,15 @@ Postgres has no `GOTO`. Errors flow through `EXCEPTION WHEN ... THEN` clauses, w
     EXCEPTION
         WHEN unique_violation THEN
             RAISE EXCEPTION 'email already taken'
-                USING ERRCODE = 'P0003';
+                USING ERRCODE = 'Z0003';
         WHEN foreign_key_violation THEN
             RAISE EXCEPTION 'referenced record does not exist'
-                USING ERRCODE = 'P0002';
+                USING ERRCODE = 'Z0002';
 
 **Catch by custom code:**
 
     EXCEPTION
-        WHEN SQLSTATE 'P0010' THEN
+        WHEN SQLSTATE 'Z0010' THEN
             -- type discriminator mismatch — translate or re-raise
             RAISE;
 
@@ -183,29 +183,28 @@ Postgres has no `GOTO`. Errors flow through `EXCEPTION WHEN ... THEN` clauses, w
             VALUES (v_state, v_msg, clock_timestamp());
         RAISE;  -- always re-raise unless you have a real reason to swallow
 
-**Rule of thumb:** EXCEPTION is for *handling* errors — translating, logging, rolling back. Don't use it as a substitute for `IF` checks. Validation belongs in the GUARD/VALIDATE blocks with explicit `RAISE EXCEPTION ... USING ERRCODE = ...`.
+The re-raise aborts the transaction, so the `error_log` row rolls back with it unless an outer caller catches the error. For a log that survives, use `RAISE LOG` or `RAISE WARNING` and let the server log carry it.
 
-## SAVEPOINT for Selective Rollback
+**Rule of thumb:** EXCEPTION is for *handling* errors: translating, logging, undoing a nested block's work. Don't use it as a substitute for `IF` checks. Validation belongs in the GUARD/VALIDATE blocks with explicit `RAISE EXCEPTION ... USING ERRCODE = ...`.
 
-When part of a procedure may fail and you want to continue the rest:
+## Selective Rollback with a Nested Block
+
+When part of a procedure may fail and you want to continue the rest, put that part in a nested block with its own `EXCEPTION` clause. Postgres opens a subtransaction when the block starts. On an error it undoes only that block's work, then runs the handler:
 
     BEGIN
         -- main work
         INSERT INTO order_line(...) VALUES (...);
 
         -- optional side effect
-        SAVEPOINT try_audit;
         BEGIN
             INSERT INTO audit_log(...) VALUES (...);
-        EXCEPTION WHEN OTHERS THEN
-            ROLLBACK TO SAVEPOINT try_audit;
-            -- log and continue; main work is preserved
+        EXCEPTION WHEN unique_violation THEN
+            RAISE WARNING 'audit insert skipped: %', SQLERRM;
+            -- main work is preserved
         END;
-
-        COMMIT;
     END;
 
-This is the *only* legitimate form of nested transaction-like behavior. SAVEPOINTs are not a nested `BEGIN` — they're a checkpoint within the current transaction.
+This is the only legitimate form of nested transaction-like behavior in PL/pgSQL. The nested block is not a second transaction, so it cannot `COMMIT` or `ROLLBACK`. Catch the specific condition you expect; `WHEN OTHERS` here would also hide bugs in the side effect. In a client-side SQL session, `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` does the same job; PL/pgSQL does not accept those commands.
 
 ## AddOrModify with INSERT ... ON CONFLICT
 
@@ -217,18 +216,11 @@ Use `INSERT ... ON CONFLICT` (UPSERT) for idempotent merges:
     )
     LANGUAGE plpgsql AS $$
     BEGIN
-        PERFORM fn_assert_not_in_transaction();
-
         INSERT INTO customer(email, full_name)
         VALUES (p_email, p_full_name)
         ON CONFLICT (email) DO UPDATE
             SET full_name = EXCLUDED.full_name,
                 updated_at = clock_timestamp();
-
-        COMMIT;
-    EXCEPTION WHEN OTHERS THEN
-        ROLLBACK;
-        RAISE;
     END;
     $$;
 

@@ -49,7 +49,7 @@ This file is the SQL surface for roles and privileges. Authentication (which rol
 
 1. **A role is a unified login + group identity.** PostgreSQL has one `pg_authid` catalog. `CREATE USER` is `CREATE ROLE … LOGIN`; `CREATE GROUP` is a deprecated synonym for `CREATE ROLE … NOLOGIN`. There is no separate user/group namespace.[^user-manag]
 
-2. **Default is `INHERIT`** — a member role automatically uses the privileges of every role it belongs to, transitively. Setting `NOINHERIT` forces explicit `SET ROLE` before privileges become usable. The default flipped to be policy-significant in PG16: `CREATEROLE` no longer creates inheriting roles automatically.[^role-membership]
+2. **`INHERIT` is the default.** Before PG16 it controls privilege inheritance at role level; PG16+ uses the attribute as the default for new memberships, whose individual `INHERIT` options can differ.[^role-membership]
 
 3. **`SUPERUSER` bypasses all privilege checks. `BYPASSRLS` bypasses row-level security only.** Either attribute makes the role exempt from the checks that follow — use sparingly, and never grant `SUPERUSER` to an application role. Use predefined roles (`pg_read_all_data`, `pg_monitor`, `pg_maintain` PG17+) for broad read/monitor/maintain access instead of `SUPERUSER`.[^createrole]
 
@@ -122,7 +122,7 @@ The full grammar (condensed):[^createrole]
 | `CREATEROLE` | `NOCREATEROLE` | Role can create/alter/drop other roles — **scope narrowed in PG16** | same |
 | `INHERIT` | `INHERIT` | Privileges from group memberships are automatically active | same |
 | `REPLICATION` | `NOREPLICATION` | Role can initiate replication (physical or logical) and connect for `replication`-database authentication | same |
-| `BYPASSRLS` | `NOBYPASSRLS` | Skip row-level security; only a superuser can grant this | same |
+| `BYPASSRLS` | `NOBYPASSRLS` | Skip row-level security; only superusers or roles with `BYPASSRLS` may specify it | same |
 | `CONNECTION LIMIT n` | `-1` (unlimited) | Max concurrent connections for this role | same |
 | `PASSWORD 'p'` | none (no password) | SCRAM/MD5 password text. `PASSWORD NULL` removes the password. | `CREATE ROLE`, `ALTER ROLE … PASSWORD`, `\password` in psql |
 | `VALID UNTIL ts` | `infinity` | Password expiration timestamp (NULL means no expiration) | same |
@@ -148,7 +148,7 @@ The verbatim docs rule: *"The privilege chain stops at memberships with `INHERIT
 Three operational rules:
 
 1. The role attribute `INHERIT` / `NOINHERIT` (set in `CREATE ROLE`) is the *default*; per-grant `WITH INHERIT` (PG16+) overrides per-membership.
-2. `SET ROLE` works on a granted role regardless of `INHERIT` — that's the whole point of `NOINHERIT`.
+2. `SET ROLE` is independent of `INHERIT`, but requires a chain of membership grants with `SET TRUE` on every link (PG16+).
 3. `NOINHERIT` does NOT prevent ownership — owned objects belong to the role even if its membership doesn't inherit privileges. `REASSIGN OWNED` still applies.
 
 
@@ -300,18 +300,7 @@ Three operational rules:
 
 1. **`REASSIGN OWNED` is per-database.** Loop over `pg_database` and run it inside each database where the role might own anything. The role catalog itself is cluster-wide; ownership is per-database.
 2. **`DROP OWNED` removes the role from any ACL it appears in**, even as a grantee — this is why step 2 is required even after step 1 already moved ownership.
-3. **`REASSIGN OWNED` does not transfer non-database-scope resources** like tablespaces or shared catalog ownership. Use `ALTER TABLESPACE … OWNER TO bob` separately if applicable.
-
-A typical batch:
-
-    DO $$
-    DECLARE d text;
-    BEGIN
-        FOR d IN SELECT datname FROM pg_database WHERE datallowconn LOOP
-            EXECUTE format('ALTER DATABASE %I CONNECTION LIMIT 0', d);
-            -- then in a per-db script: REASSIGN OWNED BY alice TO bob; DROP OWNED BY alice;
-        END LOOP;
-    END$$;
+3. **`REASSIGN OWNED` also transfers shared objects**, including databases and tablespaces. The first invocation transfers those objects; repeat it in each database for local objects. See [REASSIGN OWNED](https://www.postgresql.org/docs/16/sql-reassign-owned.html).
 
 > [!WARNING] Minor releases 2026-11-12
 > CVE-2026-120146 (2026-11-12 minors, 18.7 and the matching older branches): `REASSIGN OWNED` now follows the `ALTER OWNER` privilege rules and also checks `CREATEDB` for database ownership.[^minor-18-7] CVE-2026-116311: `DROP OWNED` removed restrictive row-level security policies; see [`47-row-level-security.md`](./47-row-level-security.md).[^minor-nov-announce] Full CVE list: <https://www.postgresql.org/support/security/>.
@@ -346,7 +335,7 @@ Predefined roles ship with the cluster and live under the `pg_` prefix.[^predefi
 > [!NOTE] PostgreSQL 18
 > `pg_signal_autovacuum_worker` added. Verbatim: *"Add predefined role pg_signal_autovacuum_worker … This allows sending signals to autovacuum workers."*[^pg18-sigav] Lets a non-superuser DBA cancel a stuck autovacuum without escalating to superuser. See [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md) for autovacuum operational context.
 
-Use predefined roles whenever possible instead of granting `SUPERUSER`. A monitoring agent needs `pg_monitor`, not superuser. A backup tool that runs `pg_basebackup` needs the `REPLICATION` role attribute and `pg_read_all_data` (or its own table grants), not superuser. An autovacuum-tuning DBA needs `pg_maintain` on PG17+, not superuser.
+Use predefined roles whenever possible instead of granting `SUPERUSER`. A monitoring agent needs `pg_monitor`, not superuser. `pg_basebackup` requires a superuser or a role with `REPLICATION`, plus suitable replication HBA access; it does not need table-level SELECT privileges. An autovacuum-tuning DBA can use `pg_maintain` on PG17+.
 
 
 ### Per-Version Timeline
@@ -414,18 +403,18 @@ Continues the iteration-41/42 per-role-baseline pattern. Set timeouts and isolat
 See [`41-transactions.md`](./41-transactions.md) Recipe 1 for timeouts, [`42-isolation-levels.md`](./42-isolation-levels.md) Recipe 7 for isolation.
 
 
-### Recipe 3 — Soft revocation via REVOKE CONNECT
+### Recipe 3 — Soft revocation via NOLOGIN
 
-To temporarily lock out a role without deleting it:
+To block a role from connecting, account for privileges inherited from `PUBLIC` and group roles. `CONNECT` is granted to `PUBLIC` by default, so revoking only a direct grant normally does not lock the role out. For a role-wide lockout, disable login and terminate its existing sessions:
 
-    REVOKE CONNECT ON DATABASE app FROM app_user;
+    ALTER ROLE app_user NOLOGIN;
 
     -- and to kick existing sessions:
     SELECT pg_terminate_backend(pid)
     FROM pg_stat_activity
     WHERE usename = 'app_user' AND pid <> pg_backend_pid();
 
-Reversing it: `GRANT CONNECT ON DATABASE app TO app_user;`.
+Restore access with `ALTER ROLE app_user LOGIN;`. To restrict only one database, revoke `CONNECT` from `PUBLIC` and other applicable groups, grant it to authorized roles, and verify effective access with `has_database_privilege`.
 
 
 ### Recipe 4 — Audit who can SELECT from a sensitive table
@@ -534,7 +523,7 @@ Cluster-scope cleanup script (pseudocode for a shell loop):
     # Then cluster-wide:
     psql -c "DROP ROLE old_dev;"
 
-If `old_dev` owned any tablespace, run `ALTER TABLESPACE x OWNER TO new_dev;` first — tablespace ownership is cluster-wide and not handled by per-database `REASSIGN OWNED`.
+`REASSIGN OWNED` also transfers shared database and tablespace ownership on its first invocation.
 
 
 ### Recipe 11 — Test what a user sees via SET ROLE
@@ -552,8 +541,8 @@ A privileged session can simulate a less-privileged user without disconnecting:
 
 ### Recipe 12 — Per-database password policy via VALID UNTIL
 
-    -- Force rotation in 90 days
-    ALTER ROLE app_user VALID UNTIL CURRENT_DATE + INTERVAL '90 days';
+    -- Force rotation at a fixed deadline
+    ALTER ROLE app_user VALID UNTIL '2027-02-01 00:00:00+00';
 
     -- Audit roles whose password expires soon:
     SELECT rolname, rolvaliduntil
@@ -562,16 +551,17 @@ A privileged session can simulate a less-privileged user without disconnecting:
       AND rolvaliduntil < CURRENT_DATE + INTERVAL '14 days'
     ORDER BY rolvaliduntil;
 
+`VALID UNTIL` takes a timestamp literal, not an expression, so compute the 90-day deadline before running the statement.
+
 After expiration the role cannot authenticate via password — but already-connected sessions stay alive. Pair with a session-aging GUC like `idle_session_timeout` to actually kick stale sessions.
 
 
 ### Recipe 13 — Per-grant audit with pg_get_acl (PG18+)
 
-Pre-PG18, decoding `pg_class.relacl` strings was a manual exercise (see the ACL letter table above). PG18 adds `pg_get_acl()`:[^pg18-getacl]
+PG18's `pg_get_acl()` retrieves an ACL array by catalog OID, object OID and subobject ID. Expand its privileges with `aclexplode()`:[^pg18-getacl]
 
-    -- PG18+
-    SELECT pg_get_acl('table', 'app.payments'::regclass::oid);
-    -- Returns a setof aclitem rows: (grantee, granted_privs, grantor, …)
+    SELECT a.*
+    FROM aclexplode(pg_get_acl('pg_class'::regclass, 'app.payments'::regclass, 0)) AS a;
 
 
 
@@ -605,13 +595,13 @@ Pre-PG18, decoding `pg_class.relacl` strings was a manual exercise (see the ACL 
 
 14. **`pg_write_all_data` does NOT grant `pg_read_all_data`.** Writers without reader membership can `INSERT`/`UPDATE`/`DELETE` blindly but cannot `SELECT` the rows they're modifying — `UPDATE … WHERE id = 1` requires `SELECT` on the WHERE-clause columns.
 
-15. **PG17 `pg_maintain` does not include `ANALYZE`-by-itself power on materialized views**. The `MAINTAIN` privilege covers `REFRESH MATERIALIZED VIEW` but the matview must already exist; `pg_maintain` doesn't grant creation rights.
+15. **`pg_maintain` grants `MAINTAIN` on tables, including materialized views.** It permits operations such as `ANALYZE` and `REFRESH MATERIALIZED VIEW`, but does not grant creation rights.
 
 16. **Granting `CONNECT` on a database does not let you read its tables.** Database `CONNECT` is just network-level admission. Tables still need `SELECT`. Common error: granting only `CONNECT` and being confused that `\d` shows nothing.
 
 17. **`REVOKE … FROM PUBLIC` only removes the PUBLIC grant.** Individual roles that hold the privilege directly are unaffected. Audit per-role grants separately.
 
-18. **`pg_dump --clean` does not drop roles.** Logical dumps cover database-scope objects only. Cluster-scope objects (roles, tablespaces, ACLs on databases) come from `pg_dumpall --globals-only`. After restoring into a fresh cluster, you must restore globals separately, or the dump's object owners won't exist as roles.
+18. **`pg_dump --clean` does not drop roles.** Cluster-wide roles, tablespaces and configuration-parameter grants require a separate reviewed globals dump, such as `pg_dumpall --globals-only`. Restore those globals before database archives, reconciling existing bootstrap roles as described in [logical restore preparation](83-backup-pg-dump.md). Database ACLs and per-database settings are not part of globals-only output; restore the appropriate database-level metadata separately.
 
 19. **`security_barrier` views and `SECURITY DEFINER` functions** interact subtly with roles — see [`05-views.md`](./05-views.md) and [`06-functions.md`](./06-functions.md). Briefly: a `security_invoker` view (PG15+) checks permissions as the *caller*; a default view checks as the *owner*. Auditing what a role can see through views requires picking the right view type.
 

@@ -200,9 +200,7 @@ Three-way feature table at planning time (2026-05-14). **Verify before adopting*
         storageClass: gp3
       numberOfInstances: 3
       users:
-        app:
-          - superuser
-          - createdb
+        app: []
         readonly: []
       databases:
         app: app
@@ -296,7 +294,7 @@ Three-way feature table at planning time (2026-05-14). **Verify before adopting*
         - name: app
           databases:
             - app
-          options: "SUPERUSER"
+          options: "NOSUPERUSER"
 
 **Failover.** Custom controller-driven. PGO watches pod health + replication lag, promotes the most-advanced replica on primary failure.
 
@@ -442,9 +440,9 @@ K8s operators evolve independently of PostgreSQL. Postgres major releases that a
                     name: backup-credentials
                     key: SECRET_ACCESS_KEY
 
-    Manual promotion on region A failure: `kubectl patch cluster appdb -p '{"spec":{"replica":{"enabled":false}}}'`.
+    Before manual promotion, fence the old primary and prevent it from accepting writes; then use `kubectl patch cluster appdb -p '{"spec":{"replica":{"enabled":false}}}'` in the DR namespace.
 
-5. **Major version upgrade (CNPG).** Edit `spec.imageName: ghcr.io/cloudnative-pg/postgresql:18.7` (was `:17.12`). Operator runs `pg_upgrade`. Watch with `kubectl cnpg status appdb -n prod` and `kubectl get pods -n prod -w`. Cross-reference: [`86-pg-upgrade.md`](./86-pg-upgrade.md) for `pg_upgrade` prerequisites + [`87-major-version-upgrade.md`](./87-major-version-upgrade.md) for strategy comparison.
+5. **Major version upgrade (CNPG).** CNPG 1.27 supports requesting an offline in-place `pg_upgrade` by changing `spec.imageName`. All instances are unavailable, replicas are rebuilt, and the target image must use the same OS distribution and compatible extensions. Take a full backup first, separate old and new WAL archive paths, then take a new base backup and follow the generated ANALYZE guidance. See <https://cloudnative-pg.io/docs/1.27/postgres_upgrades/>.
 
 6. **Online PVC resize.** Edit `spec.storage.size: 200Gi` (was `100Gi`). Storage class must support `VolumeExpansion: true`. Verify with `kubectl get pvc -n prod`.
 
@@ -533,13 +531,13 @@ K8s operators evolve independently of PostgreSQL. Postgres major releases that a
 
 14. **Operator logs vs PG logs.** `kubectl logs deploy/cnpg-controller-manager -n cnpg-system` = operator reconciliation. `kubectl logs appdb-1 -c postgres -n prod` = PG server log. Failover problems usually visible in operator logs; query problems in PG logs. Cross-reference: [`82-monitoring.md`](./82-monitoring.md).
 
-15. **Backup retention vs WAL retention misunderstanding.** Setting `retentionPolicy: 7d` deletes base backups older than 7 days; WAL retention is separate (controlled by `wal_keep_size` or `archive_timeout` on PG side, and by the backup tool's WAL pruning). Test PITR target window weekly. Cross-reference: [`85-backup-tools.md`](./85-backup-tools.md) gotcha #9.
+15. **Backup retention and WAL retention are different.** `wal_keep_size` concerns local WAL retention for standbys; `archive_timeout` switches segments. Neither defines backup-repository retention. Configure the backup tool's retention and test the PITR window.
 
-16. **CNPG `Pooler` does NOT inherit `Cluster` connection limits.** `Pooler.spec.pgbouncer.parameters.max_client_conn` is separate from `Cluster.spec.postgresql.parameters.max_connections`. Math: `max_client_conn` × pooler instances must accommodate worst-case client load; `default_pool_size` × pooler instances must be ≤ Postgres `max_connections` × cluster instances.
+16. **Pooler limits are not cluster connection limits.** Budget all PgBouncer pools across all pooler instances against the connection limit of the actual destination server, including other clients and reserved slots. `default_pool_size` applies per database/user pool; multiplying by PostgreSQL instance count overestimates capacity for an `rw` pool.
 
 17. **`Cluster.spec.imageName` change triggers rolling restart on every parameter change requiring restart.** Some parameters (`shared_buffers`, `wal_buffers`, `max_connections`) require restart. Operator waits for replica catch-up, fails over primary, restarts old primary as new replica. Plan maintenance windows.
 
-18. **Logical replication slots created via psql do NOT survive operator reconciliation.** Use the operator's declarative slot management (CNPG `Subscription` CR + PG17 logical slot failover[^pg17-release-slot-failover]) to ensure slots persist across pod rescheduling. Cross-reference: [`75-replication-slots.md`](./75-replication-slots.md).
+18. **Logical slots need an explicit failover plan.** Physical replication does not automatically make every logical slot available on a promoted standby. On PG17+, configure and verify logical failover-slot synchronization where appropriate. See <https://www.postgresql.org/docs/17/logicaldecoding-explanation.html>.
 
 19. **K8s API as DCS (Zalando default) tied to cluster availability.** Patroni leader election runs through the K8s API server[^zalando-readthedocs]. K8s API outage = no failover decisions made (cluster keeps current primary). Tolerable for short API outages; not for region-level events.
 

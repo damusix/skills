@@ -45,7 +45,7 @@ Five rules that drive every operational decision:
 
 1. **A slot is a server-side bookmark, not a connection.** It lives in `pg_replication_slots`, persists across restarts, and survives the consumer disconnecting. The slot is on disk; the walsender (or subscriber's apply worker) is in process memory.
 2. **Physical slots retain WAL; logical slots retain WAL + `catalog_xmin` + slot-level snapshot state.** Logical slots additionally hold back `VACUUM` from removing system-catalog rows the slot's consumer might still need.
-3. **An abandoned slot retains its resources indefinitely unless `max_slot_wal_keep_size` (PG13+) bounds WAL retention.** The default is `-1` (unlimited). Configure this on every production cluster.
+3. **`max_slot_wal_keep_size` limits slot-driven WAL retention at checkpoints, not all WAL disk usage.** It does not bound how long slots retain `xmin` or `catalog_xmin`, nor eliminate wraparound risk. Monitor both horizons and disk separately.
 4. **Slot invalidation is a one-way operation.** Once the slot's `wal_status` reaches `lost`, it cannot resume — you must drop and recreate (and re-bootstrap the consumer). Verbatim from the docs: *"`lost` means that this slot is no longer usable."*
 5. **PG17+ failover slots sync to physical standbys.** Pre-PG17, when the primary failed over, logical subscribers had to be rebuilt against the new primary because slots existed only on the old primary. PG17 fixes this for HA deployments via `sync_replication_slots` + `synchronized_standby_slots` + `pg_sync_replication_slots()`.
 
@@ -68,7 +68,7 @@ Three smell signals:
 
 - **`pg_wal` directory growing unbounded**: someone created a slot, the consumer went away, `max_slot_wal_keep_size = -1`. Find the abandoned slot in `pg_replication_slots WHERE active = false`.
 - **`pg_replication_slots.wal_status = 'extended'`** for a slot: WAL beyond `max_wal_size` is being retained. Either the consumer is lagging (catch it up) or it's been abandoned (drop it).
-- **VACUUM not reclaiming dead tuples** despite no long-running transactions: a logical slot's `catalog_xmin` is holding the cluster-wide xmin horizon back. Check `pg_replication_slots.catalog_xmin`.
+- **VACUUM not reclaiming dead tuples**: inspect slot `xmin` for user-table retention and `catalog_xmin` for catalog retention, alongside long transactions and prepared transactions.
 
 ## Mechanics
 
@@ -120,7 +120,7 @@ Verbatim: *"The address (LSN) of oldest WAL which still might be required by the
 
 The hot-standby-feedback interaction, verbatim: *"Similarly, `hot_standby_feedback` on its own, without also using a replication slot, provides protection against relevant rows being removed by vacuum, but provides no protection during any time period when the standby is not connected. Replication slots overcome these disadvantages."*[^warm-standby]
 
-So slots subsume the protection `hot_standby_feedback` offers while a connection is up — and extend it across disconnects.
+Physical slots preserve the last reported feedback horizon across disconnects; a slot alone does not supply standby feedback. Enable `hot_standby_feedback` when that protection is required.
 
 ### Slot Invalidation (PG13+)
 
@@ -158,8 +158,8 @@ Columns change across PG versions. Reference baseline is PG16.
 | `temporary` | `bool` | Temporary slot flag |
 | `active` | `bool` | A consumer is currently connected |
 | `active_pid` | `int4` | PID of the connected backend |
-| `xmin` | `xid` | Oldest transaction whose effects must be preserved (physical slots) |
-| `catalog_xmin` | `xid` | Oldest transaction whose catalog effects must be preserved (logical slots) |
+| `xmin` | `xid` | Oldest transaction needed by the slot; VACUUM cannot remove tuples deleted by later transactions |
+| `catalog_xmin` | `xid` | Oldest transaction affecting catalogs needed by the slot; VACUUM cannot remove later-deleted catalog tuples |
 | `restart_lsn` | `pg_lsn` | Oldest WAL LSN still required |
 | `confirmed_flush_lsn` | `pg_lsn` | LSN up to which the consumer has confirmed receipt (logical only) |
 | `wal_status` | `text` | One of `reserved`, `extended`, `unreserved`, `lost` |
@@ -209,7 +209,7 @@ Verbatim signatures from `functions-admin.html` §9.27.6[^functions-admin]:
 | `wal_level` | `replica` | postmaster | Must be `replica` for physical slots, `logical` for logical slots (PG14–18; PG19 also accepts `replica`, see `effective_wal_level`) |
 | `wal_keep_size` | 0 | sighup | WAL retention floor (parallel mechanism to slots; both apply) |
 | `max_slot_wal_keep_size` | `-1` (unlimited) | sighup (PG13+) | Maximum WAL a slot may retain. **Set this on every production cluster.** |
-| `hot_standby_feedback` | off | sighup | Standby reports xmin back to primary; redundant with physical slot for `xmin` retention but cheaper for some workloads |
+| `hot_standby_feedback` | off | sighup | Standby reports its horizon; a physical slot can retain reported feedback across disconnects |
 | `wal_sender_timeout` | 60s | user | Terminate replication conns idle longer than this. Does NOT invalidate the slot — only the connection. |
 | `idle_replication_slot_timeout` | 0 (off) | sighup (PG18+) | Invalidate slots inactive longer than this duration |
 | `sync_replication_slots` | off | sighup (PG17+) | Standby-side: enables the slotsync worker that replicates failover slots from primary |
@@ -239,8 +239,8 @@ PG17+ failover-slots architecture:
 1. **Primary** has a logical slot created with `failover = true` (5th param of `pg_create_logical_replication_slot()`, or `CREATE SUBSCRIPTION ... WITH (failover = true)`).
 2. **Primary** lists each physical standby's slot in `synchronized_standby_slots = 'standby1_slot, standby2_slot'`.
 3. **Standby** has `sync_replication_slots = true`. The slotsync background worker periodically copies logical slot state from primary.
-4. Primary's logical walsender BLOCKS the slot from advancing until all `synchronized_standby_slots` standbys have flushed the WAL — ensures the slot's `confirmed_flush_lsn` on standby is always ≤ the value that would be served to subscribers.
-5. On primary failure, promote standby. The synced logical slot on the new primary has the right state. Subscribers reconnect, no data loss.
+4. Walsenders serving failover-enabled logical slots wait for the listed physical slots to confirm WAL receipt before sending decoded changes; walsenders for other logical slots do not wait. Monitor all listed standbys because an unavailable slot blocks delivery on failover-enabled slots.
+5. Before promotion, verify the intended standby has a synchronized, usable failover slot and the required WAL. Fence the old primary and reconnect consumers only after promotion. Asynchronous failover can still lose commits; consumers must tolerate replay.
 
 Verbatim semantics for `synchronized_standby_slots`: *"Logical WAL sender processes will send decoded changes to plugins only after the specified replication slots confirm receiving WAL. ... Additionally, the replication management functions `pg_replication_slot_advance`, `pg_logical_slot_get_changes`, and `pg_logical_slot_peek_changes`, when used with logical failover slots, will block until all physical slots specified in `synchronized_standby_slots` have confirmed WAL receipt."*[^runtime-config-replication-18]
 
@@ -293,7 +293,7 @@ Configure on every production cluster that has replicas or logical replication:
     -- PG18+
     idle_replication_slot_timeout = 7d  -- auto-invalidate dead slots after 7 days
 
-Reload via `pg_reload_conf()` (none of these require restart unless raising `max_replication_slots` or `max_wal_senders` past prior value at startup).
+Restart for changes to `wal_level`, `max_replication_slots`, or `max_wal_senders`; the retention limits are reloadable.
 
 ### Recipe 2 — Create a physical slot for a streaming standby
 
@@ -317,7 +317,7 @@ When using `pg_recvlogical` or a custom CDC consumer (not native logical replica
     -- Slot creation. wal_level = logical required on PG14-18.
     SELECT pg_create_logical_replication_slot(
         'cdc_stream',     -- slot name
-        'pgoutput',       -- output plugin (use 'wal2json' if installed)
+        'test_decoding',  -- text output for this diagnostic example
         false,            -- temporary = false (permanent)
         false             -- twophase = false (set true to decode PREPARE TRANSACTION)
     );
@@ -351,28 +351,27 @@ Interpretation tree:
 
 - `active = false` + `retained_wal > 1GB` → likely abandoned. Investigate.
 - `wal_status = 'extended'` → consumer lagging or `max_slot_wal_keep_size` headroom thin.
-- `wal_status = 'lost'` → slot is dead; drop it.
+- `wal_status = 'lost'` → slot cannot resume. Identify its consumer and plan a rebuild or resnapshot before dropping it.
 - `safe_wal_size < 100MB` → invalidation imminent if consumer doesn't catch up.
 
 ### Recipe 5 — Drop a confirmed-abandoned slot
 
-    -- Step 1: Verify it's been inactive long enough (PG17+ inactive_since)
-    SELECT slot_name, active, inactive_since, now() - inactive_since AS dead_for
+    -- Step 1: Check activity; inactivity alone does not establish abandonment.
+    SELECT slot_name, active, inactive_since, now() - inactive_since AS inactive_for  -- inactive_since: PG17+
     FROM pg_replication_slots
     WHERE slot_name = 'old_subscriber_slot';
 
-    -- Step 2: If certain it's abandoned, drop it
+    -- Step 2: After identifying the owner and confirming abandonment, drop it
     SELECT pg_drop_replication_slot('old_subscriber_slot');
 
-    -- Step 3: Force a checkpoint to reclaim WAL immediately
-    CHECKPOINT;
+    -- A later checkpoint can reclaim WAL only if no other retention requirement needs it.
 
 > [!WARNING] Dropping a logical slot is irreversible
 > The subscriber must be rebuilt against a fresh snapshot. Drop only when certain the subscriber is gone or has been migrated.
 
 ### Recipe 6 — Monitor `catalog_xmin` and `VACUUM` blockage
 
-Logical slots hold the cluster-wide xmin horizon back. If `VACUUM` isn't reclaiming dead tuples:
+Inspect both slot horizons. `xmin` can retain ordinary tuples; `catalog_xmin` retains catalog tuples. Either may be relevant to vacuum progress.
 
     -- Check what's holding xmin back
     SELECT
@@ -381,13 +380,14 @@ Logical slots hold the cluster-wide xmin horizon back. If `VACUUM` isn't reclaim
         catalog_xmin,
         xmin,
         age(catalog_xmin) AS catalog_xmin_age,
+        age(xmin) AS xmin_age,
         active,
         database
     FROM pg_replication_slots
     WHERE catalog_xmin IS NOT NULL OR xmin IS NOT NULL
-    ORDER BY age(coalesce(catalog_xmin, xmin)) DESC;
+    ORDER BY greatest(age(catalog_xmin), age(xmin)) DESC NULLS LAST;
 
-If `catalog_xmin_age` exceeds `autovacuum_freeze_max_age * 0.5`, the slot is at risk of triggering a wraparound emergency. Either get the subscriber to catch up or drop the slot.
+Investigate any horizon whose age passes `autovacuum_freeze_max_age` (default 200 million, where anti-wraparound autovacuum starts), and restore the consumer where possible. Drop a slot only after identifying its owner and accepting the loss of retained changes or the need to rebuild.
 
 Cross-check against the cluster-wide xmin horizon:
 
@@ -395,13 +395,13 @@ Cross-check against the cluster-wide xmin horizon:
     SELECT
         d.datname,
         age(d.datfrozenxid) AS db_frozenxid_age,
-        (SELECT min(age(catalog_xmin))
+        (SELECT max(age(catalog_xmin))
          FROM pg_replication_slots
          WHERE catalog_xmin IS NOT NULL) AS oldest_slot_catalog_xmin_age
     FROM pg_database d
     ORDER BY age(d.datfrozenxid) DESC;
 
-If the slot's `catalog_xmin_age` matches `datfrozenxid_age` on the database in question, the slot is the binding constraint on VACUUM-freeze progress.
+Compare ages as a triage signal, not proof of causation. Inspect affected tables, old transactions, prepared transactions, and both slot horizons before changing a slot.
 
 ### Recipe 7 — PG17+ failover-slot setup for HA logical replication
 
@@ -418,7 +418,8 @@ Standby `postgresql.conf` (each standby):
 
     primary_slot_name = 'standby_1_slot'   -- (or standby_2_slot)
     sync_replication_slots = on
-    hot_standby_feedback = on              -- required so synced slot xmin survives
+    hot_standby_feedback = on              -- required for slot sync
+    primary_conninfo = 'host=primary.example.com user=replicator dbname=postgres'
 
 Create the logical slot WITH `failover = true`:
 
@@ -443,7 +444,7 @@ Verify sync is working on each standby:
     FROM pg_replication_slots
     WHERE failover = true;
 
-After failover, the subscriber reconnects to the new primary; the synced slot has the right state.
+Before failover, verify the intended standby has a synchronized, persistent, usable slot. Fence the old primary before promotion and account for possible replay and asynchronous data loss. [PG17 slot synchronization](https://www.postgresql.org/docs/17/logicaldecoding-explanation.html#LOGICALDECODING-REPLICATION-SLOTS-SYNCHRONIZATION)
 
 ### Recipe 8 — PG17+ on-demand sync from standby
 
@@ -456,7 +457,7 @@ Verbatim: *"This function can only be executed on the standby server. ... Note t
 
 ### Recipe 9 — Advance a stuck logical slot past a poison transaction
 
-A subscriber may be stuck on a transaction it can't apply (e.g., FK violation on subscriber side). To skip it:
+A subscriber may be stuck on a transaction it can't apply. First identify and resolve the conflict on the subscriber. Advancing the publisher slot discards changes and can leave the subscriber inconsistent; stop its consumer, identify the exact range and consequences, and reconcile or resnapshot before resuming.
 
     -- Find current confirmed_flush_lsn
     SELECT slot_name, confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'sub_slot';
@@ -535,11 +536,11 @@ Fork a logical slot to test a CDC schema change without disturbing production:
     SELECT pg_copy_logical_replication_slot(
         'prod_cdc',           -- source
         'test_cdc',           -- destination
-        true,                 -- temporary (auto-released on session end)
+        false,                -- persistent; explicitly drop after confirming test is finished
         'wal2json'            -- can change output plugin
     );
 
-Both slots receive the same WAL. Test consumer drains `test_cdc`; production keeps draining `prod_cdc`. Verbatim restriction: *"Copy of an invalidated slot is not allowed."*[^functions-admin]
+Both slots retain WAL independently. The test slot is persistent so a separate consumer can use it; confirm the test is finished and drop that slot afterward to avoid indefinite retention. Copying an invalidated slot is not allowed.
 
 ### Recipe 14 — Audit slot capacity headroom
 
@@ -574,7 +575,7 @@ If `slot_headroom < 2`, plan to raise `max_replication_slots`. Note: requires se
 17. **`pg_replication_slot_advance` can only move FORWARD.** No way to rewind a logical slot to an earlier LSN (would require dropping and recreating).
 18. **`pg_copy_*_replication_slot` cannot copy an invalidated slot.** Drop + recreate the source first.
 19. **Logical slots survive crash, but the position is persisted only at checkpoint.** Verbatim: *"in the case of a crash the slot may return to an earlier LSN, which will then cause recent changes to be sent again when the server restarts."*[^logicaldecoding] Consumers must be idempotent or tolerate replay across this window.
-20. **Slot creation requires connection from the consumer or explicit `immediately_reserve = true`** — without one of those, `restart_lsn` is NULL and no WAL is retained yet.
+20. **New physical slots do not reserve WAL by default.** Use `immediately_reserve = true` when reservation must begin at creation. Logical slots reserve WAL during creation.
 21. **`pg_stat_replication_slots` is PG14+.** Pre-PG14 has no decoding-statistics view.
 22. **Slot names use a restricted character set.** Verbatim: *"Each replication slot has a name, which can contain lower-case letters, numbers, and the underscore character."*[^warm-standby] No uppercase, no hyphens, no spaces.
 23. **`wal_sender_timeout` terminates the connection, not the slot.** A walsender process exits after `wal_sender_timeout`, but the slot remains and continues retaining WAL. The slot stays `active = false` until the consumer reconnects (or until invalidation).

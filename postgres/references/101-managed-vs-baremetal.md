@@ -145,7 +145,7 @@ What you give up control over on the other tiers — but get for free on managed
 
 | Capability | Implication |
 |---|---|
-| Automatic minor patch application | Vendor handles 14.22→15.17→... within a major. On bare-metal, you orchestrate. |
+| Automatic minor patch application | Vendor schedules minor updates within a major; check its maintenance policy. On bare-metal, you orchestrate. |
 | Vendor-managed failover with SLA | Defined RTO commitment. You don't run Patroni / etcd. |
 | Scheduled automated backups | Vendor backs up to vendor storage. You don't run pgBackRest / Barman / WAL-G. |
 | Out-of-band PITR | Vendor catalog of recovery points. Granularity varies. |
@@ -224,7 +224,7 @@ Logical replication slots require `wal_level=logical`. On managed PaaS:
 
 ### TLS / certificates
 
-Managed PaaS terminates TLS at the connection endpoint. Your client sends `sslmode=require` (or `verify-full` against the vendor's CA chain). Custom certs may be uploadable; check vendor docs. **You cannot disable TLS** on most managed PaaS by design.
+For authenticated TLS, use `sslmode=verify-full` with the provider's CA chain and a hostname matching the certificate. `require` encrypts but does not reliably verify the server identity. Provider TLS configuration varies; consult its documentation. See <https://www.postgresql.org/docs/16/libpq-ssl.html>.
 
 ### Backup tooling
 
@@ -410,7 +410,7 @@ ALTER ROLE app_admin SUPERUSER;
 GRANT pg_read_all_data TO app_admin;
 GRANT pg_write_all_data TO app_admin;
 GRANT pg_monitor TO app_admin;
-GRANT pg_maintain TO app_admin;  -- PG17+ only; pre-PG17 grant explicit VACUUM/ANALYZE/REINDEX/REFRESH MV/CLUSTER permissions on schemas
+GRANT pg_maintain TO app_admin;  -- PG17+; on PG16, arrange suitable ownership for maintenance
 ```
 
 See [46](./46-roles-privileges.md) for predefined-role catalog and [55](./55-statistics-planner.md) for analyze permissions.
@@ -459,7 +459,7 @@ Logical replication crosses tier boundaries cleanly:
 ```sql
 -- On source (publisher):
 ALTER SYSTEM SET wal_level = 'logical';
-SELECT pg_reload_conf();  -- May require restart on first set
+-- Restart the source server before proceeding; wal_level is a startup parameter.
 CREATE PUBLICATION migrate_pub FOR ALL TABLES;
 
 -- On target (subscriber):

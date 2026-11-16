@@ -46,7 +46,7 @@ Five rules drive every decision in this file:
 > [!WARNING]
 > Do not use `gen_random_uuid()` (UUIDv4) as a high-cardinality leading B-tree key. Random inserts scatter writes across the entire index, causing page splits and cache eviction at scale. See [Gotcha #1](#gotchas--anti-patterns).
 3. **`numeric` for exact, `double precision` for fast, `real` almost never.** Use `numeric(p, s)` for money, decimal measurements, and anything where rounding error must be zero. Use `double precision` for science and aggregate statistics. Never use `real` (single-precision float) for new code — the storage savings are tiny and the precision loss is severe.
-4. **Do not use the `money` type.** It is locale-sensitive (`lc_monetary`) at output, has exactly two fractional digits hard-coded by the locale, and silently breaks at `pg_restore` if the destination database has a different `lc_monetary`. Use `numeric(12, 2)` (or `numeric(N, S)` matching your currency precision) or an integer-minor-units column with the currency tracked separately.
+4. **Consider avoiding `money` for new schemas.** Its fractional precision and textual I/O depend on `lc_monetary`; restoring under a different setting may fail or misinterpret data. Use `numeric(N, S)` or integer minor units with the currency tracked separately.[^money]
 5. **Use `GENERATED ... AS IDENTITY` for surrogate keys on new tables, not `serial`.** `serial` is a PostgreSQL-only macro that desugars to a `CREATE SEQUENCE` + `DEFAULT nextval(...)` + `ALTER SEQUENCE ... OWNED BY`. `IDENTITY` is SQL-standard, doesn't have the dump-permission and ownership-confusion problems of `serial`, and works on partitioned tables since PG17.
 
 ## Type Selection Matrix
@@ -118,12 +118,12 @@ Example:
 
 > [!NOTE] PostgreSQL 17
 >
-> Adds `uuid_extract_timestamp()` and `uuid_extract_version()`: *"Add functions `uuid_extract_timestamp()` and `uuid_extract_version()` to return UUID information."*[^pg17-uuid-extract]
+> Adds `uuid_extract_timestamp()` and `uuid_extract_version()`. PG17 extracts timestamps from v1 UUIDs; PG18 adds v7 support.[^pg17-uuid-extract][^pg18-uuid-funcs]
 
 | Function | Returns | Behavior |
 |---|---|---|
 | `uuid_extract_version(uuid)` | `smallint` | RFC 9562 version digit (1, 4, 7, ...); NULL for non-RFC-9562 variants[^pg18-uuid-funcs] |
-| `uuid_extract_timestamp(uuid)` | `timestamptz` | Embedded timestamp for v1 and v7; NULL for other versions[^pg18-uuid-funcs] |
+| `uuid_extract_timestamp(uuid)` | `timestamptz` | Embedded timestamp for v1; also v7 in PG18+. NULL for unsupported versions.[^pg18-uuid-funcs] |
 
 Example:
 
@@ -171,7 +171,7 @@ The maximum explicitly-specifiable precision is **1000**[^numeric]. An unconstra
 |---|---|---|
 | `numeric(12, 2)` | up to 9_999_999_999.99 | Standard for single-currency money |
 | `numeric(18, 6)` | up to 999_999_999_999.999999 | Standard for FX/crypto rates |
-| `numeric(p, 0)` | integers up to 10^p | Why? Use `bigint`/`int` instead unless `p > 19` |
+| `numeric(p, 0)` | integers with at most `p` decimal digits | Use `bigint`/`int` where their range suffices |
 | `numeric` (unconstrained) | anything up to docs limits | Slower; planner can't bound output width |
 
 > [!NOTE] PostgreSQL 15
@@ -208,7 +208,7 @@ The same page also says[^money]: *"Floating point numbers should not be used to 
 >
 > 1. **Locale-dependent output** — the displayed currency symbol, thousands separator, and decimal mark come from `lc_monetary`. A query result that prints `$1,000.00` on one cluster prints `1.000,00 €` on another.
 > 2. **Single hard-coded scale per cluster.** You cannot have one column for USD (2 decimals) and another for BHD (3 decimals) — they all share `lc_monetary`'s scale.
-> 3. **`pg_restore` quietly mis-restores across `lc_monetary` boundaries.** The dump emits the locale-formatted text; restoring into a different locale parses the text differently.
+> 3. **Dump portability depends on `lc_monetary`.** A restore under a different setting might fail or misinterpret locale-formatted data.[^money]
 >
 > **Replacement A — single-currency app:** `numeric(12, 2)` (or `numeric(N, S)` matching your currency precision). Exact, fast, dump-portable, locale-independent.
 >
@@ -248,7 +248,7 @@ Why prefer `IDENTITY` over `serial`:
 - **SQL-standard syntax.** Easier to migrate to/from other databases that support `GENERATED AS IDENTITY`.
 - **`ALWAYS` mode** can prevent user-supplied values from clobbering the sequence — there is no equivalent for `serial`.
 - **No `serial` permission confusion.** `serial` requires `USAGE` on the underlying sequence to insert, surprising application roles that have INSERT on the table but not USAGE on the auto-created sequence.
-- **Works on partitioned tables (PG17+).** `serial` cannot be used on partitioned-table parents.
+- **Partitioned-table identity (PG17+).** Earlier versions can use a parent column default backed by a sequence.
 
 ### IDENTITY: `ALWAYS` vs `BY DEFAULT`
 
@@ -295,7 +295,7 @@ For pre-PG17 partitioned tables you must use a single sequence + per-partition d
 
 ### Recipe 1 — UUIDv4 as opaque application ID (default for non-PK exposure)
 
-When the UUID is exposed to clients but the **B-tree PK is a separate `bigint`**, UUIDv4 is fine. Insertion locality doesn't matter because the UUID is in a secondary B-tree where you query by exact equality.
+The internal primary key remains compact, but the unique secondary index on UUIDv4 still incurs random insertion costs.
 
     CREATE TABLE users (
         id           bigint  GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -303,8 +303,6 @@ When the UUID is exposed to clients but the **B-tree PK is a separate `bigint`**
         email        text    NOT NULL UNIQUE,
         created_at   timestamptz NOT NULL DEFAULT now()
     );
-
-    CREATE INDEX users_public_id_idx ON users (public_id);
 
 `public_id` is what the API returns. The internal `id` stays compact and append-only for join and FK efficiency.
 
@@ -325,33 +323,28 @@ UUIDv7 inserts are append-mostly at the right edge of the index, the same locali
 
 ### Recipe 3 — Pre-PG18 UUIDv7 alternative
 
-Two options without PG18:
+Three options without PG18:
 
 **Option A — `pg_uuidv7` extension** (third-party; check it's allowed in your environment): install the extension and use its `uuid_generate_v7()` function in the column default.
 
-**Option B — userland SQL function** (no extension required, but slightly slower than the C implementation):
+**Option B — application-side generation:** use a vetted UUIDv7 implementation in the application and pass the value as a parameter. PostgreSQL 14 through 17 can store UUIDv7 values in the `uuid` type even though core generation arrives in PG18.
 
-    CREATE OR REPLACE FUNCTION app.uuidv7() RETURNS uuid
-        LANGUAGE sql VOLATILE PARALLEL SAFE AS $$
+**Option C — pure SQL:** overwrite the first 48 bits of a v4 UUID with the Unix epoch in milliseconds, then flip the version nibble from `0100` to `0111`. `set_bit` numbers bits from the least significant bit of the first byte, so bits 52 and 53 are the low two bits of the version nibble in byte 6. The v4 variant bits stay as they are.
+
+    CREATE FUNCTION uuidv7_sql() RETURNS uuid
+    LANGUAGE sql VOLATILE AS $$
         SELECT encode(
             set_bit(
                 set_bit(
                     overlay(uuid_send(gen_random_uuid())
-                        PLACING substring(int8send(
-                            (extract(epoch from clock_timestamp()) * 1000)::bigint
-                        ) from 3) FROM 1 FOR 6),
+                            PLACING substring(int8send(floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint) FROM 3)
+                            FROM 1 FOR 6),
                     52, 1),
-                53, 1)::uuid::text::bytea, 'hex'
-        )::uuid;
+                53, 1),
+            'hex')::uuid;
     $$;
 
-    -- Use as column default
-    CREATE TABLE events (
-        id  uuid NOT NULL DEFAULT app.uuidv7() PRIMARY KEY,
-        ...
-    );
-
-Verify the version byte by `uuid_extract_version()` (PG17+) before relying on the encoding.
+Values generated in the same millisecond are not ordered among themselves; PG18's `uuidv7()` stores a 12-bit sub-millisecond timestamp fraction in `rand_a` and keeps values monotonic within a backend.
 
 ### Recipe 4 — Single-currency money
 
@@ -471,13 +464,13 @@ This is the canonical online migration when you cannot drop and recreate the tab
     -- 2. Sync the sequence so the next nextval > max(id).
     SELECT setval(
         pg_get_serial_sequence('legacy_orders', 'id'),
-        (SELECT coalesce(max(id), 0) FROM legacy_orders),
-        true   -- next nextval returns max+1
+        greatest(coalesce((SELECT max(id) FROM legacy_orders), 1), 1),
+        EXISTS (SELECT 1 FROM legacy_orders WHERE id >= 1)
     );
 
     COMMIT;
 
-The serial-to-IDENTITY migration recipe (drop the old DEFAULT, then ADD GENERATED, then `setval`) is documented in [`14-data-types-builtin.md`](./14-data-types-builtin.md) Recipe 2.
+This assumes the default ascending sequence starting at 1. Coordinate other sequence consumers and writes during the migration. `setval` is not rolled back on transaction abort.[^setval] The serial-to-IDENTITY migration recipe is documented in [`14-data-types-builtin.md`](./14-data-types-builtin.md) Recipe 2.
 
 ### Recipe 11 — IDENTITY on a partitioned table (PG17+)
 
@@ -497,9 +490,9 @@ The serial-to-IDENTITY migration recipe (drop the old DEFAULT, then ADD GENERATE
     VALUES (now(), 'signup', '{"plan":"pro"}'::jsonb);
     -- id is assigned from the parent's identity sequence
 
-Before PG17 this required attaching `DEFAULT nextval('shared_seq')` to every partition individually.
+Before PG17 a parent column default backed by a shared sequence can assign values to inserts routed through the parent. Direct inserts into partitions need their own defaults.
 
-### Recipe 12 — Extract creation time from a UUIDv7 (PG17+ extractors, PG18+ generator)
+### Recipe 12 — Extract creation time from a UUIDv7 (PG18+)
 
     -- PG18+: store v7, query the time later
     SELECT id,
@@ -508,7 +501,9 @@ Before PG17 this required attaching `DEFAULT nextval('shared_seq')` to every par
     WHERE uuid_extract_timestamp(id) >= now() - interval '1 day'
     ORDER BY id;
 
-The query is index-friendly because `id` is K-sortable and `uuid_extract_timestamp(id)` is a `STABLE` function. To get a real index scan on the time predicate, either an explicit `created_at` column with its own index (cheaper plan) or a functional index on `uuid_extract_timestamp(id)` works. Prefer the explicit column for query-heavy tables. For `timestamptz` arithmetic on the extracted value, see [`19-timestamp-timezones.md`](./19-timestamp-timezones.md).
+A plain index on `id` cannot satisfy the function predicate. `uuid_extract_timestamp` is immutable, so an expression index can:
+
+    CREATE INDEX orders_id_ts_idx ON orders (uuid_extract_timestamp(id));
 
 ### Recipe 13 — Audit for `money` columns (call for migration)
 
@@ -582,26 +577,26 @@ The bigint PK and the v7 PK will be similar in size and BUFFERS-dirtied; the v4 
 
 ## Gotchas / Anti-patterns
 
-1. **`gen_random_uuid()` as a high-cardinality leading B-tree key destroys insert locality.** Each insert lands on a random page, blowing the buffer cache and creating page splits across the index. Use `bigint` IDENTITY or PG18+ `uuidv7()` if the UUID is the leading B-tree column. Use v4 happily in secondary indexes where you query by `=`.
+1. **UUIDv4 keys incur random B-tree writes.** This applies to secondary indexes as well as primary keys. Benchmark the locality trade-off against the need for opaque, independently generated IDs.
 2. **`varchar(36)` for UUID instead of the `uuid` type.** Wastes ~2× storage (text serialization vs 16 binary bytes), loses validation, loses the optimized comparison operator, and breaks `uuid_extract_*()`. Always use the `uuid` type.
 3. **UUID PK without an index strategy for sorted queries.** If you need `ORDER BY created_at`, you still need a `created_at` column with an index — UUIDv7 sorts by *generation time*, not by any business event time, and `uuid_extract_timestamp()` is a function call that won't use a plain B-tree on `id` for ordering.
 4. **`numeric` without precision/scale for performance-sensitive columns.** Unconstrained `numeric` is 10–100× slower than `double precision` and the planner can't bound the column width for hash-partition selection. Use `numeric(p, s)` to constrain the value space whenever you can.
 5. **`numeric` for high-volume scientific aggregation.** A `sum(measurements)` over a billion rows is 10–100× faster as `double precision`. Use exact `numeric` for money; use `double precision` for science.
 6. **`real` (single-precision float) for new columns.** The storage saving (4 bytes vs 8) is meaningless on modern hardware, and the precision loss is severe — only 6 decimal digits. Use `double precision`.
-7. **NaN-equals-NaN in `numeric` causes silent dedup**. `SELECT DISTINCT measurement FROM t` collapses multiple `NaN` values into one because `numeric` treats `NaN = NaN`. If you need IEEE NaN semantics, use `double precision`.
-8. **NaN sorts AFTER Infinity in `numeric`.** Top-N queries can return `NaN` rows when you wanted real maxima. Filter `WHERE v != 'NaN'` or `WHERE v = v` (which is false for IEEE NaN but true for PostgreSQL `numeric` NaN — be explicit about which semantic you mean).
-9. **`money` type in a multi-database, multi-locale environment.** `lc_monetary` mismatch silently mis-parses `pg_dump` text output at restore time. Replace with `numeric(N, S)` or integer minor units. See recipe 13 for the audit.
+7. **NaN-equals-NaN causes deduplication.** PostgreSQL treats `NaN` as equal and greater than other values for both `numeric` and floating-point types.
+8. **NaN sorts after Infinity.** Filter explicitly with `WHERE v <> 'NaN'::numeric`; `v = v` does not exclude PostgreSQL NaN.
+9. **`money` across different locales.** A mismatched `lc_monetary` can prevent a dump from restoring correctly. Match the locale or migrate to `numeric(N, S)` or integer minor units.[^money]
 10. **`money` for multi-currency apps.** Single hard-coded fractional scale per cluster — no way to handle USD (2 decimals) and BHD (3 decimals) in the same database.
 11. **`'$1,234.56'::money` looks portable but isn't.** It parses with the current `lc_monetary`, which means an SQL constant that worked in one cluster fails or mis-parses in another. Use `numeric` everywhere if you need portability.
 12. **`serial` column with INSERT-only application role lacking sequence USAGE.** A role with `INSERT` on the table can't actually insert because `nextval(seq)` requires `USAGE` on the sequence. With `IDENTITY`, the privilege model is owned by the column property, not a separate sequence object. Migrate.
-13. **`serial` column on the parent of inheritance/partitioned-tables (pre-PG17).** `serial` works on the parent but child partitions don't inherit it; you end up with the parent's sequence ignored by inserts that go through partitions. Use `IDENTITY` (PG17+) or a single shared sequence with explicit `DEFAULT nextval('seq')` on each partition.
+13. **Partitioned tables before PG17.** A parent default backed by a shared sequence can generate IDs for inserts routed through the parent; direct inserts into partitions require appropriate defaults on those partitions.
 14. **`DROP TABLE` leaves an orphan `serial` sequence.** If the sequence's `OWNED BY` link is broken (often by `pg_dump` or migration tools), the sequence survives the `DROP TABLE` and shows up as an "unused" object on next audit. `IDENTITY` sequences are always cleaned up — they are a column property, not a separate object.
 15. **`OVERRIDING SYSTEM VALUE` required for `ALWAYS`, easy to forget on dump-restore.** A `pg_dump` of a table with `GENERATED ALWAYS AS IDENTITY` includes `OVERRIDING SYSTEM VALUE` clauses automatically (PG10+); a hand-rolled bulk import script does not. If you see `cannot insert into column "id"` errors during a manual data load, the column is in `ALWAYS` mode.
-16. **`setval(seq, max_id)` without the `is_called=true` third argument** sets the *current* value, so the *next* `nextval` returns `max_id` again — producing a UNIQUE-violation on the very next insert. Always pass `setval(seq, max_id, true)` after a bulk import.
-17. **`numeric(p, s)` truncates at INSERT silently when the value exceeds scale.** `INSERT INTO t (n) VALUES (1.234)` into `numeric(5, 2)` stores `1.23`, not `1.234`. Only the precision check raises an error; the scale truncates. Apply CHECKs at the column level or validate at the application layer if exact preservation matters.
+16. **Sequence reset semantics.** `setval(seq, max_id)` defaults to `is_called = true`, so the next `nextval` advances. Passing `false` returns `max_id` again; handle empty tables and coordinate concurrent consumers.[^serial]
+17. **`numeric(p, s)` rounds input to the declared scale.** Check the original input before casting if exact preservation matters; a column CHECK sees the already-rounded value.[^numeric]
 18. **`uuid_extract_timestamp` returns NULL for v4.** Two reasons: (a) you accidentally wrote `gen_random_uuid()` when you wanted `uuidv7()`, (b) you have legacy v4 IDs from before adopting v7. Recipe 12 only works on v7 (and v1, but you should not be generating v1).
-19. **UUIDv7's clock is the server clock, not a logical clock.** If two backends generate UUIDs in the same millisecond and the random tie-breaker collides (astronomically unlikely but theoretically possible), they collide. The 74-bit random component makes this safe in practice. Do not rely on UUIDv7 for cross-machine *ordering* finer than ~1 ms.
-20. **Mixing `gen_random_uuid()` and `uuidv7()` in the same B-tree column.** A table that started with v4 PKs and migrated to v7 will have an index whose left half is random and right half is K-sortable. Inserts of v7 land at the right edge (good) but range scans across both halves see the random left half. The cure is a one-time `REINDEX CONCURRENTLY` after the cutover so the B-tree is built fresh in v7 order — though the random v4 IDs still scatter at insert time if you re-insert them.
+19. **UUIDv7 embeds time.** Generation time is approximate and depends on the generating implementation; do not treat UUID order as a definitive distributed event order.[^pg18-uuid-funcs]
+20. **Mixed UUID versions remain mixed after REINDEX.** Rebuilding does not change stored UUID values or make v4 keys time-ordered.
 
 ## See Also
 
@@ -644,5 +639,7 @@ The bigint PK and the v7 PK will be similar in size and BUFFERS-dirtied; the v4 
 [^money]: PostgreSQL 16 — Monetary Types. *"Since the output of this data type is locale-sensitive, it might not work to load money data into a database that has a different setting of lc_monetary. To avoid problems, before restoring a dump into a new database make sure lc_monetary has the same or equivalent value as in the database that was dumped."* *"Floating point numbers should not be used to handle money due to the potential for rounding errors."* Storage 8 bytes; range (assuming two fractional digits) `-92233720368547758.08 to +92233720368547758.07`. A money value can be cast to numeric without loss of precision. https://www.postgresql.org/docs/16/datatype-money.html
 
 [^serial]: PostgreSQL 16 — Serial Types. *"CREATE TABLE tablename (colname SERIAL); is equivalent to specifying: CREATE SEQUENCE tablename_colname_seq AS integer; CREATE TABLE tablename (colname integer NOT NULL DEFAULT nextval('tablename_colname_seq')); ALTER SEQUENCE tablename_colname_seq OWNED BY tablename.colname;"* *"The type names serial and serial4 are equivalent: both create integer columns. The type names bigserial and serial8 work the same way, except that they create a bigint column. … The type names smallserial and serial2 also work the same way, except that they create a smallint column."* *"Because smallserial, serial and bigserial are implemented using sequences, there may be 'holes' or gaps in the sequence of values which appears in the column, even if no rows are ever deleted."* *"Another way is to use the SQL-standard identity column feature, described at CREATE TABLE."* https://www.postgresql.org/docs/16/datatype-numeric.html
+
+[^setval]: PostgreSQL 16 — Sequence Manipulation Functions. *"Likewise, sequence state changes made by setval are immediately visible to other transactions, and are not undone if the calling transaction rolls back."* https://www.postgresql.org/docs/16/functions-sequence.html
 
 [^identity]: PostgreSQL 16 — CREATE TABLE. *"GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [ ( sequence_options ) ] — This clause creates the column as an identity column. It will have an implicit sequence attached to it and in newly-inserted rows the column will automatically have values from the sequence assigned to it. Such a column is implicitly NOT NULL."* *"In an INSERT command, if ALWAYS is selected, a user-specified value is only accepted if the INSERT statement specifies OVERRIDING SYSTEM VALUE. If BY DEFAULT is selected, then the user-specified value takes precedence."* *"In an UPDATE command, if ALWAYS is selected, any update of the column to any value other than DEFAULT will be rejected. If BY DEFAULT is selected, the column can be updated normally. (There is no OVERRIDING clause for the UPDATE command.)"* *"The optional sequence_options clause can be used to override the parameters of the sequence. The available options include those shown for CREATE SEQUENCE, plus SEQUENCE NAME name, LOGGED, and UNLOGGED, which allow selection of the name and persistence level of the sequence."* https://www.postgresql.org/docs/16/sql-createtable.html

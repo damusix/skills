@@ -9,7 +9,7 @@ The canonical chapter is [`routine-vacuuming.html`](https://www.postgresql.org/d
 > 3. To update the visibility map, which speeds up index-only scans.
 > 4. To protect against loss of very old data due to transaction ID wraparound or multixact ID wraparound.
 
-(1) is what most operators think of when they hear "VACUUM"; (2) is `ANALYZE`; (3) is the [visibility-map](./27-mvcc-internals.md#the-visibility-map) maintenance that index-only scans depend on; (4) is freezing, treated in depth in [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md). All four happen in one VACUUM pass and you do not get to opt into only a subset.
+(1) reclaims dead tuples; (2) requires `ANALYZE`, optionally requested with `VACUUM (ANALYZE)`; (3) maintains the visibility map; (4) freezes old transaction state. Plain VACUUM does not run ANALYZE, and options such as `INDEX_CLEANUP`, `PROCESS_TOAST`, and `TRUNCATE` control which maintenance work is performed.[^vacuum]
 
 ## Table of Contents
 
@@ -55,9 +55,9 @@ Five rules:
 
 1. **Plain VACUUM does not shrink the table.** It marks dead tuples reusable and may truncate trailing empty pages, but it does not return space mid-relation to the OS. Quoted verbatim: *"Plain VACUUM (without FULL) simply reclaims space and makes it available for re-use ... extra space is not returned to the operating system (in most cases); it's just kept available for re-use within the same table."*[^vacuum] To reclaim heap bloat at the filesystem level you need `VACUUM FULL`, `CLUSTER`, or an online tool like `pg_repack` / `pg_squeeze` ([`26-index-maintenance.md`](./26-index-maintenance.md)).
 2. **VACUUM FULL is a rewrite under ACCESS EXCLUSIVE.** Quoted verbatim: *"This form is much slower and requires an ACCESS EXCLUSIVE lock on each table while it is being processed."*[^vacuum] It is correct for *one-time* reclamation after a deletion of most of a table; it is *wrong* for routine maintenance.
-3. **Autovacuum is on by default and is mandatory.** Quoted verbatim: *"PostgreSQL has an optional but highly recommended feature called autovacuum"*[^routine] — but in practice it is mandatory; the wraparound machinery depends on it. Disabling it cluster-wide is a footgun (gotcha #1). Per-table `autovacuum_enabled=false` is occasionally valid but still leaves the anti-wraparound path armed: *"If false, this table will not be autovacuumed, except to prevent transaction ID wraparound."*[^createtable]
+3. **Leave routine autovacuum enabled unless scheduled maintenance replaces it deliberately.** The manual calls it *"optional but highly recommended."* Forced anti-wraparound vacuum still runs with cluster-wide `autovacuum = off` or per-table `autovacuum_enabled = false`; disabling routine work does not disable this safety path.[^routine][^createtable]
 4. **`autovacuum_vacuum_scale_factor` defaults to 0.2 — too lazy for a hot table.** Quoted verbatim: *"The default is 0.2 (20% of table size) ... the setting can be overridden for individual tables by changing table storage parameters."*[^autoconf] On a 100M-row table this means autovacuum waits for ~20M dead tuples before triggering. Lowering it to 0.01 or 0.005 *per table* on hot tables is the single highest-leverage tuning move.
-5. **Long-running transactions defeat VACUUM no matter how aggressively you tune it.** The xmin horizon ([`27-mvcc-internals.md#the-xmin-horizon`](./27-mvcc-internals.md#the-xmin-horizon)) caps how recently a dead tuple can have been deleted and still be reclaimable. If a backend has been idle-in-transaction for an hour, no VACUUM that finishes today can reclaim anything that became dead in the last hour. Fix the horizon-holder; do not tune autovacuum harder.
+5. **Retained transaction horizons limit VACUUM's progress.** Old snapshots, assigned XIDs, prepared transactions, and relevant replication horizons can prevent removal or freezing of newer tuples. An idle transaction does not necessarily retain a snapshot or XID; inspect the actual horizons rather than session duration alone. VACUUM can still reclaim older eligible tuples while a horizon is held.
 
 ## Decision Matrix
 
@@ -71,10 +71,10 @@ Five rules:
 | Vacuum only the TOAST side | `VACUUM (PROCESS_MAIN false)` (PG16+) | full VACUUM on the parent | Useful when the main relation is fine but TOAST grew.[^vacuum] |
 | Skip TOAST | `VACUUM (PROCESS_TOAST false)` (PG14+) | full VACUUM | Useful when main relation needs urgent vacuum and TOAST is large.[^vacuum] |
 | Throttle a manual VACUUM | set `vacuum_cost_delay` in the session | run on default | Default for manual VACUUM is `vacuum_cost_delay=0` (no throttle).[^resource] |
-| Reduce shared-buffer churn from a one-off VACUUM | `VACUUM (BUFFER_USAGE_LIMIT '4MB')` (PG16+) | default | Caps the ring buffer used; default is 256 kB in PG16, 2 MB in PG17+.[^pg16-buf][^pg17-buf] |
+| Control shared-buffer reuse during maintenance | `VACUUM (BUFFER_USAGE_LIMIT '4MB')` (PG16+) | assuming a larger ring reduces buffer churn | Larger rings may speed maintenance but displace more cached pages; default 256 kB in PG16, 2 MB in PG17+.[^resource][^pg17-buf] |
 | Tune autovacuum harder on one table | per-table storage parameter | cluster-wide GUC change | Cluster GUCs affect every table; storage parameters scope precisely.[^createtable] |
 | Reclaim filesystem space *online* with minimal locking | `pg_repack` or `pg_squeeze` | `VACUUM FULL` | Cross-reference [`26-index-maintenance.md`](./26-index-maintenance.md). |
-| Identify the *cause* of bloat | check xmin horizon, then n_dead_tup | tuning autovacuum harder | Fix the horizon holder first; otherwise no vacuum helps.[^routine] |
+| Identify the cause of bloat | inspect retained horizons, dead tuples, and vacuum progress | assuming more aggressive autovacuum always solves it | A retained horizon can prevent cleanup of affected tuples. |
 
 Three smell signals:
 
@@ -119,7 +119,7 @@ And:[^vacuum]
 Three operational realities:
 
 - **Takes ACCESS EXCLUSIVE** — blocks `SELECT`, `INSERT`, `UPDATE`, `DELETE`, every DDL, every other VACUUM. The application is offline for that table for the duration.
-- **Requires 2× the table size on disk** — verbatim: *"This method also requires extra disk space, since it writes a new copy of the table and doesn't release the old copy until the operation is complete."*[^vacuum]
+- **Needs space for the compacted table, rebuilt indexes, and temporary work while originals remain.** Required free space depends on the surviving data and index sizes; it is not a universal 2× heap-size rule.[^vacuum]
 - **Rebuilds every index on the table** as a side effect — much more work than a plain VACUUM, which only removes dead entries.
 
 The right time to run `VACUUM FULL` is *after* a one-time `DELETE` of most of a table, when you are certain no further churn will follow and the application can tolerate the lock. Prefer `pg_repack` or `pg_squeeze` ([`26-index-maintenance.md`](./26-index-maintenance.md)) for online filesystem reclamation. Progress reports under `pg_stat_progress_cluster`, not `pg_stat_progress_vacuum`:[^progress]
@@ -139,11 +139,11 @@ When to reach for it: pre-emptively freeze a large mostly-immutable table (e.g.,
 
 ### VACUUM ANALYZE
 
-`VACUUM (ANALYZE)` runs ANALYZE as part of the same pass. Verbatim:[^vacuum]
+`VACUUM (ANALYZE)` performs VACUUM and then a separate ANALYZE step for each table.[^vacuum]
 
 > Updates statistics used by the planner to determine the most efficient way to execute a query.
 
-ANALYZE samples rows from the heap and rewrites `pg_statistic` / `pg_stats`. Running ANALYZE inside VACUUM amortizes the heap scan cost. Autovacuum runs ANALYZE on its own schedule (`autovacuum_analyze_threshold` + `autovacuum_analyze_scale_factor`), separate from the VACUUM schedule.
+ANALYZE samples table data and updates `pg_statistic` (exposed through the `pg_stats` view). Combining the commands does not combine their heap reads into one scan. Autovacuum schedules ANALYZE independently of VACUUM.[^routine]
 
 > [!NOTE] PostgreSQL 18
 > `VACUUM ONLY tbl` and `ANALYZE ONLY tbl` skip descent into child partitions: *"Allow VACUUM and ANALYZE to process partitioned tables without processing their children ... This is enabled with the new ONLY option. This is useful since autovacuum does not process partitioned tables, just its children."*[^pg18-only]
@@ -163,14 +163,14 @@ Always write the parenthesized form. The full option catalog, with verbatim docs
 | `FULL` | off | all | Rewrite the table; ACCESS EXCLUSIVE.[^vacuum] |
 | `FREEZE` | off | all | Equivalent to `vacuum_freeze_min_age=0` + `vacuum_freeze_table_age=0`.[^vacuum] |
 | `VERBOSE` | off | all | *"Prints a detailed vacuum activity report for each table."*[^vacuum] |
-| `ANALYZE` | off | all | Run ANALYZE in the same pass.[^vacuum] |
+| `ANALYZE` | off | all | Run ANALYZE after vacuuming each table.[^vacuum] |
 | `DISABLE_PAGE_SKIPPING` | false | all | Disable visibility-map-based skipping. *"Intended to be used only when the contents of the visibility map are suspect, which should happen only if there is a hardware or software issue causing database corruption."*[^vacuum] |
 | `SKIP_LOCKED` | false | all | *"if a relation cannot be locked immediately without waiting, the relation is skipped."*[^vacuum] |
 | `INDEX_CLEANUP` | `AUTO` | PG14+ default change | `AUTO` / `ON` / `OFF`. Verbatim: *"The default is AUTO, which allows VACUUM to skip index vacuuming when appropriate."*[^vacuum] |
 | `PROCESS_TOAST` | true | PG14+ | Set false to skip the TOAST side.[^vacuum] *"Add ability to skip vacuuming of TOAST tables."*[^pg14-toast] |
 | `PROCESS_MAIN` | true | PG16+ | Set false to vacuum only the TOAST side. *"Allow VACUUM and vacuumdb to only process TOAST tables."*[^pg16-main] |
 | `TRUNCATE` | true | all | *"Setting this option to false may be useful to avoid ACCESS EXCLUSIVE lock on the table that the truncation requires."*[^vacuum] |
-| `PARALLEL n` | 0 (none) | PG13+ | Parallel index vacuum with `n` workers.[^pg13-parallel] |
+| `PARALLEL n` | automatic when omitted | PG13+ | Parallel index work subject to eligible indexes and worker limits; explicit `PARALLEL 0` disables it.[^vacuum] |
 | `SKIP_DATABASE_STATS` | false | PG16+ | Skip updating database-wide oldest-XID stats; useful when issuing many VACUUMs in parallel.[^pg16-skipdb] |
 | `ONLY_DATABASE_STATS` | false | PG16+ | Only update database-wide oldest-XID stats.[^pg16-onlydb] |
 | `BUFFER_USAGE_LIMIT 'size'` | from `vacuum_buffer_usage_limit` | PG16+ | Ring buffer size for the VACUUM. Range 128 kB to 16 GB; 0 disables.[^vacuum] |
@@ -208,7 +208,7 @@ The cluster-wide GUCs (verbatim defaults):[^autoconf]
 
 | GUC | Default | Reload? | Notes |
 |---|---|---|---|
-| `autovacuum` | `on` | postmaster | "This is on by default." Only set in postgresql.conf or server command line. |
+| `autovacuum` | `on` | reload | Requires `track_counts`; forced anti-wraparound work still runs when off. |
 | `autovacuum_max_workers` | `3` | restart | "This parameter can only be set at server start." |
 | `autovacuum_naptime` | `1min` | reload | Time between launcher sweeps per database. |
 | `autovacuum_vacuum_threshold` | `50` | reload | Per-table override available. |
@@ -221,6 +221,9 @@ The cluster-wide GUCs (verbatim defaults):[^autoconf]
 | `autovacuum_multixact_freeze_max_age` | `400000000` | restart | "relatively low 400 million multixacts." |
 | `autovacuum_vacuum_cost_delay` | `2ms` | reload | -1 to use `vacuum_cost_delay`. |
 | `autovacuum_vacuum_cost_limit` | `-1` | reload | Means: use `vacuum_cost_limit` (200). |
+
+> [!NOTE] PostgreSQL 18
+> `autovacuum_max_workers` becomes reloadable, bounded by the new restart-only `autovacuum_worker_slots` setting. PG18 also caps the update/delete trigger with `autovacuum_vacuum_max_threshold` (default 100M) and adjusts the insert trigger for the unfrozen fraction of the table. The formulas below describe PG16.[^pg18-vacuum-config]
 
 `autovacuum` requires `track_counts`. Verbatim:[^routine]
 
@@ -250,7 +253,7 @@ The launcher picks tables to vacuum and analyze by evaluating two (since PG13, t
 >
 > where the vacuum base threshold is autovacuum_vacuum_threshold, the vacuum scale factor is autovacuum_vacuum_scale_factor, and the number of tuples is pg_class.reltuples.
 
-A table is vacuumed when `n_dead_tup ≥ vacuum_threshold`. Worked example, default GUCs:
+A table becomes eligible when the estimated dead-tuple count exceeds the vacuum threshold. The launcher schedule and worker availability determine when work actually begins:
 
 | Table size (`reltuples`) | `vacuum_threshold` | Dead tuples to trigger |
 |---|---|---|
@@ -317,7 +320,7 @@ Full per-table parameter catalog:
 | `vacuum_index_cleanup` / `toast.vacuum_index_cleanup` | (none) | `AUTO`/`ON`/`OFF`. Verbatim: *"With OFF, index cleanup is disabled, with ON it is enabled, and with AUTO a decision is made dynamically, each time VACUUM runs."*[^createtable] |
 | `toast.autovacuum_*` | corresponding GUC | Override settings on the TOAST side independently. |
 
-The headline per-table tuning move is `autovacuum_vacuum_scale_factor = 0.01` on hot churn tables (10× more aggressive than default). Combine with a `autovacuum_vacuum_threshold` floor of a few thousand to prevent over-triggering on tiny tables.
+Setting `autovacuum_vacuum_scale_factor = 0.01` reduces the scale-dependent part of the default threshold by 20×. Combine it with an appropriate base threshold, then measure vacuum throughput and application latency.
 
 ## Cost-Based Vacuum Delay (IO Throttling)
 
@@ -364,7 +367,7 @@ VACUUM stores dead-tuple TIDs in memory between scan and index-vacuum phases. `m
 
 > Specifies the maximum amount of memory to be used by maintenance operations, such as VACUUM, CREATE INDEX, and ALTER TABLE ADD FOREIGN KEY. If this value is specified without units, it is taken as kilobytes. It defaults to 64 megabytes (64MB). Since only one of these operations can be executed at a time by a database session, and an installation normally doesn't have many of them running concurrently, it's safe to set this value significantly larger than work_mem. Larger settings might improve performance for vacuuming and for restoring database dumps.
 
-The 64 MB default is conservatively low for any modern server. A typical production setting is 512 MB to 2 GB.
+Size maintenance memory from available RAM and concurrent operations. A higher setting can reduce repeated index passes, but there is no safe fixed production value independent of the workload.
 
 `autovacuum_work_mem` overrides per-worker. Verbatim:[^resource]
 
@@ -376,7 +379,7 @@ Two consequences:
 2. **Pre-PG17 1 GB cap** — verbatim from the PG16 docs:[^resource] *"Note that for the collection of dead tuple identifiers, VACUUM is only able to utilize up to a maximum of 1GB of memory."* This silently capped VACUUM at ~178 million TIDs per index-pass regardless of `maintenance_work_mem`.
 
 > [!NOTE] PostgreSQL 17
-> The 1 GB cap is lifted. Verbatim:[^pg17-mem] *"New memory management system for VACUUM, which reduces memory consumption and can improve overall vacuuming performance. ... Additionally, vacuum is no longer silently limited to one gigabyte of memory when maintenance_work_mem or autovacuum_work_mem are higher."* On PG17+ you can size `maintenance_work_mem = 4GB` and a single VACUUM pass will use all of it, reducing the number of index-vacuum cycles on a very large table from many to one.
+> PG17 removes the 1 GB limit on storage for dead-tuple identifiers.[^pg17-mem] A larger budget can reduce repeated index-vacuum cycles, but does not guarantee one pass or allocation of the full budget.
 
 ## Parallel Vacuum (PG13+)
 
@@ -445,7 +448,7 @@ The seven phases, verbatim:[^progress]
 > [!NOTE] PostgreSQL 17
 > Three column changes:[^pg17-progress] *"Rename pg_stat_progress_vacuum column max_dead_tuples to max_dead_tuple_bytes, rename num_dead_tuples to num_dead_item_ids, and add dead_tuple_bytes."* Plus a new pair for index processing:[^pg17-progress-index] *"Allow vacuum to report the progress of index processing ... This appears in system view pg_stat_progress_vacuum columns indexes_total and indexes_processed."* Diagnostic queries that joined `max_dead_tuples` need to be rewritten for PG17.
 
-If `index_vacuum_count > 1` in `pg_stat_progress_vacuum`, the table was too big for one pass and VACUUM had to round-trip through indexes multiple times. The fix on PG≤16 is to raise `maintenance_work_mem`, accepting the 1 GB cap. On PG17+ the cap is gone and raising `maintenance_work_mem` removes the multi-pass entirely (recipe 6).
+`index_vacuum_count > 1` indicates repeated index-vacuum cycles. Consider increasing the dead-item memory budget if RAM permits: `maintenance_work_mem` for manual VACUUM, or `autovacuum_work_mem` for autovacuum. PG16 caps the dead-item store at 1 GB; PG17 removes that cap, but a larger value does not guarantee one pass.
 
 ## Per-Version Timeline
 
@@ -574,22 +577,22 @@ The downside: trailing empty pages stay until the next non-LAZY operation that r
 
 If `pg_stat_progress_vacuum.index_vacuum_count > 1` during a vacuum, the dead-tuple TID store didn't fit in `maintenance_work_mem` and VACUUM had to round-trip through every index multiple times.
 
-    -- Pre-PG17: capped at 1 GB anyway.
+    -- Pre-PG17: VACUUM uses at most 1 GB of this, so 1GB is the useful ceiling.
     -- PG17+: cap is removed.
-    SET maintenance_work_mem = '4GB';
+    SET maintenance_work_mem = '1GB';  -- budget concurrent memory first
     VACUUM (PARALLEL 4, VERBOSE) huge_archive_table;
 
 > [!NOTE] PostgreSQL 17
-> The 1 GB silent cap is gone:[^pg17-mem] *"vacuum is no longer silently limited to one gigabyte of memory when maintenance_work_mem or autovacuum_work_mem are higher."* On PG17+ this recipe collapses a multi-pass vacuum of a 500 GB table from hours to a single index round-trip.
+> PG17 removes the 1 GB limit on the dead-item store.[^pg17-mem] Measure whether a larger budget reduces repeated index work; heap size alone does not determine the memory needed.
 
 ### Recipe 7 — Bloat triage walkthrough
 
 A `n_dead_tup`-heavy table with autovacuum running:
 
 1. **Confirm autovacuum is running on this table** — check `pg_stat_user_tables.last_autovacuum` and `autovacuum_count`.
-2. **Check the xmin horizon** — if any backend has `backend_xmin < (max XID - days*86400*xacts/sec)`, autovacuum cannot reclaim tuples that became dead after that backend's xmin. Run the diagnostic query from [`27-mvcc-internals.md`](./27-mvcc-internals.md) Recipe 2.
-3. **If horizon is fine, check that autovacuum is finishing** — `pg_stat_progress_vacuum` will tell you. If a vacuum is repeatedly being cancelled by lock conflicts, set `lock_timeout` lower on the offending statement, not on the vacuum.
-4. **If autovacuum runs and finishes but bloat stays** — the scale factor is wrong for this table size. Apply recipe 1.
+2. **Check retained XIDs and snapshots** using `age(backend_xid)` and `age(backend_xmin)`, plus replication-slot and prepared-transaction horizons. Do not compare XIDs with ordinary integer subtraction because they wrap.
+3. **Check whether vacuum finishes.** Inspect `pg_stat_progress_vacuum` and cancellation logs. A backend blocked by an ordinary autovacuum cancels it when its deadlock check runs, after `deadlock_timeout`. If routine vacuums keep getting canceled, set `lock_timeout` below `deadlock_timeout` on the offending statement, not on the vacuum, so the statement gives up before it cancels autovacuum.
+4. **Distinguish retained dead tuples from reusable free space.** Recent writes, horizon blockers, cancellations, or insufficient throughput can leave `n_dead_tup` high; lowering a scale factor is not a universal fix.
 5. **If heap is bloated but indexes are not** — `n_dead_tup` is wrong as a proxy; check `pgstattuple_approx(tbl)` for the heap and `pgstatindex(idx)` for each index ([`26-index-maintenance.md`](./26-index-maintenance.md) recipe 10). Decide between routine VACUUM (already running) and online table reorg via `pg_repack` / `pg_squeeze`.
 6. **If pgstattuple says the heap is 80% dead** — switch to a one-time online reorg with `pg_repack`, not `VACUUM FULL`.
 
@@ -602,7 +605,7 @@ A `n_dead_tup`-heavy table with autovacuum running:
       $$ VACUUM (ANALYZE, PARALLEL 4, BUFFER_USAGE_LIMIT '32MB') public.big_fact_table $$
     );
 
-The `BUFFER_USAGE_LIMIT '32MB'` keeps the maintenance from sweeping shared_buffers clean during the run (PG16+). Cross-reference [`98-pg-cron.md`](./98-pg-cron.md). For the `VACUUM cannot run in transaction block` rule — pg_cron jobs execute outside a transaction, so this works.
+`BUFFER_USAGE_LIMIT` controls the reuse ring, not total maintenance memory or an absolute limit on cache displacement. A single VACUUM command in a pg_cron job works without an explicit transaction block; do not wrap it in `BEGIN` or a multi-command transaction. Cross-reference [`98-pg-cron.md`](./98-pg-cron.md).
 
 ### Recipe 9 — Inventory tables with autovacuum disabled
 
@@ -652,7 +655,7 @@ Or the inverse, when TOAST processing is slow and you want to vacuum only the ma
     # Post-pg_upgrade: refresh planner stats in stages of increasing fidelity.
     vacuumdb --all --analyze-in-stages
 
-`--analyze-in-stages` runs three passes with progressively higher `default_statistics_target` (1, 10, full). On PG17+ pg_upgrade preserves statistics, but `--analyze-in-stages` is still the right post-upgrade catch-all.
+`--analyze-in-stages` starts with low-fidelity statistics and can temporarily worsen plans when useful statistics already exist. PG18 begins transferring planner statistics during `pg_upgrade`, but follow its post-upgrade instructions: fill missing statistics, then run a full ANALYZE to refresh cumulative statistics used by maintenance. PG17 does not transfer planner statistics.[^pg18-upgrade]
 
 ### Recipe 13 — Pre-emptive freeze of a write-once partition
 
@@ -660,11 +663,11 @@ For a daily-rotation partition that will never be updated again, pre-emptively f
 
     VACUUM (FREEZE, ANALYZE, PARALLEL 4) events_2025_05_10;
 
-This advances `relfrozenxid` on the partition to "now," so anti-wraparound never has to scan it. Combined with [`35-partitioning.md`](./35-partitioning.md) retention, you get bounded freeze cost.
+This freezes eligible tuples and lets future aggressive scans skip all-frozen pages. It does not guarantee that `relfrozenxid` equals the current XID or eliminate later horizon bookkeeping.[^routine]
 
 ## Gotchas / Anti-patterns
 
-1. **Disabling autovacuum cluster-wide is operationally fatal.** Without autovacuum, freezing never happens, `relfrozenxid` does not advance, and the cluster will shut down at wraparound. Whatever problem motivated disabling autovacuum (high CPU, IO contention) is better solved by tuning cost limits, raising `maintenance_work_mem`, or rebalancing workers — never by disabling the daemon.
+1. **Disabling routine autovacuum removes automatic reclamation and analysis.** Prefer tuning it. If routine work is deliberately scheduled manually, forced anti-wraparound vacuums still run even with `autovacuum = off`.[^routine]
 
 2. **`autovacuum_enabled = false` on a table still allows anti-wraparound.** Verbatim:[^createtable] *"If false, this table will not be autovacuumed, except to prevent transaction ID wraparound."* You cannot fully exempt a table from VACUUM. The setting is correct for "I will run VACUUM on this table manually on my own schedule" but you must actually do that.
 
@@ -674,7 +677,7 @@ This advances `relfrozenxid` on the partition to "now," so anti-wraparound never
 
 5. **The 0.2 default scale factor is too lazy for big tables.** Out-of-the-box, a 100M-row table waits for 20M dead tuples before autovacuum triggers. Lower the per-table `autovacuum_vacuum_scale_factor` aggressively — 0.01 or even 0.005 — on hot tables. Cluster-wide changes are coarse; per-table is precise.
 
-6. **`autovacuum: ... (to prevent wraparound)` cannot be auto-cancelled.** A query that takes a conflicting lock will *block* on it until the vacuum finishes, even if your application has a `lock_timeout`. The fix is to let it complete, then investigate why anti-wraparound triggered in the first place (was `autovacuum_freeze_max_age` reached because routine autovacuum was being cancelled? see gotcha #10).
+6. **Anti-wraparound autovacuum is not automatically canceled by conflicting locks.** A waiting DDL statement can still hit its own `lock_timeout`, and an administrator can explicitly cancel the vacuum. Let urgent wraparound work finish and investigate its cause afterward.[^routine]
 
 7. **Manual `VACUUM` defaults to `vacuum_cost_delay = 0`** — no throttle.[^resource] If you run `VACUUM big_table` in business hours expecting it to be polite to other queries, you will be surprised. Either set `SET vacuum_cost_delay = '2ms';` before issuing the VACUUM, or rely on autovacuum which already has the throttle.
 
@@ -682,27 +685,27 @@ This advances `relfrozenxid` on the partition to "now," so anti-wraparound never
 
 9. **Pre-PG17, VACUUM is silently capped at 1 GB regardless of `maintenance_work_mem`.** Verbatim from the PG16 docs:[^resource] *"Note that for the collection of dead tuple identifiers, VACUUM is only able to utilize up to a maximum of 1GB of memory."* The cap is removed in PG17.[^pg17-mem] If you tuned `maintenance_work_mem = 8GB` on PG16 and saw no speedup, this is why.
 
-10. **A long-running transaction or abandoned replication slot defeats VACUUM completely.** No autovacuum tuning helps. The fix is upstream — `idle_in_transaction_session_timeout`, dropping abandoned slots — not in this file. See [`27-mvcc-internals.md`](./27-mvcc-internals.md) gotchas #2, #4, and the long-running-offender recipes.
+10. **Old transactions and slot horizons can prevent reclamation of still-needed tuples.** VACUUM can still process older reclaimable tuples and perform other maintenance; it is not necessarily defeated completely. Diagnose the retained horizon before tuning.
 
 11. **`VACUUM` cannot run inside a transaction block.** Verbatim:[^vacuum] *"VACUUM cannot be executed inside a transaction block."* Migration frameworks that wrap every step in a transaction (Rails, Alembic, Flyway) need the same escape hatch as `CREATE INDEX CONCURRENTLY` ([`26-index-maintenance.md`](./26-index-maintenance.md)).
 
-12. **Autovacuum requires `track_counts`.** Verbatim:[^routine] *"autovacuum cannot be used unless track_counts is set to true."* `track_counts` is on by default; if you turned it off (e.g., for `pg_stat_kcache` experimentation), you turned off autovacuum.
+12. **Routine autovacuum requires `track_counts`.** Turning it off disables statistics-based scheduling. Forced anti-wraparound work remains a separate safety mechanism.[^autoconf]
 
-13. **Trailing-page truncation takes brief ACCESS EXCLUSIVE.** Plain VACUUM's only blocking operation. For ultra-latency-sensitive tables, set `ALTER TABLE tbl SET (vacuum_truncate = false)` and accept that empty trailing pages stay until the next FULL.
+13. **Trailing-page truncation can take ACCESS EXCLUSIVE.** For latency-sensitive tables, consider `ALTER TABLE tbl SET (vacuum_truncate = false)`. Empty trailing pages remain until a later vacuum with truncation enabled or a table rewrite. Other VACUUM phases can still wait for conflicting locks.[^vacuum]
 
 14. **`pg_stat_progress_vacuum` shows only LAZY VACUUM, not VACUUM FULL.** On PG14–18, verbatim:[^progress] *"Backends running VACUUM FULL will instead report their progress in the pg_stat_progress_cluster view."* Diagnostic queries that look for a stuck VACUUM by querying `pg_stat_progress_vacuum` will miss any FULL.
 
-15. **`VACUUM` does *not* lower `relfrozenxid` on a partitioned-table parent — only on the partitions.** A parent is just a catalog entry; the actual heap is in the child partitions. Anti-wraparound triggers per partition. On PG18+ use `VACUUM ONLY parent` to run a vacuum on just the parent's catalog row.[^pg18-only]
+15. **A partitioned-table parent has no heap or meaningful `relfrozenxid`.** Anti-wraparound maintenance runs on stored leaf relations. On PG18+, `VACUUM ONLY parent` skips the children; it does not freeze the parent's nonexistent heap. Use ANALYZE for parent planner statistics.[^routine][^pg18-only]
 
-16. **`INDEX_CLEANUP=OFF` skips index entries but the TID-store still grows.** Don't use OFF as a workaround for "VACUUM is too slow" except in genuine pre-wraparound emergencies. Verbatim:[^vacuum] *"This may be useful when it is necessary to make VACUUM run as quickly as possible to avoid imminent transaction ID wraparound."* And the immediate next sentence: *"However, the wraparound failsafe mechanism controlled by vacuum_failsafe_age will generally trigger automatically to avoid transaction ID wraparound failure, and should be preferred."*
+16. **`INDEX_CLEANUP=OFF` leaves dead index entries and associated heap line pointers.** Repeatedly skipping cleanup can cause bloat. It can be useful near wraparound, but the automatic failsafe normally handles this tradeoff when the configured age is reached.[^vacuum]
 
-17. **Replication-slot xmin holds the horizon back cluster-wide.** A slot for a subscriber that's been down for a day pins every database's horizon at where the subscriber left off. Bloat will accumulate on *every* table in *every* database. Fix the slot ([`75-replication-slots.md`](./75-replication-slots.md)), not the autovacuum.
+17. **Slot `xmin` and `catalog_xmin` retain different data.** An old `xmin` can hold back user-row cleanup; `catalog_xmin` retains catalog tuples needed for logical decoding. An inactive slot with null horizons does not itself pin tuple cleanup. Inspect the values and the affected relations before dropping a slot.
 
 18. **Autovacuum cancellation by lock conflict is silent in default logs.** Set `log_autovacuum_min_duration = 0` temporarily to see every autovacuum (and every cancellation) in the log. On PG15+ the default `10min` catches long runs but not quick cancellations.[^pg15-log]
 
-19. **`PARALLEL n` is for the index phase only — it does not parallelize the heap scan.** A table with one giant index gets no parallel speedup. A table with many indexes gets a near-linear speedup.
+19. **Parallel VACUUM distributes eligible index work, not the heap scan.** Only one worker can process a particular index at a time, and workers launch only when at least two indexes qualify. Speedup depends on the workload and available workers.[^vacuum]
 
-20. **`autovacuum_max_workers` is restart-only.** Verbatim:[^autoconf] *"This parameter can only be set at server start."* You cannot raise it during an incident.
+20. **`autovacuum_max_workers` requires a restart on PG16–17.** PG18 makes it reloadable up to the reserved `autovacuum_worker_slots`, which remains restart-only.[^autoconf][^pg18-vacuum-config]
 
 21. **GIN-pending-list flush happens during every VACUUM** — a busy GIN-indexed table will have most of its VACUUM time go to GIN cleanup. Tune `gin_pending_list_limit` per index ([`24-gin-gist-indexes.md`](./24-gin-gist-indexes.md)) if VACUUM is slow on GIN-heavy tables.
 
@@ -804,3 +807,7 @@ This advances `relfrozenxid` on the partition to "now," so anti-wraparound never
 [^pg19-av-parallel]: PostgreSQL 19 release notes (RC2): *"Allow autovacuum to use parallel autovacuum workers"*, *"Add scoring system to control the order that tables are processed by autovacuum"*, and, under Migration, *"Change parallel vacuum leaders and workers to share the cost-based vacuum delay limit... `VACUUM` with parallel workers and cost-based delay enabled might run slower than in previous releases."* https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-PERFORMANCE ; GUC list: https://www.postgresql.org/docs/19/runtime-config-vacuum.html
 
 [^pg19-wait-events-28]: PostgreSQL 19 release notes (RC2), Migration: *"Rename wait event type `BUFFERPIN` to `BUFFER` and rename wait event `BufferPin` to `BufferCleanup`"*; *"Remove wait event `BufferContent` and add more precise wait events `BufferShared`, `BufferShareExclusive`, and `BufferExclusive`."* https://www.postgresql.org/docs/19/release-19.html#RELEASE-19-MIGRATION
+
+[^pg18-vacuum-config]: PostgreSQL 18, Vacuuming configuration: worker slots, reloadable worker limit, maximum trigger threshold, and insert-trigger changes. <https://www.postgresql.org/docs/18/runtime-config-vacuum.html>
+
+[^pg18-upgrade]: PostgreSQL 18, pg_upgrade, post-upgrade statistics instructions. <https://www.postgresql.org/docs/18/pgupgrade.html#PGUPGRADE-STEP-STATISTICS>

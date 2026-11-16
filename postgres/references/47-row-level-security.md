@@ -75,14 +75,14 @@ This file is the SQL surface for RLS policies. Role attributes (including `BYPAS
 | Multi-tenant table where every row carries `tenant_id` | RLS policy `USING (tenant_id = current_setting('app.tenant_id')::int)` | Application-layer WHERE only | Survives ad-hoc SQL and ORM bypasses |
 | Allow user to see only their own rows | RLS `FOR ALL TO PUBLIC USING (owner = current_user)` | Trigger-based filter | Triggers can't filter `SELECT` |
 | Combine "tenant filter" with "admin override" | Two `PERMISSIVE` policies (OR-combined) | One mega-policy with `OR` | Easier to audit; admin policy `TO admin_role` |
-| Enforce "no row may exceed X regardless of who writes" | One `RESTRICTIVE` policy gating writes | More permissive policies | Restrictive AND-combines: subtractive |
-| Audit-only role that reads everything | Grant `pg_read_all_data` predefined role OR `BYPASSRLS` | A wide-open permissive policy | Predefined role audits clearly; avoids policy sprawl |
+| Enforce a row invariant for all writers | A table constraint | RLS alone | Superusers, bypass roles, and normally owners bypass RLS |
+| Audit-only role that reads everything | Grant table `SELECT` and `BYPASSRLS` | `pg_read_all_data` alone | `pg_read_all_data` grants access but does not bypass RLS |
 | Application owns the table AND needs RLS | `ALTER TABLE ... FORCE ROW LEVEL SECURITY` | Letting the owner bypass | Without FORCE, the app role sees everything |
 | Prevent `pg_dump` from silently dropping rows | Default is correct (`row_security=off` raises an error) | Setting `row_security=on` in dump session | The error surfaces unintended filtering |
 | Strip RLS from a dump (PG18+) | `pg_dump --no-policies` | Manually editing dump SQL | PG18+ supported tooling[^pg18-no-policies] |
 | Make a view enforce caller's RLS, not owner's | `WITH (security_invoker = true)` view (PG15+) | A `security_barrier` view alone | `security_invoker` reads as the caller[^createview-invoker] |
 | Logical replication INTO an RLS table | Subscription owner has `BYPASSRLS` OR is table owner | Plain non-bypass subscription role | Verbatim: policies not checked, copy fails for non-bypass non-owner[^pg15-logrep] |
-| Quick RLS escape hatch for one query | `SET row_security = on/off` per-session | `BYPASSRLS` as a permanent attribute | Use GUC for diagnostics, attribute for service accounts |
+| Detect whether RLS would filter a query | `SET row_security = off` per-session | Treating the GUC as a bypass | It raises an error rather than bypassing policies |
 | Detect missing RLS on a "should be secured" table | Audit `pg_class.relrowsecurity = false` | Manual review | See Recipe 11 |
 
 Three smell signals that you reached for RLS but should not have:
@@ -90,6 +90,8 @@ Three smell signals that you reached for RLS but should not have:
 - **The policy expression calls a slow function on every row.** RLS evaluates per-row. Use a CHECK constraint or trigger if the expression is value-derivable.
 - **You added `BYPASSRLS` to every service account.** That's a sign your tenancy model lives in the application layer; RLS is providing no value. Pick one — drop RLS or remove the bypasses.
 - **You disabled RLS to make migrations work.** Migrations should run as a role that owns the table (and bypasses by default) or has `BYPASSRLS`. Disabling RLS during DDL is operationally fragile.
+
+**Trust boundary:** Custom settings such as `app.tenant_id` can be changed by any SQL client in its own session. They are not authenticated tenant identities. These examples are safe only when a trusted application controls the connection and untrusted users cannot issue arbitrary SQL. Otherwise use an identity the caller cannot forge, such as separate database roles, and derive tenant access from trusted mappings. Reset pooled session state on checkout and test as the actual non-owner role.
 
 
 ### Enabling and Disabling RLS
@@ -132,7 +134,7 @@ Verbatim docs description: *"The CREATE POLICY command defines a new row-level s
 
 Four rules to remember:
 
-1. **Policies are named.** The name is unique per (table, command), not globally per database. Two policies named `tenant_read` on different tables are independent.
+1. **Policies are named.** The name must be unique per table, regardless of command; different tables may reuse it.
 2. **`OR REPLACE` is not supported on `CREATE POLICY`.** You must `DROP POLICY ... IF EXISTS` then `CREATE` or use `ALTER POLICY`.
 3. **`USING` and `WITH CHECK` are independent expressions.** Omit either where it does not apply (see below).
 4. **The policy expression cannot contain aggregates or window functions.** Verbatim: *"The conditional expression cannot contain any aggregate or window functions."*[^createpolicy-using]
@@ -192,9 +194,7 @@ Five command keywords:
 - **`FOR UPDATE`** — both `USING` and `WITH CHECK`.
 - **`FOR DELETE`** — `USING` only.
 
-Two policies of different `FOR` types do not OR-combine in the way two `FOR SELECT` policies do — they apply to *disjoint* operations. A `FOR SELECT` policy and a `FOR INSERT` policy both being present means SELECT queries use the first, INSERT statements use the second, never both.
-
-The exception is `FOR ALL` + a more-specific policy: both apply to the matched command, OR-combined as permissive.
+Different command types can apply together. For example, an `UPDATE` requiring SELECT privileges must satisfy both the SELECT and UPDATE policy groups, combined with AND. `RETURNING`, `ON CONFLICT`, and `MERGE` have additional checks; consult the command table in [CREATE POLICY](https://www.postgresql.org/docs/16/sql-createpolicy.html). Within each command group, applicable `ALL` policies combine with command-specific policies according to their permissive or restrictive mode.
 
 
 ### TO Role Targeting
@@ -236,7 +236,7 @@ Three classes of bypass:
 
 | Bypass class | Always bypasses? | How to grant |
 |---|---|---|
-| Superuser | Yes — bypasses RLS, privileges, FK, CHECK, everything | `CREATE ROLE … SUPERUSER` |
+| Superuser | Yes — bypasses RLS and privilege checks, not ordinary constraints | `CREATE ROLE … SUPERUSER` |
 | `BYPASSRLS` role | Yes — bypasses RLS only, still subject to grants | `CREATE ROLE … BYPASSRLS` (PG9.5+) |
 | Table owner | Yes by default — unless `FORCE ROW LEVEL SECURITY` is set on the table | Implicit on ownership |
 
@@ -262,12 +262,12 @@ Verbatim docs: *"These forms control the application of row security policies be
 
 When to reach for `FORCE`:
 
-- The application user that runs DML *is* the table owner (common in single-role app deployments). Without `FORCE`, RLS does nothing.
-- You want defense-in-depth and don't trust the "owner won't run risky SQL" assumption.
+- The owner should be subject to policies during ordinary access, for example to catch mistakes in maintenance code.
+- Treat this only as defense in depth: the owner can alter the table and disable or unforce RLS. Use a separate non-owner application role when RLS is a security boundary.
 
 When *not* to reach for `FORCE`:
 
-- Operational scripts running as the owner (`REINDEX`, `pg_repack`, partition rotation) — they'll be filtered by RLS, which is rarely what you want. Either separate the role or use `BYPASSRLS` for that role.
+- Maintenance scripts that move rows with ordinary DML as the owner (for example `INSERT ... SELECT` during partition rotation). `FORCE` filters them like any other query; run them as a role with `BYPASSRLS` instead. Whole-table operations such as `TRUNCATE` are not subject to row security,[^ddl-rls] and utility commands such as `REINDEX` and `VACUUM` do not read rows through policies, so `FORCE` does not change them.
 
 
 ### row_security GUC and pg_dump
@@ -467,6 +467,7 @@ CREATE POLICY hide_drafts_from_non_managers
         OR EXISTS (
             SELECT 1 FROM org_members
             WHERE user_id = current_setting('app.user_id', true)::int
+              AND org_id = contracts.org_id
               AND role = 'manager'
         )
     );
@@ -495,8 +496,9 @@ CREATE POLICY accounts_admin_sees_deleted
     TO admin_role
     USING (true);
 
--- Application performs UPDATE accounts SET deleted_at = now() WHERE id = $1;
--- (Need an UPDATE policy for that — separate.)
+-- An UPDATE that soft-deletes a row and requires SELECT access is checked
+-- against SELECT policies on the new row as well. A normal user whose
+-- SELECT policy hides deleted rows cannot perform that update successfully.
 CREATE POLICY accounts_owner_can_update
     ON accounts
     FOR UPDATE
@@ -505,7 +507,7 @@ CREATE POLICY accounts_owner_can_update
     WITH CHECK (owner_id = current_setting('app.user_id', true)::int);
 ```
 
-This approach survives ad-hoc SQL access through any tool — the policy is enforced regardless of query source.
+Run soft-delete updates through an appropriately authorized role whose SELECT policy permits the resulting row, or redesign the access pattern. Test updates including `RETURNING` as the actual non-owner role. A custom GUC is not a trustworthy identity if clients can issue arbitrary SQL.
 
 
 ### Recipe 5 — Per-user table with `current_user`
@@ -568,7 +570,7 @@ Note: the lack of UPDATE/DELETE policies means even the auditor cannot delete ro
 
 ### Recipe 7 — Force RLS on owner-app pattern
 
-Common deployment: the application connects as `app_user`, which is also the table owner. Without `FORCE`, RLS doesn't apply to the app at all:
+When the application role owns the table, `FORCE` subjects ordinary owner queries to policies, but it is not a security boundary: an owner can change or disable RLS. Use a separate non-owner role for untrusted application SQL.
 
 ```sql
 ALTER TABLE events OWNER TO app_user;
@@ -772,7 +774,7 @@ Pre-PG18 you must edit the dump SQL by hand or restore everything and `DROP POLI
 
 ## Sources
 
-[^ddl-rls]: PostgreSQL 16 documentation, *5.9. Row Security Policies*. Verbatim: *"In addition to the SQL-standard privilege system available through GRANT, tables can have row security policies that restrict, on a per-user basis, which rows can be returned by normal queries or inserted, updated, or deleted by data modification commands."* And: *"Superusers and roles with the BYPASSRLS attribute always bypass the row security system when accessing a table. Table owners normally bypass row security as well, though a table owner can choose to be subject to row security with ALTER TABLE ... FORCE ROW LEVEL SECURITY."* And on `row_security`: *"This does not in itself bypass row security; what it does is throw an error if any query's results would get filtered by a policy."* https://www.postgresql.org/docs/16/ddl-rowsecurity.html
+[^ddl-rls]: PostgreSQL 16 documentation, *5.9. Row Security Policies*. Verbatim: *"In addition to the SQL-standard privilege system available through GRANT, tables can have row security policies that restrict, on a per-user basis, which rows can be returned by normal queries or inserted, updated, or deleted by data modification commands."* And: *"Operations that apply to the whole table, such as TRUNCATE and REFERENCES, are not subject to row security."* And: *"Superusers and roles with the BYPASSRLS attribute always bypass the row security system when accessing a table. Table owners normally bypass row security as well, though a table owner can choose to be subject to row security with ALTER TABLE ... FORCE ROW LEVEL SECURITY."* And on `row_security`: *"This does not in itself bypass row security; what it does is throw an error if any query's results would get filtered by a policy."* https://www.postgresql.org/docs/16/ddl-rowsecurity.html
 
 [^createpolicy-syn]: PostgreSQL 16 documentation, *CREATE POLICY*. Verbatim full synopsis preserved in the [CREATE POLICY Grammar](#create-policy-grammar) section. https://www.postgresql.org/docs/16/sql-createpolicy.html
 

@@ -28,7 +28,7 @@ PostgreSQL's cost-based planner depends on statistics about table contents to pi
 Load this file when the user asks about: planner statistics, `pg_statistic`, `pg_stats`, `pg_stats_ext`, `pg_stats_ext_exprs`, `ANALYZE`, `default_statistics_target`, per-column statistics target, extended statistics, `CREATE STATISTICS`, ndistinct / dependencies / MCV statistics, multivariate statistics, autovacuum ANALYZE, or "why is the planner picking a bad plan?"
 
 > [!WARNING] PG18 preserves planner stats through pg_upgrade — NOT PG17
-> A widely-quoted "PG17 keeps stats across pg_upgrade" claim is **wrong**. PG17 pg_upgrade docs still say *"Because optimizer statistics are not transferred by `pg_upgrade`, you will be instructed to run a command to regenerate that information at the end of the upgrade."*[^pg16-pgupgrade] [^pg17-pgupgrade] The preservation feature landed in **PG18** with the verbatim release-note: *"Allow pg_upgrade to preserve optimizer statistics (Corey Huinker, Jeff Davis, Nathan Bossart). Extended statistics are not preserved. Also add pg_upgrade option `--no-statistics` to disable statistics preservation."*[^pg18-pgupgrade-stats] On PG≤17 you still need `vacuumdb --analyze-in-stages` after every major-version upgrade; on PG18+ you do not — except for extended statistics, which must be re-collected manually even on PG18.
+> PG17 does not transfer optimizer statistics. PG18 transfers most by default, but not extended, extension-provided, or cumulative statistics. After a PG18 upgrade, run both commands in [the PG18 upgrade instructions](https://www.postgresql.org/docs/18/pgupgrade.html): `vacuumdb --all --analyze-in-stages --missing-stats-only`, then `vacuumdb --all --analyze-only`. The second refreshes cumulative statistics needed for vacuum and analyze scheduling.
 
 ## Mental Model
 
@@ -42,7 +42,7 @@ Five rules that govern everything else:
 
 4. **Extended statistics (PG10+) handle correlations the per-column model misses.** Per-column statistics assume column-independence; when columns are correlated (`(state, country)`, `(day_of_week, is_weekend)`, etc.) the planner under-estimates filter selectivity unless you `CREATE STATISTICS`. Three kinds since PG12: `ndistinct`, `dependencies`, `mcv`.[^pg10-extstats] [^pg12-mcv]
 
-5. **Sampled, not complete.** Even at `default_statistics_target = 10000` (max), ANALYZE samples up to 30 × target rows = 300,000 rows per relation. For a 100M-row table this is 0.3%. The planner's estimates are inherently approximate; perfection isn't an option.
+5. **Statistics are sampled, not complete.** `ANALYZE` samples 300 × the largest statistics target among the analyzed columns (30,000 rows at the default of 100), or every row of a smaller table. Estimates remain approximate even after ANALYZE.[^planner-stats]
 
 ## Decision Matrix
 
@@ -51,7 +51,7 @@ When the planner picks a bad plan, work down this list:
 | Symptom | Diagnostic | Fix |
 |---|---|---|
 | EXPLAIN ANALYZE shows actual rows 10×+ off estimate on a single column | `\d+ table` shows column had recent ANALYZE? `SELECT last_analyze FROM pg_stat_user_tables` | Run `ANALYZE table_name`; if recent, raise per-column SET STATISTICS |
-| Estimate off on a WHERE with several AND-ed conditions on the same table | Check `pg_stats_ext` for relevant extended statistics | `CREATE STATISTICS ... (dependencies, mcv) ON (col_a, col_b) FROM table` |
+| Estimate off on a WHERE with several AND-ed conditions on the same table | Check `pg_stats_ext` for relevant extended statistics | `CREATE STATISTICS s (dependencies, mcv) ON col_a, col_b FROM table_name` |
 | Estimate off on a WHERE involving expression like `lower(email)` | Per-column stats don't apply to expressions | Either expression index OR `CREATE STATISTICS ... ON (lower(email)) FROM table` (PG14+) |
 | Bad estimate on a JOIN's join-key cardinality | n_distinct for the join column wrong? | Set `n_distinct` manually with `ALTER TABLE ... ALTER COLUMN ... SET (n_distinct = -0.5)` |
 | Estimate off for `WHERE col = $1` parameterized query | Generic plan chose poorly with average selectivity | Force `plan_cache_mode = force_custom_plan` or rewrite (cross-reference 13-cursors-and-prepares.md) |
@@ -59,7 +59,7 @@ When the planner picks a bad plan, work down this list:
 | Planner stats look identical to default_statistics_target=1 sample | `default_statistics_target` set per-column to a low value? | Check `pg_attribute.attstattarget`; reset or raise |
 | All planner stats missing after pg_upgrade on PG≤17 | pg_upgrade doesn't transfer stats | `vacuumdb --all --analyze-in-stages` |
 | Estimate off but stats look correct | Cross-table correlation? | No fix — planner has no cross-table statistics; rewrite query |
-| Want to check planner is using extended stats | `EXPLAIN` doesn't reveal which extended-stats object was used | `pg_stats_ext` shows when last analyzed; toggle on/off via `ALTER STATISTICS ... SET STATISTICS 0` |
+| Investigate extended statistics | Inspect `pg_stats_ext` and compare plans in an isolated test | Test after dropping and recreating the statistics object and running ANALYZE |
 
 Three smell signals — drop into a diagnostic session if you see these:
 
@@ -88,7 +88,7 @@ For each column, ANALYZE writes to `pg_statistic`:
 > [!NOTE] PostgreSQL 17
 > Range-type histogram columns were added to `pg_stats`: `range_length_histogram`, `range_empty_frac`, `range_bounds_histogram`. These let the planner estimate selectivity for range-overlap operators on range-type columns.[^pg17-pg-stats-range]
 
-ANALYZE samples up to `30 × statistics_target` rows per relation (so 3,000 rows at the default target of 100, or 300,000 at the max of 10,000) — the sample is large enough to keep statistics-collection time bounded but small enough that estimates remain inherently approximate, especially `n_distinct` on high-cardinality columns.
+ANALYZE uses a shared sample for column and extended statistics. Larger targets normally increase the sample; the actual sample depends on table size and the statistics being collected.[^planner-stats]
 
 ### pg_statistic and pg_stats
 
@@ -148,7 +148,7 @@ Operational rules:
 - **`ANALYZE` is non-blocking.** Takes `ShareUpdateExclusiveLock`, same as autovacuum — doesn't block readers or writers, but conflicts with concurrent `VACUUM` (full) and DDL.
 - **`SKIP_LOCKED` (PG12+)** skips relations where the lock can't be acquired immediately — useful in cron jobs.
 - **`BUFFER_USAGE_LIMIT` (PG16+)** caps the buffer-cache footprint of the analyze scan. Default uses a small ring buffer like vacuum. Cross-reference 32-buffer-manager.md.
-- **`ANALYZE` does NOT update `pg_class.reltuples` and `pg_class.relpages`** alone — `VACUUM` does that. ANALYZE estimates `reltuples` from its sample but VACUUM has the authoritative count. Always run a full `VACUUM ANALYZE` once on a freshly-loaded large table.
+- **Both `ANALYZE` and `VACUUM` update `pg_class.reltuples` and `relpages`.** Counts are approximate when the entire table is not scanned. After a bulk load, run `ANALYZE`; use VACUUM as needed for visibility and cleanup.[^planner-stats]
 
 ### default_statistics_target and per-column overrides
 
@@ -189,11 +189,17 @@ ALTER TABLE events ALTER COLUMN event_type SET STATISTICS -1;
 Per-column statistics assume columns are independent. Extended statistics (PG10+) capture correlations explicitly:
 
 ```
-CREATE STATISTICS [ IF NOT EXISTS ] statistics_name
+CREATE STATISTICS [ [ IF NOT EXISTS ] statistics_name ]
+    ON ( expression )
+    FROM table_name
+
+CREATE STATISTICS [ [ IF NOT EXISTS ] statistics_name ]
     [ ( statistics_kind [, ... ] ) ]
-    ON { column_name | ( expression ) } , { column_name | ( expression ) } [, ...]
+    ON { column_name | ( expression ) }, { column_name | ( expression ) } [, ...]
     FROM table_name
 ```
+
+The first form (PG14+) collects univariate statistics on a single expression and takes no statistics kinds. The second form needs at least two columns or expressions; a single bare column is rejected.
 
 *"CREATE STATISTICS will create a new extended statistics object tracking data about the specified table, foreign table or materialized view."*[^sql-createstatistics]
 
@@ -208,7 +214,7 @@ Three statistics kinds (since PG12; PG10 introduced ndistinct + dependencies, PG
 If you omit the `(statistics_kind, ...)` list, all kinds are computed.
 
 > [!NOTE] PostgreSQL 14
-> *"Allow extended statistics on expressions (Tomas Vondra). This allows statistics on a group of expressions and columns, rather than only columns like previously. System view `pg_stats_ext_exprs` reports such statistics."*[^pg14-extstats-exprs] Before PG14 you could only `CREATE STATISTICS ... ON (col_a, col_b)`; PG14+ accepts `ON (lower(email), country)` — making extended statistics applicable to common query patterns that mix expressions and columns.
+> *"Allow extended statistics on expressions (Tomas Vondra)."*[^pg14-extstats-exprs] Before PG14, specify columns as `ON col_a, col_b`; PG14+ also accepts expressions such as `ON (lower(email)), country`.
 
 > [!NOTE] PostgreSQL 15
 > *"Allow extended statistics to record statistics for a parent with all its children (Tomas Vondra, Justin Pryzby). Regular statistics already tracked parent and parent-plus-all-children statistics separately."*[^pg15-extstats-parent] Operational impact: extended statistics on a partitioned-table parent now reflect the union of children automatically, instead of being effectively empty.
@@ -236,7 +242,7 @@ DROP STATISTICS events_geography;
 DROP STATISTICS IF EXISTS events_geography;
 ```
 
-`ALTER STATISTICS ... SET STATISTICS 0` is the canonical way to disable an extended statistics object without dropping it — useful for benchmarking whether the object is helping a particular query.
+`ALTER STATISTICS ... SET STATISTICS 0` disables future collection for that object; it does not immediately remove previously collected data. For a controlled comparison, use an isolated environment, drop the object, and recreate and analyze it afterward.
 
 ### Autovacuum and ANALYZE
 
@@ -266,7 +272,7 @@ Per-table overrides cross-reference 28-vacuum-autovacuum.md.
 ### pg_upgrade interaction (PG18+)
 
 > [!NOTE] PostgreSQL 18
-> pg_upgrade now preserves per-relation and per-column optimizer statistics by default. Verbatim release-note: *"Allow pg_upgrade to preserve optimizer statistics (Corey Huinker, Jeff Davis, Nathan Bossart). Extended statistics are not preserved. Also add pg_upgrade option `--no-statistics` to disable statistics preservation."*[^pg18-pgupgrade-stats] Pair of constraints to remember: (1) **extended statistics are explicitly excluded** — you must re-run `ANALYZE` on tables with `CREATE STATISTICS` objects after pg_upgrade; (2) the `--no-statistics` flag exists for the rare case where you want the old "no stats transferred" behavior, e.g., if statistics in the old cluster are known to be wrong and you want a fresh sample.
+> PG18 `pg_upgrade` preserves most optimizer statistics by default, but not extended, extension-provided, or cumulative statistics. `--no-statistics` disables transfer. Follow the [PG18 post-upgrade instructions](https://www.postgresql.org/docs/18/pgupgrade.html) to fill missing optimizer statistics and refresh cumulative statistics on all relations.
 
 PG18 also adds four functions for explicit statistics manipulation:
 
@@ -274,8 +280,8 @@ PG18 also adds four functions for explicit statistics manipulation:
 -- PG18+
 pg_restore_relation_stats(...)
 pg_restore_attribute_stats(...)
-pg_clear_relation_stats(relid)
-pg_clear_attribute_stats(relid, attnum)
+pg_clear_relation_stats(schemaname, relname)
+pg_clear_attribute_stats(schemaname, relname, attname, inherited)
 ```
 
 Verbatim release-note: *"Add functions to modify per-relation and per-column optimizer statistics (Corey Huinker). The functions are `pg_restore_relation_stats()`, `pg_restore_attribute_stats()`, `pg_clear_relation_stats()`, and `pg_clear_attribute_stats()`."*[^pg18-stats-functions]
@@ -343,8 +349,8 @@ SELECT
     avg_width,
     n_distinct,
     array_length(most_common_vals, 1) AS n_mcv,
-    most_common_vals[1:5] AS top_5_values,
-    most_common_freqs[1:5] AS top_5_freqs,
+    most_common_vals AS mcv_values,
+    most_common_freqs AS mcv_freqs,
     array_length(histogram_bounds, 1) AS histogram_buckets,
     correlation
 FROM pg_stats
@@ -516,35 +522,37 @@ WHERE relname = 'events';
 
 After a bulk load, the autovacuum-triggered ANALYZE won't fire until enough updates accumulate. Run `VACUUM ANALYZE` manually so the planner has accurate stats for the queries that immediately follow.
 
-### Recipe 11: Post-pg_upgrade ANALYZE (PG≤17)
+### Recipe 11: Post-pg_upgrade ANALYZE
 
 ```bash
 # After pg_upgrade on PG14 → PG15, PG15 → PG16, PG16 → PG17
 vacuumdb --all --analyze-in-stages --jobs=$(nproc)
 
-# Three-stage: low statistics target first (fast), then progressively higher
-# Without --analyze-in-stages, the planner has zero stats until full ANALYZE completes
+# PG18 destination: first fill missing optimizer statistics, then refresh
+# cumulative statistics on all relations:
+vacuumdb --all --analyze-in-stages --missing-stats-only --jobs=8
+vacuumdb --all --analyze-only --jobs=8
 ```
 
-On PG≤17 this is mandatory post-upgrade. On PG18+ it's optional — only needed for tables with extended statistics, which pg_upgrade does NOT preserve.
+Use the commands appropriate to the destination version; the PG18 commands both matter even when most optimizer statistics transferred.
 
 ### Recipe 12: PG18+ stats export-and-restore between clusters
 
 ```sql
--- On the source cluster (production), export the relation-level stats for a table
-SELECT pg_get_relation_stats('events'::regclass);
--- Returns a serialized representation
+-- On the source, inspect relation statistics:
+SELECT relpages, reltuples, relallvisible
+FROM pg_class WHERE oid = 'public.events'::regclass;
 
--- On the destination cluster (dev), restore it
+-- On the destination, restore measured values (PG18+):
 SELECT pg_restore_relation_stats(
-    relation => 'events'::regclass,
-    relpages => 1234567,
-    reltuples => 9876543210
-    -- ... other parameters
+    'schemaname', 'public',
+    'relname', 'events',
+    'relpages', 1234567::integer,
+    'reltuples', 9876543210::real
 );
 
--- Or clear stats first if you want a fresh sample
-SELECT pg_clear_relation_stats('events'::regclass);
+-- Or clear stats first if you want a fresh sample:
+SELECT pg_clear_relation_stats('public', 'events');
 ANALYZE events;
 ```
 
@@ -559,7 +567,7 @@ SELECT
     s.stxname AS stats_object,
     s.stxkeys AS column_indexes,
     pg_catalog.pg_get_statisticsobjdef_columns(s.oid) AS columns,
-    s.stxkind AS kinds,  -- 'd'=dependencies, 'f'=ndistinct, 'm'=mcv, 'e'=expressions
+    s.stxkind AS kinds,  -- 'd'=ndistinct, 'f'=dependencies, 'm'=mcv, 'e'=expressions
     sd.last_analyze
 FROM pg_statistic_ext s
 JOIN pg_class c ON c.oid = s.stxrelid
@@ -573,23 +581,23 @@ Use this on inherited schemas to inventory existing extended-stats objects, iden
 
 ## Gotchas / Anti-patterns
 
-1. **pg_upgrade does NOT preserve stats on PG≤17.** Verbatim PG17 docs: *"Because optimizer statistics are not transferred by `pg_upgrade`, you will be instructed to run a command to regenerate that information at the end of the upgrade."*[^pg17-pgupgrade] Run `vacuumdb --analyze-in-stages` after every major upgrade. On PG18+ pg_upgrade DOES preserve per-column stats but still NOT extended stats — re-run ANALYZE manually on tables with `CREATE STATISTICS` objects.
+1. **pg_upgrade does not preserve optimizer statistics on PG≤17.** On PG18, most optimizer statistics transfer, but extended, extension-provided, and cumulative statistics do not. Run both PG18 post-upgrade `vacuumdb` commands in Recipe 11.[^pg17-pgupgrade]
 
-2. **`ANALYZE` is sample-based and inherently approximate.** Even at `default_statistics_target = 10000`, the sample is 300,000 rows per relation. For a billion-row table this is 0.03%. The `n_distinct` for high-cardinality columns will be wildly off; use the `ALTER TABLE ... ALTER COLUMN ... SET (n_distinct = ...)` override.
+2. **`ANALYZE` uses a sample and its estimates are approximate.** Sample size depends on the table and statistics targets. Consider a higher target or an `n_distinct` override only after measuring a persistent estimate error.
 
 3. **Per-column statistics assume column independence.** `WHERE a = 'x' AND b = 'y'` selectivity is calculated as `sel(a) × sel(b)`, which is wrong when columns are correlated. Use extended statistics with `dependencies` and/or `mcv` kinds.
 
 4. **`default_statistics_target` cluster-wide changes affect every ANALYZE.** Raising it from 100 → 1000 makes ANALYZE 10× slower (sample size grows linearly) on every table. Use per-column overrides instead.
 
-5. **`SET STATISTICS 0` on a column disables statistics collection.** Useful for write-only audit columns where the planner never needs stats. But `0` means "no MCV or histogram" — only the basic null_frac, avg_width, n_distinct get collected.
+5. **`SET STATISTICS 0` disables collection for a column.** `ANALYZE` skips the column, so its existing statistics stop updating and go stale as the data changes.
 
-6. **Extended statistics on expressions did not exist before PG14.** Before PG14, `CREATE STATISTICS ... ON (lower(email), country) FROM users` errored. The workaround was a functional index — which also provides stats but adds storage cost.
+6. **Extended statistics on expressions did not exist before PG14.** Before PG14, `CREATE STATISTICS ... ON (lower(email)), country FROM users` errored. The workaround was a functional index — which also provides stats but adds storage cost.
 
 7. **`pg_stats` view filters MCV/histogram by SELECT privilege.** A role that can't SELECT a column will see NULL in `most_common_vals` and `histogram_bounds` for that column. This is a security feature, not a bug — the underlying `pg_statistic` catalog requires the role to have privileges on each column it wants to inspect statistics for.
 
 8. **Statistics-target sampling for extended statistics is per-statistics-object, not per-column.** `ALTER STATISTICS ... SET STATISTICS N` overrides the sample size for THIS extended-statistics object. The per-column targets on the underlying columns are independent and govern only the per-column `pg_statistic` rows.
 
-9. **`reltuples` and `relpages` get accurate values from VACUUM, not ANALYZE.** ANALYZE estimates `reltuples` from its sample (extrapolation) but VACUUM has the exact count after scanning every page. After a major data change, `VACUUM ANALYZE` (not just ANALYZE) gives the planner the most accurate inputs.
+9. **`reltuples` and `relpages` are approximate.** Both VACUUM and ANALYZE update them, often from a partial scan; neither guarantees an exact row count.[^planner-stats]
 
 10. **Autovacuum's analyze trigger uses a 10% scale factor by default.** On a 100M-row table, this means autovacuum waits for 10M+ row changes before re-analyzing. For analytics tables or any table where the data distribution shifts faster than that, set a smaller per-table scale factor (e.g., `autovacuum_analyze_scale_factor = 0.01`).
 
@@ -613,11 +621,11 @@ Use this on inherited schemas to inventory existing extended-stats objects, iden
 
 20. **MCV extended stats has a stats-size limit.** The `mcv` extended statistics kind captures up to `default_statistics_target` MCV entries. For column groups with very high joint cardinality, MCV may not help; in that case, look at `ndistinct` and/or `dependencies` instead.
 
-21. **`CREATE STATISTICS` does NOT auto-include statistics_kinds you didn't specify.** Writing `CREATE STATISTICS s ON (a, b) FROM t` builds all three default kinds. Writing `CREATE STATISTICS s (ndistinct) ON (a, b) FROM t` builds ONLY ndistinct — no dependencies, no mcv. Be explicit when you want a specific kind.
+21. **Explicit statistics kinds restrict what is collected.** `CREATE STATISTICS s ON a, b FROM t` requests all applicable kinds; `CREATE STATISTICS s (ndistinct) ON a, b FROM t` requests only ndistinct.
 
 22. **`DROP STATISTICS` does NOT cascade to dependent views.** Extended statistics objects don't have dependents in the normal sense — they're inputs to the planner, not referenced by queries. Drop them anytime; the worst case is the planner reverts to per-column statistics.
 
-23. **PG18 `pg_upgrade --no-statistics` reverts to the PG≤17 behavior of dropping stats.** Use it only when you specifically want the destination cluster to start with fresh ANALYZE. Otherwise prefer the new default (statistics preserved) — it eliminates the largest source of post-upgrade query-plan regression.
+23. **PG18 `pg_upgrade --no-statistics` disables statistics transfer.** Even with the default transfer, follow both post-upgrade ANALYZE steps to fill missing and refresh cumulative statistics.
 
 ## See Also
 
@@ -635,7 +643,7 @@ Use this on inherited schemas to inventory existing extended-stats objects, iden
 
 ## Sources
 
-[^planner-stats]: PostgreSQL 16 documentation, "Statistics Used by the Planner". https://www.postgresql.org/docs/16/planner-stats.html — *"Entries in `pg_statistic` are updated by the `ANALYZE` and `VACUUM ANALYZE` commands, and are always approximate even when freshly updated."*
+[^planner-stats]: PostgreSQL 16 documentation, "Statistics Used by the Planner". https://www.postgresql.org/docs/16/planner-stats.html — *"Entries in `pg_statistic` are updated by the `ANALYZE` and `VACUUM ANALYZE` commands, and are always approximate even when freshly updated."* The sample size of 300 rows per unit of statistics target is set in `std_typanalyze()` in `src/backend/commands/analyze.c`.
 
 [^pg-stats-view]: PostgreSQL 16 documentation, "pg_stats" system view. https://www.postgresql.org/docs/16/view-pg-stats.html — *"The view `pg_stats` provides access to the information stored in the `pg_statistic` catalog."*
 
@@ -664,7 +672,5 @@ Use this on inherited schemas to inventory existing extended-stats objects, iden
 [^pg18-pgupgrade-stats]: PostgreSQL 18 release notes, Section E.4.3.7.2 pg_upgrade. https://www.postgresql.org/docs/release/18.0/ — *"Allow pg_upgrade to preserve optimizer statistics (Corey Huinker, Jeff Davis, Nathan Bossart). Extended statistics are not preserved. Also add pg_upgrade option `--no-statistics` to disable statistics preservation."*
 
 [^pg18-stats-functions]: PostgreSQL 18 release notes, Section E.4.3.2 Utility Commands. https://www.postgresql.org/docs/release/18.0/ — *"Add functions to modify per-relation and per-column optimizer statistics (Corey Huinker). The functions are `pg_restore_relation_stats()`, `pg_restore_attribute_stats()`, `pg_clear_relation_stats()`, and `pg_clear_attribute_stats()`."*
-
-[^pg16-pgupgrade]: PostgreSQL 16 documentation, pg_upgrade reference. https://www.postgresql.org/docs/16/pgupgrade.html — *"Because optimizer statistics are not transferred by `pg_upgrade`, you will be instructed to run a command to regenerate that information at the end of the upgrade."*
 
 [^pg17-pgupgrade]: PostgreSQL 17 documentation, pg_upgrade reference. https://www.postgresql.org/docs/17/pgupgrade.html — *"Because optimizer statistics are not transferred by `pg_upgrade`, you will be instructed to run a command to regenerate that information at the end of the upgrade."* — (this language is unchanged from PG16; preservation lands in PG18, not PG17)

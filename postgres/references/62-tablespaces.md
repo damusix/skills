@@ -53,7 +53,7 @@ Five rules cover almost every tablespace question:
 
 4. **`default_tablespace` and `temp_tablespaces` are per-session/per-role GUCs that decide where *new* objects go.** Existing objects do not move on their own. The empty string for `default_tablespace` means "use the database's default tablespace" (`pg_default` unless `CREATE DATABASE ... TABLESPACE` overrode it).[^runtime-config-client]
 
-5. **Tablespaces complicate backups significantly.** They are *not* an autonomous collection of data files. The cluster's main data directory holds the metadata that points at them; the tablespace contents alone are useless without it. Backup tools (pgBackRest, Barman, WAL-G) require explicit per-tablespace configuration. **`pg_basebackup` handles tablespaces correctly only when configured to do so explicitly** — the `--tablespace-mapping` option remaps tablespace paths during the backup.[^manage-ag-backup]
+5. **Tablespaces are integral to the cluster and require backup planning.** In plain format, `pg_basebackup` copies external tablespaces to their original absolute paths by default; use `--tablespace-mapping` when target paths must differ. Verify backup and restore procedures for all tablespaces.[^manage-ag-backup]
 
 > [!WARNING] Tablespace location is critical and irreversible state
 > Verbatim from the docs: *"Even though located outside the main PostgreSQL data directory, tablespaces are an integral part of the database cluster and **cannot** be treated as an autonomous collection of data files. They are dependent on metadata contained in the main data directory, and therefore cannot be attached to a different database cluster or backed up individually. Similarly, if you lose a tablespace (file deletion, disk failure, etc.), the database cluster might become unreadable or unable to start."*[^manage-ag-backup]
@@ -124,14 +124,7 @@ Two grammars:
     ALTER TABLESPACE name SET ( tablespace_option = value [, ... ] )
     ALTER TABLESPACE name RESET ( tablespace_option [, ... ] )
 
-`ALTER TABLESPACE` does *not* let you change the filesystem location of an existing tablespace. To move a tablespace, you must:
-
-1. Stop the cluster (or evacuate all its contents).
-2. Move the directory on disk.
-3. Recreate the symlink in `$PGDATA/pg_tblspc/<oid>` to point at the new location.
-4. Restart.
-
-The catalog records the location in `pg_tablespace.spcoptions` and the on-disk symlink, but there is no `ALTER TABLESPACE ... LOCATION` clause. Practical operators evacuate via `ALTER TABLE ... SET TABLESPACE pg_default` and drop the tablespace rather than try to relocate.
+`ALTER TABLESPACE` has no `LOCATION` clause. The SQL-level move is: create a new tablespace, move objects and database defaults into it, verify all databases and dependencies, then drop the empty old tablespace. The docs also allow redefining the symlinks under `$PGDATA/pg_tblspc` by hand with the server stopped, but call it *"not recommended"*.[^manage-ag-symlinks] The path is represented by the on-disk symlink, not `pg_tablespace.spcoptions`.
 
 ### DROP TABLESPACE
 
@@ -383,7 +376,7 @@ You must move every listed object out before the `DROP TABLESPACE` will succeed:
 
 ### Recipe 7: PG14+ online index rebuild onto a different tablespace
 
-    REINDEX (CONCURRENTLY) INDEX idx_orders_user_id TABLESPACE fast_nvme;
+    REINDEX (CONCURRENTLY, TABLESPACE fast_nvme) INDEX idx_orders_user_id;
 
 Pre-PG14 this required `CREATE INDEX CONCURRENTLY ... ON ... TABLESPACE`, then `DROP INDEX CONCURRENTLY` on the old, then rename. PG14 collapsed this into one operation.
 
@@ -405,10 +398,10 @@ If a tablespace has no rows in `spcoptions` (NULL), it inherits the cluster-wide
 
 ### Recipe 9: Move a database's default tablespace
 
-    -- All non-shared, non-pg_global objects in this DB move physically.
+    -- Connect to a different database first. No session may be connected to app.
     ALTER DATABASE app SET TABLESPACE fast_nvme;
 
-This operation takes `ACCESS EXCLUSIVE` on the database — no sessions can be connected. The cluster must be able to write into the target tablespace. On PG18+ with `file_copy_method = clone` and a CoW filesystem, this can be near-instant; otherwise it physically rewrites every file in every relation in the database.
+Only objects in the old database default tablespace move; objects in other tablespaces remain there. The destination must be empty for this database, and the command cannot run in a transaction block. See [ALTER DATABASE](https://www.postgresql.org/docs/16/sql-alterdatabase.html). On PG18+, `file_copy_method = clone` lets the kernel share blocks on copy-on-write file systems instead of rewriting every file, which can make the move much faster.[^pg18-file_copy_method]
 
 ### Recipe 10: Detect tablespace location inside `$PGDATA`
 
@@ -446,7 +439,7 @@ If you want application code to create temp objects in a tablespace, give the ap
 
 ### Recipe 13: pg_basebackup with tablespace remapping
 
-When taking a base backup of a cluster that uses non-default tablespaces, the base backup will fail (or restore to the same path as the source) unless you remap:
+In plain format, unmapped tablespaces are copied to their original absolute paths on the receiving host. Use mappings when paths differ or would collide with the running source:
 
     pg_basebackup \
         --pgdata=/var/lib/pgsql/16/restore \
@@ -456,7 +449,7 @@ When taking a base backup of a cluster that uses non-default tablespaces, the ba
         --checkpoint=fast \
         --progress
 
-Each tablespace's source-side path must be remapped to a target-side path that already exists and is writable by the postgres user. See [84-backup-physical-pitr.md](./84-backup-physical-pitr.md) for the full base-backup walkthrough; this recipe is just the per-tablespace concern.
+Each source path must exactly match the source tablespace location. The mapped target must be an absolute path that does not exist or is empty; the backup user needs permission to create or write it. See [pg_basebackup](https://www.postgresql.org/docs/16/app-pgbasebackup.html).
 
 ### Recipe 14: Find tablespaces with no objects (can be dropped)
 
@@ -472,7 +465,7 @@ Each tablespace's source-side path must be remapped to a target-side path that a
            SELECT 1 FROM pg_database d WHERE d.dattablespace = t.oid
        );
 
-Catches both standalone leftover tablespaces (no `pg_class.reltablespace` rows) AND tablespaces that are still set as a database default (which would prevent `DROP TABLESPACE`).
+This query checks relations only in the current database, plus cluster-wide database defaults. Repeat the relation check in every database before concluding the tablespace is empty; `DROP TABLESPACE` is the final authority.
 
 ## Gotchas / Anti-patterns
 
@@ -494,9 +487,9 @@ Catches both standalone leftover tablespaces (no `pg_class.reltablespace` rows) 
 
 9. **`CREATE TABLESPACE` and `DROP TABLESPACE` cannot run in transaction blocks.** Verbatim from the docs.[^create-tablespace] This means migration frameworks must be configured to disable wrapping these in a transaction (Rails' `disable_ddl_transaction!`, Alembic's `transactional_ddl: False`).
 
-10. **You cannot change a tablespace's location with `ALTER TABLESPACE`.** There is no `ALTER TABLESPACE name LOCATION` clause. To relocate, you must evacuate (ALTER ... SET TABLESPACE), drop, and recreate — or stop the cluster and move on disk.
+10. **You cannot change a tablespace's location with `ALTER TABLESPACE`.** There is no `ALTER TABLESPACE name LOCATION` clause. To relocate, evacuate (ALTER ... SET TABLESPACE), drop, and recreate. Stopping the cluster and redefining the `pg_tblspc` symlink by hand is possible but not recommended.[^manage-ag-symlinks]
 
-11. **Backup tools require explicit per-tablespace configuration.** `pg_basebackup`'s `--tablespace-mapping` rewrites paths; pgBackRest's `tablespace-map` does the same in `pgbackrest.conf`; Barman handles it via `tablespace_bandwidth_limit` and per-tablespace knobs. If you forget, restored clusters may fail to start or land tablespaces in unexpected locations. See [84-backup-physical-pitr.md](./84-backup-physical-pitr.md).
+11. **Plan tablespace restore paths explicitly.** Plain-format `pg_basebackup` defaults to the original absolute paths; use `--tablespace-mapping` when necessary and verify the restore with your chosen backup tool.
 
 12. **Tablespace symlinks live in `$PGDATA/pg_tblspc/<oid>`.** If you copy `$PGDATA` to a new host without also copying the tablespace directories *and* recreating the symlinks, the new cluster will not start.
 
@@ -589,6 +582,8 @@ If your deployment target is uncertain or may move between self-hosted and manag
 ## Sources
 
 [^manage-ag]: PostgreSQL 16 documentation, "Tablespaces". https://www.postgresql.org/docs/16/manage-ag-tablespaces.html — verbatim: *"Tablespaces allow database administrators to define locations in the file system where the files representing database objects can be stored."* Also: *"`pg_global`, used for shared system catalogs. `pg_default`, the default tablespace of the `template1` and `template0` databases (and therefore the default for other databases as well, unless overridden)."*
+
+[^manage-ag-symlinks]: PostgreSQL 16 documentation, "Tablespaces". https://www.postgresql.org/docs/16/manage-ag-tablespaces.html — verbatim: *"Although not recommended, it is possible to adjust the tablespace layout by hand by redefining these links. Under no circumstances perform this operation while the server is running."*
 
 [^manage-ag-backup]: PostgreSQL 16 documentation, "Tablespaces". https://www.postgresql.org/docs/16/manage-ag-tablespaces.html — verbatim: *"Even though located outside the main PostgreSQL data directory, tablespaces are an integral part of the database cluster and cannot be treated as an autonomous collection of data files. They are dependent on metadata contained in the main data directory, and therefore cannot be attached to a different database cluster or backed up individually."*
 

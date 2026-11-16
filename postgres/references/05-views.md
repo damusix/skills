@@ -40,20 +40,16 @@ Load this file when the question involves views, materialized views, updatabilit
 
 A regular view is a relation with **no storage** and one `ON SELECT DO INSTEAD` rewrite rule (conventionally named `_RETURN`). At query-rewrite time the planner substitutes the view's SELECT into the calling query tree.[^rules-views]
 
-That's why this:
+For example:
 
     CREATE VIEW myview AS SELECT * FROM mytab;
 
-is internally equivalent to:
-
-    CREATE TABLE myview (/* same column list as mytab */);
-    CREATE RULE "_RETURN" AS ON SELECT TO myview DO INSTEAD
-        SELECT * FROM mytab;
+PostgreSQL creates the internal `_RETURN` rule automatically; PG16 no longer permits creating a view manually via an `ON SELECT` rule.
 
 Two consequences fall out of this design:
 
 1. Views compose: a view over a view over a table flattens at rewrite, so the planner sees the full query tree and can optimize across all the layers.
-2. Predicates pushed against the view typically pass *through* the view into the base table — unless you turn that off explicitly with `security_barrier` (see below).
+2. Predicates can pass through a view into the base table. `security_barrier` constrains evaluation order for potentially leaky predicates, while leakproof predicates can still be pushed down.
 
 The full mechanics live in [52-rules-system.md](./52-rules-system.md). For day-to-day use, what matters is that **a view does not add a hard optimization fence** — the way `MATERIALIZED` in a CTE does (see [04-ctes.md](./04-ctes.md)).
 
@@ -89,7 +85,7 @@ Three boolean/enum options are supported in `WITH ( ... )`:[^create-view]
 | Option | Type | Default | Purpose |
 |---|---|---|---|
 | `check_option` | `local` / `cascaded` | (off) | Enforce that INSERT/UPDATE through the view cannot produce rows that the view's WHERE would hide |
-| `security_barrier` | boolean | `false` | Block predicate push-down through the view so leaky functions can't see filtered-out rows |
+| `security_barrier` | boolean | `false` | Prevent leaky user predicates from seeing rows rejected by the view; leakproof predicates may be pushed down |
 | `security_invoker` | boolean | `false` (PG15+) | Run base-table access checks against the **invoker's** privileges, not the view owner's |
 
 #### `security_barrier` — protecting from "leaky" functions
@@ -208,7 +204,7 @@ A view is **automatically updatable** by simple INSERT/UPDATE/DELETE if **all** 
 2. No `WITH`, `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, or `OFFSET` at the top level.
 3. No set operations (`UNION`, `INTERSECT`, `EXCEPT`).
 4. No aggregates, window functions, or set-returning functions in the select list.
-5. Every output column references exactly one column of the underlying base relation. Expressions in the select list are not updatable (you can still SELECT through such a view; you just can't UPDATE that column).
+5. Individual output columns are writable only when they reference an updatable base column directly; expression columns are read-only.
 
 When the conditions hold, the rewriter translates DML on the view directly into DML on the base relation. Privileges on the view and on the base table are both checked (unless `security_invoker` is off and the owner has rights — see above).
 
@@ -261,7 +257,7 @@ On an updatable view, `WITH CHECK OPTION` forces inserted or updated rows to sat
         SELECT * FROM comedies WHERE classification = 'PG'
         WITH CASCADED CHECK OPTION;
 
-`LOCAL` checks only the immediate view's WHERE. `CASCADED` (which is the default if you write `WITH CHECK OPTION` with no qualifier) checks this view's WHERE **and** the WHEREs of every underlying base view that also has the check.[^create-view]
+`LOCAL` checks the immediate view and honors any checks already specified by underlying views. `CASCADED` checks this view and all underlying base views, whether or not those views specify a check option; trigger- and rule-updatable views have exceptions.[^create-view]
 
 Equivalent option form:
 
@@ -321,7 +317,7 @@ Comparison to a regular view:
 `WITH NO DATA` creates the matview empty and **unscannable** — querying it errors until you run `REFRESH MATERIALIZED VIEW`. Useful when:
 
 - You want to define a complex matview without paying for population at create time (e.g., during a migration).
-- You'll be loading it via a different process (truncate-and-insert).
+- You plan to populate it later with `REFRESH MATERIALIZED VIEW`.
 
 > [!NOTE] PostgreSQL 18
 > `COPY TO` can now copy from a populated materialized view, not just from tables or queries.[^pg18-copy-matview] If you've been doing `COPY (SELECT * FROM mv) TO ...` as a workaround, you can drop the wrapper.
@@ -366,7 +362,7 @@ Always create the unique index before scheduling concurrent refreshes:
 
 `WITH NO DATA` on a refresh **discards** the existing rows and leaves the matview unscannable until the next refresh repopulates it. Storage is freed. Useful for shedding stale rows before a known-long rebuild on a maintenance window.
 
-There is **no automatic refresh** in core PostgreSQL. Schedule it with a cron job, with [pg_cron](./98-pg-cron.md), with an event trigger that watches base-table writes, or with the application. The dedicated section in [98-pg-cron.md](./98-pg-cron.md) shows the scheduling recipe.
+There is **no automatic refresh** in core PostgreSQL. Schedule it with a cron job, with [pg_cron](./98-pg-cron.md), or with the application. Event triggers do not watch ordinary table writes.
 
 
 ### Lock-level summary
@@ -421,7 +417,7 @@ Goal: a view that's just a readability alias (column rename, simple subset). The
 Now `SELECT FROM reports_by_customer` requires the caller to hold `SELECT` on both the view *and* `reports`. The view owner being a superuser doesn't magically grant access.
 
 > [!NOTE] PostgreSQL 15
-> Required version for `security_invoker`. Earlier majors silently use the owner's privileges.[^pg15-security-invoker]
+> Required version for `security_invoker`. Earlier majors reject this view option.
 
 
 ### Recipe 3 — An updatable view that filters out soft-deleted rows
@@ -520,6 +516,7 @@ To schedule, use [pg_cron](./98-pg-cron.md):
 ### Recipe 6 — Layered views for tenant isolation (combine RLS, security_barrier, view)
 
 
+    -- Illustration only: a user-settable GUC is not a secure tenant identity.
     -- Base table with RLS policies.
     ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
     CREATE POLICY invoices_tenant ON invoices
@@ -535,7 +532,7 @@ To schedule, use [pg_cron](./98-pg-cron.md):
 
     GRANT SELECT ON invoice_summary TO app_user;
 
-The RLS policy on `invoices` enforces tenant isolation; `security_invoker` makes the policy evaluate under the caller's role; `security_barrier` prevents the optimizer from giving up isolation in exchange for a faster plan.
+The caller also needs SELECT on the underlying relations. This policy is not a tenant-isolation boundary for untrusted SQL users: they can set the custom `app.tenant_id` setting themselves. Derive tenant identity from a trusted, non-spoofable source before using this pattern for isolation.
 
 Full RLS mechanics are in [47-row-level-security.md](./47-row-level-security.md).
 
@@ -572,32 +569,7 @@ If you're refreshing many matviews, wrap them in a procedure and call it from `p
 
 Goal: skip the refresh if base data hasn't changed.
 
-    CREATE OR REPLACE FUNCTION refresh_if_stale(mv_name text, source_table text)
-        RETURNS void LANGUAGE plpgsql AS
-    $$
-    DECLARE
-        last_mv_refresh   timestamptz;
-        last_source_write timestamptz;
-    BEGIN
-        SELECT GREATEST(last_vacuum, last_autovacuum, last_analyze, last_autoanalyze)
-            INTO last_source_write
-            FROM pg_stat_user_tables
-            WHERE schemaname || '.' || relname = source_table;
-
-        -- Track last refresh in a side table; left as an exercise (see below).
-        SELECT refreshed_at INTO last_mv_refresh
-            FROM mv_refresh_log WHERE mv = mv_name;
-
-        IF last_mv_refresh IS NULL OR last_mv_refresh < last_source_write THEN
-            EXECUTE format('REFRESH MATERIALIZED VIEW CONCURRENTLY %I', mv_name);
-            INSERT INTO mv_refresh_log (mv, refreshed_at)
-                VALUES (mv_name, clock_timestamp())
-                ON CONFLICT (mv) DO UPDATE SET refreshed_at = EXCLUDED.refreshed_at;
-        END IF;
-    END;
-    $$;
-
-The freshness signal here is approximate (uses stats updates). For a robust system, track explicit "last write" timestamps on the base table with a trigger.
+Vacuum and analyze timestamps in `pg_stat_user_tables` are not last-write timestamps. They can remain unchanged after writes, so they cannot establish freshness. Track source changes transactionally, for example with an application-maintained version or a trigger-maintained dirty marker, and coordinate its reset with the refresh. Otherwise refresh on a schedule.
 
 
 ## Gotchas / Anti-patterns
@@ -607,7 +579,7 @@ The freshness signal here is approximate (uses stats updates). For a robust syst
 
 2. **`CREATE OR REPLACE VIEW` is column-shape-rigid.** You can't drop, reorder, or rename existing output columns; can't change their types; (PG15+) can't change their collations.[^pg15-view-collation] To restructure a view, drop it and recreate — but `RESTRICT` will block the drop if anything depends on it. You'll either need to cascade (and rebuild downstream objects) or stage the change behind a temporary alias.
 
-3. **`security_barrier` blocks optimization.** Predicates can't be pushed past it. A `SELECT … WHERE id = 42` against a barrier view scans the view's full underlying rowset, then filters. If you don't actually need the security guarantee — for instance, the view is only there for readability — *don't* set the barrier.[^rules-privileges] The cost is real.
+3. **`security_barrier` constrains optimization.** Non-leakproof predicates cannot be evaluated before the view's security conditions; leakproof predicates may still be pushed down. Measure the plan rather than assuming a full scan.[^rules-privileges]
 
 4. **`security_invoker = true` doesn't help you bridge privileges.** A common mental model error: setting `security_invoker = true` and expecting the view to *expand* the caller's permissions. It does the opposite — the caller now needs the base-table privileges *too*.
 
@@ -625,13 +597,13 @@ The freshness signal here is approximate (uses stats updates). For a robust syst
 
 11. **Matviews lose `ORDER BY` of the defining query.** Refresh doesn't preserve order. If the consumer needs an order, add an `ORDER BY` to the consumer's query or build an index that the consumer can scan in order.[^refresh-matview]
 
-12. **No DML on a matview.** You cannot `INSERT`/`UPDATE`/`DELETE` against a matview. `TRUNCATE` is also not a substitute for `REFRESH` — it empties the matview but leaves it unqueryable until a `REFRESH MATERIALIZED VIEW` repopulates it. To populate or replace rows, use `REFRESH` or `DROP+CREATE`.
+12. **No DML on a matview.** You cannot `INSERT`, `UPDATE`, `DELETE`, or `TRUNCATE` a materialized view. Use `REFRESH` or `DROP` and recreate it.
 
 13. **Matview is not automatically refreshed when the base table changes.** Stale data is the user's responsibility. Common patterns: per-write triggers that mark dirty + scheduled refresh; `pg_cron` periodic refresh; debounced refresh on idle.
 
-14. **`pg_dump` includes matview definitions but never their data.**[^pgdump-matview-defaults] After a logical restore, every matview is unscannable until you `REFRESH MATERIALIZED VIEW` it — a base-table restore plus a matview-refresh pass is the runbook. Physical backups (`pg_basebackup`, PITR) restore the matview's stored heap normally because they're file-level. Plan for the difference: see [83-backup-pg-dump.md](./83-backup-pg-dump.md) and [84-backup-physical-pitr.md](./84-backup-physical-pitr.md).
+14. **Logical dumps repopulate materialized views by refresh, not by copying their stored rows.** A normal full dump includes refresh commands for populated matviews; selective or schema-only dumps can omit them. Restore dependencies and check population status, then refresh as necessary. Physical backups restore the stored heap.[^pgdump-matview-defaults]
 
-15. **The view's owner matters.** Default access goes through the owner's privileges. If the owner is later dropped, the view becomes useless and queries against it fail. Use a dedicated role for view ownership (e.g., a service account that other roles inherit from), not a personal account.
+15. **The view's owner matters.** Default access uses the owner's privileges on underlying objects. PostgreSQL refuses to drop a role that still owns objects; reassign or drop them first. Use a dedicated role for view ownership, not a personal account.
 
 16. **You can't add an index to a view.** Only matviews and tables can be indexed. If you find yourself wishing for a view index, you actually want a materialized view (or to index the base table).
 
@@ -685,7 +657,7 @@ The freshness signal here is approximate (uses stats updates). For a robust syst
 
 [^pg18-copy-matview]: PostgreSQL 18 Release Notes. "Allow `COPY TO` to copy rows from populated materialized views (Jian He)." https://www.postgresql.org/docs/release/18.0/
 
-[^pgdump-matview-defaults]: PostgreSQL 16 — *pg_dump*. Documents `--table` behavior: *"As well as tables, this option can be used to dump the definition of matching views, materialized views, foreign tables, and sequences. It will not dump the contents of views or materialized views."* The restored matview is empty (equivalent to `WITH NO DATA`) and requires `REFRESH MATERIALIZED VIEW` after restore. https://www.postgresql.org/docs/16/app-pgdump.html
+[^pgdump-matview-defaults]: PostgreSQL 16 `pg_dump` documents selective `--table` behavior: https://www.postgresql.org/docs/16/app-pgdump.html. Normal dump refresh generation is in https://github.com/postgres/postgres/blob/REL_16_STABLE/src/bin/pg_dump/pg_dump.c.
 
 
 [^minor-18-7]: PostgreSQL 18.7 release notes (2026-11-12). <https://www.postgresql.org/docs/release/18.7/>

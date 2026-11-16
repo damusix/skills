@@ -433,9 +433,9 @@ vacuum_buffer_usage_limit = '32MB'   # cluster-wide, also applies to autovacuum
 Linux hugepage reservation (one-time, via `/etc/sysctl.d/40-postgres-hugepages.conf`):
 
 ```ini
-# 16 GB of 2 MB hugepages = 8192 pages
-# Add ~5% headroom for shared memory areas beyond shared_buffers
-vm.nr_hugepages = 8400
+# <N> = output of `postgres -D "$PGDATA" -C shared_memory_size_in_huge_pages`
+# (run with the server stopped, PG15+), plus operational headroom.
+vm.nr_hugepages = <N>
 ```
 
 After reboot, verify:
@@ -463,6 +463,7 @@ SELECT n.nspname || '.' || c.relname AS relation,
        round(avg(b.usagecount), 2)    AS avg_usagecount
 FROM   pg_buffercache b
 JOIN   pg_class c ON b.relfilenode = pg_relation_filenode(c.oid)
+                  AND b.reldatabase IN (0, (SELECT oid FROM pg_database WHERE datname = current_database()))
 JOIN   pg_namespace n ON c.relnamespace = n.oid
 WHERE  c.relkind IN ('r', 'i', 'm', 't', 'p')
 GROUP  BY n.nspname, c.relname
@@ -470,7 +471,7 @@ ORDER  BY buffers DESC
 LIMIT  20;
 ```
 
-The `pg_buffercache` view is expensive at scale (one row per buffer). Always wrap it in an aggregation; never `SELECT *` it raw on a multi-gigabyte pool.
+`pg_buffercache` scans shared buffers; aggregation reduces result volume, not the cost of scanning the buffer pool. The query above restricts database identity, but filenode collisions across tablespaces and forks can still misattribute buffers; include tablespace and fork when exact attribution matters.[^pgbuffercache]
 
 ### Recipe 3 — diagnose "is bgwriter falling behind?" (PG≤16)
 
@@ -478,8 +479,6 @@ The `pg_buffercache` view is expensive at scale (one row per buffer). Always wra
 SELECT  buffers_alloc,
         buffers_backend,
         buffers_clean,
-        round(100.0 * buffers_backend / NULLIF(buffers_alloc, 0), 2) AS pct_backend,
-        round(100.0 * buffers_clean   / NULLIF(buffers_alloc, 0), 2) AS pct_clean,
         maxwritten_clean,
         stats_reset
 FROM    pg_stat_bgwriter;
@@ -487,9 +486,9 @@ FROM    pg_stat_bgwriter;
 
 Interpretation:
 
-- `pct_backend > 5%` — backends are writing dirty buffers because the bgwriter can't keep up. Raise `bgwriter_lru_maxpages` (e.g., 500 → 1000), lower `bgwriter_delay` (e.g., 200ms → 100ms), or raise `bgwriter_lru_multiplier` (2.0 → 4.0).
+- Compare interval deltas of `buffers_backend`, `buffers_clean`, and `buffers_alloc` alongside workload context. These count different events, so their ratios are not a fraction of a common total and cannot alone establish bgwriter saturation.[^monitoring-stats]
 - `maxwritten_clean` growing — the bgwriter is hitting its per-round write cap (`bgwriter_lru_maxpages`). Raise it.
-- `pct_clean` very low (e.g., <10%) AND `pct_backend` very low — bgwriter is barely running, possibly because the workload doesn't dirty pages fast enough or the pool is mostly clean.
+- `buffers_clean` barely moving over a busy interval — the bgwriter is writing little, either because the pool stays mostly clean or because `bgwriter_lru_multiplier` and `bgwriter_lru_maxpages` keep it from getting ahead of allocations.
 
 ### Recipe 4 — diagnose "is bgwriter falling behind?" (PG17+)
 
@@ -512,10 +511,10 @@ SELECT  num_timed, num_requested, buffers_written, write_time, stats_reset
 FROM    pg_stat_checkpointer;
 ```
 
-### Recipe 5 — per-relation I/O via pg_stat_io (PG16+)
+### Recipe 5 — I/O by backend, context, and object (PG16+)
 
 ```sql
--- Bulk read traffic by relation kind
+-- Cluster-wide I/O categories, not individual relations
 SELECT  backend_type,
         context,
         object,
@@ -558,7 +557,7 @@ VACUUM (BUFFER_USAGE_LIMIT '64MB', VERBOSE) my_big_table;
 VACUUM (BUFFER_USAGE_LIMIT 0, VERBOSE) my_big_table;
 ```
 
-The `BUFFER_USAGE_LIMIT 0` form is appropriate when you *want* the vacuum to evict cold data to make room for the table you're vacuuming (e.g., a one-off vacuum of a critical table). Combined with `PARALLEL n`, this is the fastest way to vacuum a large table during a maintenance window.
+`BUFFER_USAGE_LIMIT 0` permits vacuum to use the normal shared pool; benchmark the cache impact and runtime before using it. `PARALLEL` controls eligible index vacuum work and does not guarantee the fastest run.[^vacuum-buffer-usage]
 
 ### Recipe 8 — pre-PG17 audit query for backend writes
 
@@ -699,7 +698,7 @@ A clean COPY shows almost all writes/extends in `context = bulkwrite` with high 
 
 20. **`pg_aios` shows file handles, not queries**[^pg18-aio]. To map an AIO operation to a query, join against `pg_stat_activity` via `pid` and read the `query` column.
 
-21. **High `usagecount_avg` (close to 5) means the working set is larger than `shared_buffers`.** If `pg_buffercache_usage_counts()` shows almost everything at 4 or 5, your buffers are constantly being re-accessed before clock-sweep can decrement them — raise `shared_buffers` until you see a healthy spread across usage counts.
+21. **High average usage count alone does not measure working-set size.** Interpret usage counts with miss rates and workload observations; frequently reused pages can remain hot whether the working set fits or exceeds the cache.[^pgbuffercache]
 
 22. **Cache hit ratio is a misleading metric.** A 99.9% hit ratio can mean "tiny working set, pool overprovisioned" or "perfect cache fit." It can also mean "a few small lookup tables dominate the metric while the actual large-table queries miss." Use `pg_stat_io` and `pg_buffercache` aggregations to make actionable decisions.
 

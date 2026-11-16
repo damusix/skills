@@ -35,7 +35,7 @@ Do **not** load this file for: scalar equality + range + sort on common types (u
 
 Five rules that should drive every decision in this file.
 
-1. **BRIN summarizes block ranges, it does not list values.** Each BRIN index entry covers `pages_per_range` heap pages (default 128 = 1 MB of heap per index entry). The index is *tiny* — often 0.01% of heap size — and the query path is "consult summary, then bitmap-scan the candidate ranges from heap." Cost is index-creation O(table), index-write near-zero, query bounded by the summary's selectivity. BRIN is **useless on uncorrelated data** — see gotcha #1.
+1. **BRIN summarizes block ranges, it does not list values.** Each BRIN index entry covers `pages_per_range` heap pages (default 128). Minmax works best with local correlation; BRIN bloom can support equality searches even on uncorrelated values.[^pg14-bloom]
 
 2. **Hash is a niche choice, but a real one.** Hash indexes have been WAL-logged and crash-safe since PG10[^pg10-hash]; the old "do not use hash indexes" folklore is obsolete. They store *only the 4-byte hash code*[^hash-32bit], which makes them dramatically smaller than B-tree for very long keys (UUIDs as text, URLs, S3 keys, hashes). They support only `=`[^hash-equality] and are single-column only[^hash-singlecol]. Pick B-tree by default; pick hash deliberately when the index size win dominates.
 
@@ -66,7 +66,7 @@ Twelve rows mapping a workload shape to the recommended access method. Rows are 
 
 Three smell signals for wrong access method:
 
-- **BRIN on uncorrelated data.** If `pg_stats.correlation` for the column is near zero, BRIN gives a tiny index that selects ~the whole table — you've gained nothing. The fix is usually `CLUSTER` (one-shot reorder) plus rethinking the schema, or pick a different index type.
+- **BRIN minmax on data without useful local correlation.** Its ranges may cover much of the value domain. Check representative plans and consider `minmax_multi`, BRIN bloom for equality, or another index.
 - **Hash for "I want a faster index than B-tree."** Hash is almost never *faster*. Its only structural advantage is *size* on long keys. If your keys are short, B-tree wins.
 - **Bloom as a default multi-column index.** Bloom is the *last resort* when the query pattern is genuinely arbitrary-combination. If you know which two or three columns dominate the predicates, build a multicolumn B-tree leading with the most selective columns.
 
@@ -78,7 +78,7 @@ Three smell signals for wrong access method:
 
 > *"BRIN works in terms of _block ranges_ (or 'page ranges'). A block range is a group of pages that are physically adjacent in the table; for each block range, some summary info is stored by the index."*[^brin-intro]
 
-The summary depends on the opclass. For `minmax`, it's `(min, max)`. For `minmax_multi`, it's up to 32 representative `(min, max)` pairs. For `bloom`, it's a Bloom filter over the values in the range. For `inclusion`, it's a bounding box / supernet that contains all values.
+The summary depends on the opclass. For `minmax`, it's `(min, max)`. For `minmax_multi`, it stores multiple values and ranges, with a default budget of 32 values per range. For `bloom`, it's a Bloom filter over the values in the range. For `inclusion`, it's a bounding box or supernet.
 
 ### Query Mechanics
 
@@ -104,7 +104,7 @@ Default `pages_per_range = 128` means each index entry covers 128 × 8 KB = 1 MB
 
 > *"`autosummarize` (`boolean`) — Defines whether a summarization run is queued for the previous page range whenever an insertion is detected on the next one. The default is `off`."*[^createindex-pageranges]
 
-**The `autosummarize = off` default is the single biggest BRIN footgun on append-only workloads.** Without it, fresh inserts never get summarized until you (or autovacuum on the table) explicitly call `brin_summarize_new_values`. Queries for "the last hour" will fall back to scanning the unsummarized portion of the heap — meaning the most-queried data is the data BRIN is currently useless for.
+With `autosummarize = off`, newly created ranges remain unsummarized until regular vacuum or an explicit summarization call processes them. Queries must scan unsummarized ranges, reducing selectivity.
 
 The maintenance functions[^brin-functions]:
 
@@ -123,8 +123,8 @@ Four families. The relevant ones[^brin-opclasses]:
 | Family | When | Built-in scalar/inet types |
 | --- | --- | --- |
 | **`*_minmax_ops`** (default) | Append-mostly with strong physical correlation. One `(min, max)` per range. | `int2`/`4`/`8`, `float4`/`8`, `numeric`, `text`, `bpchar`, `bytea`, `date`, `time`/`timetz`, `timestamp`/`timestamptz`, `interval`, `inet`, `macaddr`/`macaddr8`, `oid`, `pg_lsn`, `tid`, `uuid`, `bit`, `varbit`, `char`, `name` |
-| **`*_minmax_multi_ops`** (PG14+)[^pg14-minmax-multi] | Mostly-monotone with occasional reorder/outliers. Up to 32 representative `(min, max)` pairs per range; tune with `values_per_range` (default 32, 8–256). | All numeric / temporal / network / pg_lsn / tid / uuid scalar types (see Sources for full list). |
-| **`*_bloom_ops`** (PG14+)[^pg14-bloom] | Equality lookup on data that isn't physically correlated. Each range stores a small Bloom filter. Tune with `n_distinct_per_range` (default `-0.1`) and `false_positive_rate` (default `0.01`, range 0.0001 to 0.25). | All the same scalar / temporal / network types as minmax, plus inet, but NOT `text` minmax: text supports bloom and minmax. |
+| **`*_minmax_multi_ops`** (PG14+)[^pg14-minmax-multi] | Mostly-monotone with occasional reorder/outliers. `values_per_range` sets a budget of stored values (default 32, 8–256), not a count of min/max pairs. | Numeric, temporal, network and other supported scalar types. |
+| **`*_bloom_ops`** (PG14+)[^pg14-bloom] | Equality lookup on data that isn't physically correlated. Each range stores a Bloom filter. Tune `n_distinct_per_range` (default `-0.1`, 10% of the maximum tuples per range, minimum 16) and `false_positive_rate` (default `0.01`, range 0.0001 to 0.25). | Supported scalar types include text and inet; consult the operator-class table for the complete list.[^brin-opclasses] |
 | **`*_inclusion_ops`** | Range/box/inet types where a single "bounding" value contains all per-range values. | `box`, `inet`, `anyrange`. |
 
 > [!NOTE] PostgreSQL 14
@@ -137,7 +137,7 @@ Four families. The relevant ones[^brin-opclasses]:
 > *"Allow HOT updates if only BRIN-indexed columns are updated."*[^pg16-brin-hot] — This makes BRIN dramatically cheaper on hot rows: previously any update to an indexed column broke HOT; now BRIN-only-column updates remain HOT, preserving the heap-only-tuple fast path. Cross-reference [`30-hot-updates.md`](./30-hot-updates.md).
 
 > [!NOTE] PostgreSQL 17
-> *"Allow BRIN indexes to be created using parallel workers (Tomas Vondra, Matthias van de Meent)."*[^pg17-brin-parallel] — Controlled by `max_parallel_maintenance_workers`. CREATE INDEX CONCURRENTLY still does not parallelize.
+> *"Allow BRIN indexes to be created using parallel workers (Tomas Vondra, Matthias van de Meent)."*[^pg17-brin-parallel] Concurrent builds can parallelize the first scan.
 
 ### BRIN Tuning Knobs
 
@@ -167,7 +167,7 @@ Because the column value isn't in the index, every hash lookup is *lossy*[^hash-
 
 > *"The absence of the column value also makes all hash index scans lossy."*[^hash-lossy]
 
-So EXPLAIN reports `Bitmap Index Scan` + `Recheck Cond:` for hash, same shape as BRIN.
+The executor must recheck hash matches. The planner can choose an ordinary index scan or a bitmap scan.
 
 ### Restrictions
 
@@ -340,7 +340,7 @@ Look for `Bitmap Index Scan on events_2026_05_created_at_brin` + `Bitmap Heap Sc
 
 ### Recipe 2 — Verify correlation before reaching for BRIN
 
-BRIN is useless on uncorrelated data. Check `pg_stats.correlation` first:
+For minmax BRIN, inspect physical correlation first; local range distribution also matters. Bloom BRIN can support equality on uncorrelated data.
 
     ANALYZE events_2026_05;
 
@@ -371,7 +371,7 @@ Sensor data ingested mostly in order, but with occasional out-of-order arrivals 
         USING brin (recorded_at timestamptz_minmax_multi_ops (values_per_range = 64))
         WITH (pages_per_range = 64, autosummarize = on);
 
-The `values_per_range = 64` doubles the per-entry storage but holds twice as many `(min, max)` pairs per range, dramatically improving selectivity when outliers exist.
+Increasing `values_per_range` increases the summary's value budget and can improve selectivity for outliers, at the cost of a larger summary.
 
 ### Recipe 4 — BRIN bloom for equality on uncorrelated data (PG14+)
 
@@ -531,7 +531,7 @@ Watch progress live:
            round(100.0 * blocks_done / NULLIF(blocks_total, 0), 1) AS pct
     FROM pg_stat_progress_create_index;
 
-CREATE INDEX CONCURRENTLY does **not** parallelize, even on PG17+ — same restriction as B-tree and GIN.
+On access methods that support parallel builds, `CREATE INDEX CONCURRENTLY` can parallelize its first scan; validation is not parallel.
 
 ### Recipe 13 — Inventory the non-default access methods in your database
 
@@ -557,7 +557,7 @@ Useful before a planned PG-major upgrade or as a baseline before a tuning pass.
 
 ## Gotchas / Anti-patterns
 
-1. **BRIN on uncorrelated data is functionally a no-op.** The summary `(min, max)` per range covers the entire data range, so the planner has to read every range. Confirm `pg_stats.correlation > 0.5` (preferably `> 0.9`) on the indexed column before creating BRIN. The fix is `CLUSTER` (one-shot heap reorder, takes ACCESS EXCLUSIVE) or rethinking the table's physical layout.
+1. **BRIN minmax can be ineffective on uncorrelated data.** If most block ranges span the query value, little can be skipped. Check actual plans; BRIN bloom is a separate option for equality.
 
 2. **`autosummarize = off` is the silent BRIN footgun.** Default is `off`. Fresh appends never get summarized until you call `brin_summarize_new_values` or autovacuum runs. Set `autosummarize = on` for append-only workloads (see §Summarization and autosummarize above).
 
@@ -587,7 +587,7 @@ Useful before a planned PG-major upgrade or as a baseline before a tuning pass.
 
 15. **Bloom requires the `bloom` extension.** *"`bloom` provides an index access method based on Bloom filters."*[^bloom-intro] — it's a contrib extension. Run `CREATE EXTENSION bloom;` before `CREATE INDEX … USING bloom`. Most managed providers ship it in the allowlist; self-hosted requires the `postgresql-contrib` package.
 
-16. **CREATE INDEX CONCURRENTLY does not parallelize for any of these access methods.** PG17 added parallel BRIN build, but only via the non-CONCURRENTLY path. For online builds on a production table, expect significantly longer index-build times. Plan maintenance windows accordingly.
+16. **Parallel concurrent builds have limits.** Supported access methods can parallelize the first scan, not concurrent validation. Worker availability and the planner's cost model also affect parallelism.
 
 17. **BRIN indexes with `pages_per_range` too small approach B-tree size.** The whole point of BRIN is "tiny index, lossy bitmap scan." If you set `pages_per_range = 4` (32 KB heap per entry) on a 1 GB table, you have ~32k index entries — comparable to a B-tree's leaf count for that table. Pick `pages_per_range` to match your typical query selectivity, not your row count.
 

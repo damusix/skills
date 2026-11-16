@@ -59,7 +59,7 @@ Use this file when you need an audit trail of what users did inside the database
 
 - **You are running pgaudit + a row-level trigger + logical replication for the same audit requirement.** Pick one: pgaudit for statement audit, trigger-into-audit-table for row deltas, logical replication for CDC. Running all three triples the write amplification and produces three sources of truth that drift.
 - **Your audit log is the same file as your error log and there is no log shipping.** That violates every compliance framework's tamper-evident-log requirement. Audit logs must ship to an immutable store outside the database server. Configure `log_destination = jsonlog` + filebeat/fluent-bit to an S3-with-object-lock or equivalent.
-- **You enabled `pgaudit.log = 'all'` in production "to be safe."** Expect log volume to multiply 50–500× depending on workload, disk to fill, and the audit log itself to become the bottleneck. Scope down to `pgaudit.log = 'ddl,role,write'` or use object auditing.
+- **You enabled `pgaudit.log = 'all'` in production without measuring.** Audit output can be very large and fill the log filesystem. Measure a representative workload and scope auditing to the requirements.
 
 ## Installing pgaudit
 
@@ -119,7 +119,7 @@ ALTER ROLE webapp SET pgaudit.log = 'read, write';
 ALTER DATABASE prod SET pgaudit.log = 'ddl, role';
 ```
 
-**Scope precedence** (highest wins): session `SET pgaudit.log = ...` → role-level `ALTER ROLE ... SET` → database-level `ALTER DATABASE ... SET` → cluster `ALTER SYSTEM SET` / `postgresql.conf`. **Per-role and per-database overrides are how production deployments scope volume** — a cluster-wide `'all'` is rarely the right choice.
+**Scope precedence** follows PostgreSQL configuration rules (highest wins): session `SET` → `ALTER ROLE ... IN DATABASE ... SET` → `ALTER ROLE ... SET` → `ALTER DATABASE ... SET` → `ALTER SYSTEM` / `postgresql.conf`. See [`53-server-configuration.md`](./53-server-configuration.md#precedence-order). Role/database defaults apply at login, and pgAudit settings may be modified only by a superuser. `SET ROLE` does not reapply role defaults. Create the extension in each audited database before setting `pgaudit.log` so DDL object details are available.[^pgaudit-readme]
 
 > [!WARNING] log_client + log_level coupling
 > Setting `pgaudit.log_level = 'warning'` without also setting `pgaudit.log_client = on` is silently a no-op. The level setting only takes effect when audit messages are visible to the client. The default (`log_client = off`, `log_level = log`) sends audit to the server log at `LOG` level, which is correct for compliance use.[^pgaudit-readme]
@@ -228,12 +228,12 @@ Because pgaudit emits via `ereport()`, every audit line is governed by your stan
 | `log_rotation_size` | `10MB` | Rotate when the current file reaches N kilobytes. |
 | `log_truncate_on_rotation` | `off` | If `on`, an existing same-named file is truncated rather than appended — useful for round-robin daily logs. |
 | `log_line_prefix` | `'%m [%p] '` | Prefix prepended to every log line. Set to include `%u`, `%d`, `%a`, `%h` for audit correlation. |
-| `log_min_messages` | `WARNING` | Minimum severity to record. Must be `LOG` or lower to capture pgaudit's default `pgaudit.log_level = log`. |
+| `log_min_messages` | `WARNING` | The default includes `LOG`; `FATAL` or `PANIC` suppresses pgAudit's default log messages. |
 | `log_connections` | `off` | Logs every new connection — pgaudit does **not** cover this; enable separately. |
 | `log_disconnections` | `off` | Logs session-end. Audit-relevant for session-duration correlation. |
 
 > [!NOTE] PostgreSQL 15 — jsonlog
-> PG15 added `log_destination = 'jsonlog'`, producing structured JSON log lines. pgaudit emits its CSV-formatted body as a single string inside the JSON `message` field — the audit fields are not separately parsed into JSON keys. Downstream SIEM parsers must split the message field on commas to extract pgaudit columns. Combine with `csvlog` simultaneously (`log_destination = 'stderr,csvlog,jsonlog'`) if you need both formats during a transition.
+> PG15 added `log_destination = 'jsonlog'`, producing structured JSON log lines. pgAudit's CSV-formatted body is a string inside the JSON `message` field. Parse the body with a CSV parser, not a naive comma split: SQL and parameters can contain commas and quotes.
 
 ## PG-Version Compatibility Matrix
 
@@ -292,10 +292,9 @@ log_line_prefix         = '%m [%p] %q%u@%d/%a '
 # Capture authentication (pgaudit does NOT do this)
 log_connections         = on
 log_disconnections      = on
-log_min_messages        = LOG                  # required so pgaudit's default LOG-level entries appear
+log_min_messages        = WARNING              # default includes LOG messages
 
 # pgaudit: session-level for DDL/ROLE/WRITE; object-level for PII reads
-pgaudit.log             = 'ddl, role, write'
 pgaudit.role            = 'pii_auditor'
 pgaudit.log_parameter   = on
 pgaudit.log_parameter_max_size = 4096          # truncate huge JSON params
@@ -304,6 +303,13 @@ pgaudit.log_statement_once = on                # one statement-text per stmt, no
 ```
 
 ```sql
+-- After restarting with the library preloaded, run in each audited database:
+CREATE EXTENSION pgaudit;
+
+-- Then, once for the whole cluster, enable session auditing:
+ALTER SYSTEM SET pgaudit.log = 'ddl, role, write';
+SELECT pg_reload_conf();
+
 -- One-time PII auditor role setup
 CREATE ROLE pii_auditor;
 GRANT SELECT, INSERT, UPDATE, DELETE ON customers     TO pii_auditor;
@@ -393,7 +399,7 @@ tail -100 /var/lib/postgresql/18/data/log/postgresql-*.log | grep AUDIT
 If you see no `AUDIT:` lines:
 1. `SHOW shared_preload_libraries` — must contain `pgaudit`.
 2. `SHOW pgaudit.log` — must be non-empty.
-3. `SHOW log_min_messages` — must be `LOG` or lower (default `WARNING` filters out pgaudit's `LOG`-level entries).
+3. `SHOW log_min_messages` — `WARNING` includes `LOG`; check that the threshold is not `FATAL` or `PANIC`.
 4. `SHOW logging_collector` — must be `on` if you expect `log_directory`/`log_filename` files.
 
 ### Recipe 6 — Object audit with multiple departments
@@ -408,7 +414,7 @@ CREATE ROLE master_auditor  NOLOGIN;
 
 GRANT finance_auditor, hr_auditor, engineering_auditor TO master_auditor;
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON ledger_*  TO finance_auditor;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ledger TO finance_auditor;
 GRANT SELECT, INSERT, UPDATE, DELETE ON employee  TO hr_auditor;
 GRANT SELECT, INSERT, UPDATE, DELETE ON code_repo TO engineering_auditor;
 
@@ -433,26 +439,7 @@ Now `UPDATE customers SET ssn = $1 WHERE id = $2` is audited with the actual SSN
 
 ### Recipe 8 — Log shipping to immutable storage
 
-Audit logs must reside on tamper-evident storage outside the cluster. Filebeat to S3 with object-lock is one canonical pattern:
-
-```yaml
-# /etc/filebeat/filebeat.yml
-filebeat.inputs:
-  - type: log
-    enabled: true
-    paths:
-      - /var/lib/postgresql/18/data/log/postgresql-*.log.json
-    json.keys_under_root: true
-    json.add_error_key: true
-    fields:
-      log_type: pgaudit
-output.s3:
-  bucket: pgaudit-immutable-2026
-  region: us-east-1
-  encryption: AES256
-  storage_class: GLACIER
-  # Bucket configured with Object Lock + Compliance retention 7 years
-```
+Ship collected PostgreSQL logs to a separately administered, tamper-evident destination using a supported log-forwarder and destination configuration. Verify delivery, retention, access controls, and behavior during destination outages before relying on it for audit evidence. PostgreSQL's logging collector does not guarantee durable storage after a crash.[^pg-logging-runtime]
 
 For high-volume clusters, route to OpenSearch / Splunk / Datadog with a daily roll-up to S3.
 
@@ -516,10 +503,11 @@ Combine with [`46-roles-privileges.md`](./46-roles-privileges.md) Recipe 1 (`ALT
 Audit `pg_stat_statements` for an hour, then estimate:
 
 ```sql
--- Total statements per second
-SELECT round(sum(calls) / EXTRACT(EPOCH FROM now() - stats_reset)) AS qps
-FROM pg_stat_statements ss, pg_stat_database d
-WHERE d.datname = current_database();
+-- Estimate average calls per second over the pg_stat_statements reset interval.
+-- This is cumulative, not a measurement of a specific recent hour.
+SELECT round(sum(calls) / NULLIF(EXTRACT(EPOCH FROM
+    now() - (SELECT stats_reset FROM pg_stat_statements_info)), 0)) AS qps
+FROM pg_stat_statements;
 
 -- Estimate audit log volume (rough)
 -- Average audit line: ~200 bytes for short statements, ~500–2000 bytes with parameters
@@ -545,11 +533,11 @@ COMMIT;
 
 1. **pgaudit is not in core.** PostgreSQL ships no auditing functionality. `https://www.postgresql.org/docs/current/auditing.html` returns 404. If your team or vendor claims "PostgreSQL audit is built in," they are wrong; either pgaudit or a comparable third-party tool must be installed.
 
-2. **Missing `shared_preload_libraries = 'pgaudit'` → silent no-op.** Without preloading, `CREATE EXTENSION pgaudit` succeeds and `SHOW pgaudit.log` returns the configured value, but **no audit entries are emitted**. Always verify with `SHOW shared_preload_libraries`.
+2. **Missing `shared_preload_libraries = 'pgaudit'` prevents pgAudit from loading.** The extension reports an error at load time; verify the preload setting and restart after changing it.[^pgaudit-readme]
 
 3. **`pgaudit.log_client = off` (default) + `pgaudit.log_level = warning` is silently a no-op.** The level setting only applies when audit messages flow to clients. Leave both at defaults for production.
 
-4. **`log_min_messages = WARNING` (default) hides pgaudit's `LOG`-level entries.** pgaudit defaults to logging at `LOG` severity, which is *below* `WARNING`. Without lowering `log_min_messages` to `LOG`, the server filters audit lines out before they reach `log_destination`.
+4. **`log_min_messages = WARNING` includes `LOG` messages.** PostgreSQL ranks `LOG` above `ERROR` for server logging. Raising the threshold to `FATAL` or `PANIC` can suppress audit entries.[^pg-logging-runtime]
 
 5. **Object auditing covers only SELECT/INSERT/UPDATE/DELETE.** Verbatim: *"Only SELECT, INSERT, UPDATE and DELETE commands are supported."*[^pgaudit-readme] Object auditing does not capture TRUNCATE, COPY, DDL, or function calls. For those, combine with session auditing (`pgaudit.log = 'ddl, role, function'`).
 
@@ -557,7 +545,7 @@ COMMIT;
 
 7. **pgaudit does not capture row-level deltas.** Statement-level only. A `DELETE FROM customers` audited with `pgaudit.log = 'write'` produces one log line per statement; it does **not** log the rows deleted. For row-level capture use triggers writing to an audit table, or logical replication.
 
-8. **`pgaudit.log = 'all'` on a busy OLTP cluster fills disk.** Expect 50–500× log-volume amplification depending on QPS. Use object auditing or per-role scoping in production.
+8. **`pgaudit.log = 'all'` on a busy OLTP cluster can fill disk.** Measure representative audit volume and provision retention and shipping accordingly.
 
 9. **Per-role `ALTER ROLE ... SET pgaudit.log` does not propagate across pgBouncer transaction-mode pools.** Backend connections reuse across user identities; `SET ROLE` does not re-apply per-role GUCs (cross-reference [`46-roles-privileges.md`](./46-roles-privileges.md) gotcha #6). Behind transaction-mode poolers, configure pgaudit at the cluster or per-database level instead.
 
@@ -567,7 +555,7 @@ COMMIT;
 
 12. **Audit log lines appear in *both* `stderr` and `csvlog`/`jsonlog`** when `log_destination = 'stderr,csvlog,jsonlog'`. This is correct for transition periods but doubles log-disk usage. Pick one final-form destination.
 
-13. **`jsonlog` (PG15+) embeds pgaudit's CSV body in the `message` field as a single string.** SIEM parsers must split the message field on commas — pgaudit fields are not separately parsed into JSON keys. If your SIEM cannot parse nested CSV-in-JSON cleanly, use `csvlog` instead.
+13. **`jsonlog` (PG15+) embeds pgAudit's CSV body in the `message` field.** Use a CSV parser that handles quoted commas and quotes; audit fields are not separate JSON keys.
 
 14. **`%L` (client IP) in `log_line_prefix` is PG18-only.** Pre-PG18, use `%h` (host name) or `%r` (host + port). The `%L` escape was added in PG18 per the verbatim release-note quote.[^pg18-logging]
 
@@ -611,5 +599,5 @@ COMMIT;
 [^pg15-logging]: PostgreSQL 15.0 release notes, Server-side languages and logging section. Verbatim: *"Add support for jsonlog log output (Sehrope Sarkuni). This logs in a parsable JSON format."* https://www.postgresql.org/docs/release/15.0/
 [^pg17-logging]: PostgreSQL 17.0 release notes, Server section. Verbatim: *"Add log_connections log line for trust connections (Jacob Champion)."* https://www.postgresql.org/docs/release/17.0/
 [^pg18-logging]: PostgreSQL 18.0 release notes, Server section. Verbatim quotes: *"Add log_line_prefix escape `%L` to output the client IP address (Greg Sabino Mullane)."* *"Increase the logging granularity of server variable log_connections (Melanie Plageman)... This server variable was previously only boolean, which is still supported."* *"Add log_connections option to report the duration of connection stages (Melanie Plageman)."* *"Add server variable log_lock_failures to log lock acquisition failures (Yuki Seino, Fujii Masao). Specifically it reports SELECT ... NOWAIT lock failures."* https://www.postgresql.org/docs/release/18.0/
-[^pg-logging-runtime]: PostgreSQL 16 documentation, runtime configuration logging chapter. Verbatim default values and behavior for `log_destination` (*"PostgreSQL supports several methods for logging server messages, including stderr, csvlog, jsonlog, and syslog. On Windows, eventlog is also supported... The default is to log to stderr only."*), `log_statement` (*"Valid values are none (off), ddl, mod, and all (all statements)... The default is none."*), `log_min_messages` (*"Valid values are DEBUG5, DEBUG4, DEBUG3, DEBUG2, DEBUG1, INFO, NOTICE, WARNING, ERROR, LOG, FATAL, and PANIC... The default is WARNING."*), `log_min_error_statement`, `log_line_prefix` (*"The default is '%m [%p] ' which logs a time stamp and the process ID."*), `log_rotation_age` (24 hours default) and `log_rotation_size` (10 megabytes default). https://www.postgresql.org/docs/16/runtime-config-logging.html
+[^pg-logging-runtime]: PostgreSQL 16 documentation, runtime configuration logging chapter. Verbatim default values and behavior for `log_destination` (*"PostgreSQL supports several methods for logging server messages, including stderr, csvlog, jsonlog, and syslog. On Windows, eventlog is also supported... The default is to log to stderr only."*), `log_statement` (*"Valid values are none (off), ddl, mod, and all (all statements)... The default is none."*), `log_min_messages` (*"Valid values are DEBUG5, DEBUG4, DEBUG3, DEBUG2, DEBUG1, INFO, NOTICE, WARNING, ERROR, LOG, FATAL, and PANIC... The default is WARNING."*), `log_min_error_statement`, `log_line_prefix` (*"The default is '%m [%p] ' which logs a time stamp and the process ID."*), `log_rotation_age` (24 hours default) and `log_rotation_size` (10 megabytes default). On `logging_collector`: *"The logging collector does not guarantee that log messages have reached durable storage. It can still lose messages due to a system crash, power loss, or an error while writing the log file."* https://www.postgresql.org/docs/16/runtime-config-logging.html
 [^pgaudit-releases]: pgaudit GitHub releases page lists 18.0 (2025-09-24) as the latest stable release and `19rc1` (2026-10-27, https://github.com/pgaudit/pgaudit/releases/tag/19rc1) as a pre-release for PG19 (checked 2026-11-14), with prior majors `17.X`, `16.X`, `1.7.X` (PG15), `1.6.X` (PG14), and `1.5.X` (PG13, unsupported). The versioning-scheme break at PG 16 is documented in the compatibility matrix in the README. https://github.com/pgaudit/pgaudit/releases

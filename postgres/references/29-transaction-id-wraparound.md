@@ -1,6 +1,6 @@
 # Transaction ID Wraparound
 
-PostgreSQL transaction IDs (XIDs) are 32-bit integers. After ~4 billion transactions the counter wraps around to zero, and without preventive maintenance every existing row becomes "in the future" to every reader and the cluster shuts down to protect data. **Autovacuum prevents this automatically; you only see wraparound trouble when autovacuum has been failing for a long time.**
+PostgreSQL transaction IDs (XIDs) use a 32-bit counter. An unfrozen XID becomes unsafe after roughly 2^31 subsequent XIDs, not after the full 2^32 counter cycle. PostgreSQL blocks new XID allocation before that limit to prevent data loss; autovacuum normally advances the freeze horizon before this becomes an emergency.
 
 This file is the dedicated wraparound deep dive. The data-structure side (xmin, xmax, FrozenTransactionId, snapshot construction) lives in [`27-mvcc-internals.md`](./27-mvcc-internals.md); the VACUUM command surface lives in [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md).
 
@@ -48,13 +48,13 @@ Skip this file if you only need the VACUUM command grammar ([`28-vacuum-autovacu
 
 1. **XIDs are 32-bit. The safety margin is ~2 billion transactions, not 4 billion.** Half the XID space is "the past" and half is "the future" of any given reference XID — wraparound becomes catastrophic at 2^31, not 2^32. The docs state it precisely: *"it is necessary to vacuum every table in every database at least once every two billion transactions."*[^routine]
 
-2. **Freezing replaces a tuple's `xmin` with a sentinel.** The sentinel is `FrozenTransactionId` (numeric value 2 — defined in `src/include/access/transam.h`). The docs: *"PostgreSQL reserves a special XID, FrozenTransactionId, which does not follow the normal XID comparison rules and is always considered older than every normal XID."*[^routine] Once a tuple's xmin is frozen, no XID comparison can ever make it "in the future."
+2. **Freezing marks a committed insertion XID as permanently old.** Since PostgreSQL 9.4, tuple-header flags preserve the original `xmin` while treating it as `FrozenTransactionId` (numeric value 2). Freezing does not make a subsequently deleted row visible again.[^routine]
 
-3. **Autovacuum runs anti-wraparound vacuums even when autovacuum is disabled.** The docs are emphatic: *"autovacuum is invoked on any table that might contain unfrozen rows with XIDs older than the age specified by ... `autovacuum_freeze_max_age`. (This will happen even if autovacuum is disabled.)"*[^routine] Setting `autovacuum = off` on a table or cluster-wide does not exempt you.
+3. **Autovacuum runs anti-wraparound vacuums even when autovacuum is disabled.** The docs state: *"autovacuum is invoked on any table that might contain unfrozen rows with XIDs older than the age specified by ... `autovacuum_freeze_max_age`. (This will happen even if autovacuum is disabled.)"*[^routine] Neither cluster-wide `autovacuum = off` nor per-table `autovacuum_enabled = false` exempts a table.
 
-4. **Long-running transactions, abandoned replication slots, stale prepared transactions, and `hot_standby_feedback` from standbys all pin the xmin horizon.** When the horizon cannot advance, VACUUM cannot freeze — even running constantly. No autovacuum-tuning change helps; the operator must find and clear the blocker. Cross-reference [`27-mvcc-internals.md`](./27-mvcc-internals.md) for the five-source enumeration.
+4. **Long-running transactions, replication slots, prepared transactions, and `hot_standby_feedback` can hold back the removal and freeze horizons.** VACUUM can still freeze eligible older tuples, but it cannot advance past the relevant blocker. Identify the retained horizon before changing autovacuum settings. Cross-reference [`27-mvcc-internals.md`](./27-mvcc-internals.md).
 
-5. **Single-user mode is rarely the right answer.** The in-server hint that fires at the hard-stop threshold says *"Stop the postmaster and vacuum that database in single-user mode."* The docs contradict this same hint two paragraphs later: *"Contrary to what the hint states, it is not necessary or desirable to stop the postmaster or enter single user-mode in order to restore normal operation."*[^routine] The right runbook is "VACUUM in normal multi-user mode after killing whatever is holding the horizon back."
+5. **Recover from XID exhaustion with ordinary VACUUM in multi-user mode.** Resolve horizon blockers, then run a database-wide `VACUUM` as a superuser in the affected database. Do not use `FULL` or `FREEZE` for this emergency. Single-user mode disables wraparound safeguards and is reserved here for expert-directed removal of unneeded tables.[^routine]
 
 > [!WARNING] PG18 did NOT introduce 64-bit XIDs.
 > A common misconception in the lead-up to PG18 was that wraparound concerns would become historical. **PostgreSQL 18 is still 32-bit XIDs.** PG18 did improve normal vacuum's ability to opportunistically freeze pages (the new `vacuum_max_eager_freeze_failure_rate` GUC and `pg_class.relallfrozen` column),[^pg18-eager] but the fundamental 2-billion-transaction obligation is unchanged. Plan capacity accordingly.
@@ -65,22 +65,22 @@ Skip this file if you only need the VACUUM command grammar ([`28-vacuum-autovacu
 
 | Situation | Action | Cross-reference |
 |---|---|---|
-| Cluster is healthy, age is well below 200M | Rely on autovacuum, monitor weekly | Recipe 1 |
+| Cluster is healthy, age is well below the configured freeze threshold | Rely on autovacuum; choose monitoring frequency from the XID consumption rate | Recipe 1 |
 | `age(datfrozenxid)` climbing despite autovacuum running | Find the xmin-horizon blocker | Recipe 2, [`27 §xmin-horizon`](./27-mvcc-internals.md#xmin-horizon--the-five-sources) |
 | Hot table has age > 200M and autovacuum can't keep up | Per-table tune `autovacuum_freeze_max_age` lower; raise `autovacuum_vacuum_cost_limit` | Recipe 4 |
-| Approaching 400M (anti-wraparound about to launch) | Schedule a maintenance window to let it complete; do not cancel it | Recipe 6 |
-| Past 1B age, failsafe (1.6B) imminent | Stop conflicting DDL, drop cost throttling, let VACUUM run | Recipe 7 |
-| Warning fires (~40M XIDs left; ~100M on PG19) | Identify largest table by age, manual `VACUUM FREEZE` | Recipe 8 |
-| Hard stop fires (3M XIDs left) | **Do not enter single-user mode** — clear the horizon blocker, then run VACUUM in normal mode | Recipe 9 |
-| Cluster won't start (e.g., wraparound + crash) | Last resort: `pg_resetwal`, then immediately dump/initdb/restore | Recipe 10 |
+| Approaching the configured `autovacuum_freeze_max_age` (default 200M XIDs) | Let anti-wraparound vacuum complete; do not cancel it | Recipe 6 |
+| Past 1B age, failsafe (default 1.6B) approaching | Investigate blockers and let ordinary VACUUM advance the horizon | Recipe 7 |
+| Warning fires (~40M XIDs left; ~100M on PG19) | Resolve blockers and run ordinary database-wide `VACUUM` as superuser | Recipe 8 |
+| Hard stop fires (3M XIDs left) | Keep multi-user mode; resolve blockers, then ordinary `VACUUM`, without `FULL` or `FREEZE` | Recipe 9 |
+| Server cannot start because WAL or `pg_control` is corrupt | Prefer backup recovery; expert-directed `pg_resetwal` is a last-resort salvage tool, not a wraparound repair | Recipe 10 |
 | MultiXact age > 400M | Same procedure as XID, with MultiXact-specific GUCs | Recipe 11 |
 | Pre-emptively freeze a write-once partition | `VACUUM FREEZE` on the leaf during off-hours | Recipe 5, [`28 §VACUUM FREEZE`](./28-vacuum-autovacuum.md#vacuum-freeze-deep-dive) |
 
 Three smell signals for real wraparound risk:
 
-- `last_autovacuum` advances but `age(relfrozenxid)` stays high → xmin horizon held back; autovacuum is running but cannot freeze.
-- Autovacuum log lines show `(to prevent wraparound)` in the activity prefix → anti-wraparound autovacuum is already running and **cannot be cancelled by `lock_timeout` or session statement timeout**.[^routine]
-- Cluster has been up >1 year with default `autovacuum_freeze_max_age = 200M` and you've never seen an anti-wraparound vacuum — almost certainly the horizon is held back.
+- `last_autovacuum` advances but `age(relfrozenxid)` stays high: investigate horizon blockers and whether vacuum scanned all required pages.
+- `(to prevent wraparound)` in `pg_stat_activity` means conflicting lock requests will not automatically cancel that autovacuum. It can still be explicitly canceled; avoid doing so during a wraparound emergency.[^routine]
+- Compare XID age with measured XIDs per second. Server uptime alone does not indicate wraparound risk.
 
 
 ## Syntax / Mechanics
@@ -89,7 +89,7 @@ Three smell signals for real wraparound risk:
 ### The 32-bit XID space
 
 
-Every transaction that writes (or that explicitly assigns an XID via `pg_current_xact_id()`) consumes exactly one 32-bit XID. The counter starts at 3 (values 0, 1, 2 are reserved sentinels) and advances monotonically.
+Writing transactions consume a top-level XID; writing subtransactions can consume additional XIDs. Read-only transactions normally do not allocate one unless an operation such as `pg_current_xact_id()` requests it. Normal XIDs start at 3 and wrap modulo 2^32, skipping reserved values.
 
 XID comparisons use modular-2^32 arithmetic with the *current XID* as the reference point: half the space is treated as "past" and half as "future." This means the practical safety margin is **2^31 transactions ≈ 2.1 billion**, not 2^32.[^routine]
 
@@ -97,7 +97,7 @@ XID comparisons use modular-2^32 arithmetic with the *current XID* as the refere
 |---|---|---|
 | 0 | `InvalidTransactionId` | Used as "no transaction" / NULL in some contexts |
 | 1 | `BootstrapTransactionId` | Set during `initdb` bootstrap |
-| 2 | `FrozenTransactionId` | Always-older-than-everything sentinel — what freezing writes into `t_xmin` |
+| 2 | `FrozenTransactionId` | Always-old insertion sentinel; modern tuples normally preserve `xmin` and use freeze flags |
 | 3..2^32-1 | Normal XIDs | Allocated to writing transactions |
 
 The docs again: *"transaction IDs have limited size (32 bits) a cluster that runs for a long time (more than 4 billion transactions) would suffer transaction ID wraparound: the XID counter wraps around to zero, and all of a sudden transactions that were in the past appear to be in the future ... In short, catastrophic data loss."*[^routine]
@@ -106,7 +106,7 @@ The docs again: *"transaction IDs have limited size (32 bits) a cluster that run
 ### Freezing — FrozenTransactionId sentinel
 
 
-Freezing is the act of writing the `HEAP_XMIN_FROZEN` bit (or setting `t_xmin = 2` in pre-9.4 layouts) on a tuple whose `xmin` is older than `vacuum_freeze_min_age` (default 50M).[^vacuum-freeze-min-age] Once frozen, a tuple is visible to every future transaction forever — the XID is no longer compared.
+Freezing marks an eligible committed insertion XID with `HEAP_XMIN_FROZEN` flags (pre-9.4 versions instead replaced `t_xmin` with 2). `vacuum_freeze_min_age` controls the normal age cutoff. Freezing removes insertion-XID age from future visibility decisions; deletion and locking state still matter.[^routine]
 
 Two ways a tuple becomes frozen:
 
@@ -168,14 +168,14 @@ PostgreSQL has *three* freeze-age thresholds. They escalate in aggression as the
 | GUC | Default | Effect | Verbatim docs |
 |---|---|---|---|
 | `vacuum_freeze_min_age` | 50,000,000 | Minimum XID age before a tuple becomes *eligible* for freezing during a routine vacuum | *"Specifies the cutoff age (in transactions) that VACUUM should use to decide whether to freeze row versions while scanning a table"*[^vacuum-freeze-min-age] |
-| `vacuum_freeze_table_age` | 150,000,000 | When `age(relfrozenxid) > this`, the next VACUUM is *aggressive* (scans every page, including all-visible) | *"VACUUM performs an aggressive scan if the table's pg_class.relfrozenxid field has reached the age specified by this setting"*[^vacuum-freeze-table-age] |
+| `vacuum_freeze_table_age` | 150,000,000 | At this age, VACUUM uses an aggressive scan of pages not already all-frozen, including all-visible pages | *"VACUUM performs an aggressive scan if the table's pg_class.relfrozenxid field has reached the age specified by this setting"*[^vacuum-freeze-table-age] |
 | `autovacuum_freeze_max_age` | 200,000,000 | When `age(relfrozenxid) > this`, autovacuum forces an anti-wraparound vacuum **even if autovacuum is disabled** | *"Specifies the maximum age (in transactions) that a table's pg_class.relfrozenxid field can attain before a VACUUM operation is forced to prevent transaction ID wraparound within the table"*[^autovacuum-freeze-max-age] |
 
 Important silent-capping rules from the docs:
 
 - `vacuum_freeze_min_age` is *silently limited to half the value of `autovacuum_freeze_max_age`*.[^vacuum-freeze-min-age] So if you raise `autovacuum_freeze_max_age` to 1B but leave `vacuum_freeze_min_age` at 50M, that's fine; if you set `vacuum_freeze_min_age` to 500M without raising `autovacuum_freeze_max_age`, it caps at 100M effectively.
 - `vacuum_freeze_table_age` is *silently limited to 95% of `autovacuum_freeze_max_age`*.[^vacuum-freeze-table-age] Set them together, not independently.
-- The "can only set smaller" per-table override rule applies to all three (storage parameters override GUCs only when they make freezing *more* eager).[^routine]
+- Per-table freeze **max-age** overrides cannot exceed the system-wide maximum. Min-age and table-age settings have their own effective caps; they are not all governed by a blanket "only smaller" rule.[^per-table-autovac]
 
 
 ### Anti-wraparound autovacuum
@@ -223,7 +223,7 @@ PostgreSQL emits two server-log messages on every transaction allocation when th
 | `age(datfrozenxid) > 2^31 − 40,000,000` (≈40M XIDs left until catastrophe; PG19 starts warning at 100M) | `WARNING: database "mydb" must be vacuumed within N transactions / HINT: To avoid a database shutdown, execute a database-wide VACUUM in that database.`[^routine] |
 | `age(datfrozenxid) > 2^31 − 3,000,000` (3M XIDs left) | `ERROR: database is not accepting commands to avoid wraparound data loss in database "mydb" / HINT: Stop the postmaster and vacuum that database in single-user mode.`[^routine] |
 
-At the hard-stop threshold the database refuses new transactions (XID allocation is blocked). Existing transactions complete, but no new work can start until VACUUM advances `datfrozenxid`.
+At the hard-stop threshold PostgreSQL refuses to assign new XIDs. Existing transactions can continue, and new read-only transactions and ordinary `VACUUM` can still run. This is not a refusal of all connections or commands.[^routine]
 
 **The hint message is misleading.** Docs: *"Contrary to what the hint states, it is not necessary or desirable to stop the postmaster or enter single user-mode in order to restore normal operation."*[^routine] Keep the postmaster running, identify the xmin horizon blocker, clear it, let VACUUM run normally. See Recipe 9 for the runbook.
 
@@ -265,21 +265,21 @@ VACUUM cannot freeze a tuple whose `xmin` is newer than the cluster-wide xmin ho
 |---|---|---|---|
 | Idle-in-transaction session | Long `xact_start`, `state = 'idle in transaction'` | `pg_stat_activity` | `pg_terminate_backend(pid)`; set `idle_in_transaction_session_timeout` |
 | Long-running query | Same session running a single statement for hours | `pg_stat_activity` `state = 'active'` with old `xact_start` | Kill it; set `statement_timeout` |
-| Abandoned replication slot | `pg_replication_slots.xmin` ≪ current XID and slot is `inactive` | `pg_replication_slots` | `pg_drop_replication_slot(slot_name)` if confirmed orphan; set `max_slot_wal_keep_size` |
-| Stale prepared transaction | `pg_prepared_xacts` row that's been there for hours/days | `pg_prepared_xacts` | `ROLLBACK PREPARED 'gid'`; set `max_prepared_transactions = 0` if you don't use 2PC |
+| Abandoned replication slot | Old `xmin` or `catalog_xmin`, often an inactive slot | `pg_replication_slots` | Drop only after confirming the consumer is retired or accepting that it may need rebuilding; a WAL retention cap does not directly bound XID age |
+| Stale prepared transaction | Old `transaction` in `pg_prepared_xacts` | `pg_prepared_xacts` | Ask the transaction coordinator whether to `COMMIT PREPARED` or `ROLLBACK PREPARED`; do not guess the distributed outcome |
 
 Plus `hot_standby_feedback` from a standby — see [`27 §xmin-horizon`](./27-mvcc-internals.md#xmin-horizon--the-five-sources) for the full enumeration.
 
 The canonical "find the backend holding the horizon back" query (see [`27-mvcc-internals.md`](./27-mvcc-internals.md) Recipe 2):
 
     SELECT pid, datname, usename, application_name,
-           state, backend_xmin,
-           age(backend_xmin) AS xmin_age,
+           state, backend_xid, backend_xmin,
+           greatest(age(backend_xid), age(backend_xmin)) AS xid_age,
            now() - xact_start AS running_for,
            query
     FROM pg_stat_activity
-    WHERE backend_xmin IS NOT NULL
-    ORDER BY age(backend_xmin) DESC
+    WHERE backend_xid IS NOT NULL OR backend_xmin IS NOT NULL
+    ORDER BY greatest(age(backend_xid), age(backend_xmin)) DESC
     LIMIT 10;
 
 
@@ -302,7 +302,7 @@ The canonical "find the backend holding the horizon back" query (see [`27-mvcc-i
 ### Recipe 1 — Baseline wraparound monitoring
 
 
-Run weekly (or hourly on high-TPS clusters). Returns the percentage of the safety budget consumed for both XID and MXID.
+Choose the monitoring interval from the measured XID consumption rate and the remaining safety margin. At high throughput, weekly or hourly checks are insufficient.
 
     SELECT datname,
            age(datfrozenxid)                                              AS xid_age,
@@ -316,11 +316,11 @@ Run weekly (or hourly on high-TPS clusters). Returns the percentage of the safet
 
 Alert thresholds (defaults):
 
-- `xid_pct_to_autovac > 50` → autovacuum will fire soon, but no emergency
-- `xid_pct_to_autovac > 90` → anti-wraparound likely already running
-- `xid_pct_to_wraparound > 50` → investigate immediately (over 1 billion age)
-- `xid_pct_to_wraparound > 75` → P1 incident
-- `xid_pct_to_wraparound > 95` → hard-stop imminent; warning messages should already be in the log
+- `xid_pct_to_autovac > 50`: age has consumed half the configured anti-wraparound threshold; no emergency by itself.
+- `xid_pct_to_autovac >= 100`: the relation may be eligible for anti-wraparound vacuum; inspect per-table overrides and worker progress.
+- `xid_pct_to_wraparound > 50`: investigate the high age.
+- `xid_pct_to_wraparound > 75`: prioritize remediation and calculate time remaining at the current XID rate.
+- `xid_pct_to_wraparound > 95`: urgent; PG16 warnings start only around 98.1%, so do not wait for a server warning.
 
 
 ### Recipe 2 — Find the table holding a database back
@@ -354,24 +354,24 @@ Two diagnostic branches from this query:
 Already in [`27 Recipe 2`](./27-mvcc-internals.md), reproduced here for standalone readability:
 
     SELECT pid, datname, usename, application_name,
-           state, backend_xmin,
-           age(backend_xmin) AS xmin_age,
+           state, backend_xid, backend_xmin,
+           greatest(age(backend_xid), age(backend_xmin)) AS oldest_xid_age,
            now() - xact_start AS xact_duration,
            wait_event_type, wait_event,
            left(query, 200) AS query
     FROM pg_stat_activity
-    WHERE backend_xmin IS NOT NULL
-    ORDER BY age(backend_xmin) DESC
+    WHERE backend_xid IS NOT NULL OR backend_xmin IS NOT NULL
+    ORDER BY oldest_xid_age DESC
     LIMIT 10;
 
 Then in parallel:
 
     SELECT slot_name, slot_type, database, active,
            xmin, catalog_xmin,
-           age(coalesce(xmin, catalog_xmin)) AS slot_xmin_age,
+           greatest(age(xmin), age(catalog_xmin)) AS slot_xmin_age,
            pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS wal_retained
     FROM pg_replication_slots
-    ORDER BY age(coalesce(xmin, catalog_xmin)) DESC NULLS LAST;
+    ORDER BY slot_xmin_age DESC NULLS LAST;
 
     SELECT gid, prepared, age(transaction) AS xact_age, owner, database
     FROM pg_prepared_xacts
@@ -390,7 +390,7 @@ For a high-insert-rate table (e.g., 100M+ rows/day), lower `autovacuum_freeze_ma
         autovacuum_vacuum_cost_delay        = 2            -- ms
     );
 
-Per-table values **must be smaller** than the cluster-wide GUC equivalents (the "can only set smaller" rule). Raising per-table requires raising the cluster GUC first.
+The freeze max-age overrides cannot exceed the corresponding cluster-wide maxima. Cost-limit and delay overrides do not have this restriction.[^per-table-autovac]
 
 Verify:
 
@@ -436,35 +436,28 @@ The `phase` column shows the seven phases (initializing / scanning heap / vacuum
 ### Recipe 7 — Failsafe is active: drop the throttle
 
 
-When `age(relfrozenxid) > 1.6B` (or the PG14+ `vacuum_failsafe_age` you've configured), VACUUM already disables cost-based throttling. But manual VACUUM defaults to `vacuum_cost_delay = 0` (no throttling) anyway, so a manual rescue VACUUM is the fastest path:
+At the configured failsafe age, VACUUM disables cost-based delays and skips index cleanup to prioritize freezing. Do not cancel an already progressing anti-wraparound vacuum merely to replace it with a manual one. If manual intervention is needed, connect to the affected database as a superuser and run ordinary VACUUM:
 
-    -- on the offending database, as superuser or table owner
-    SET vacuum_cost_delay = 0;                  -- defensive: should already be 0 for manual
-    SET maintenance_work_mem = '4GB';           -- much bigger than default 64MB
-    VACUUM (FREEZE, PARALLEL 4, VERBOSE) public.huge_table;
+    VACUUM (VERBOSE);
 
 > [!NOTE] PostgreSQL 17+
-> Pre-PG17 VACUUM was silently capped at 1GB of `maintenance_work_mem` regardless of how high you set it.[^pg17-mem] On PG17+ the cap is removed; setting `4GB` for a single-pass vacuum on a 500GB table now actually uses 4GB. Pre-PG17 clusters should not bother setting it above 1GB.
+> Before PG17, VACUUM's dead-tuple identifier storage was capped at 1GB even with larger `maintenance_work_mem`.[^pg17-mem] PG17 removed this cap. A larger budget can reduce repeated index-cleanup cycles, but neither full allocation nor a single pass is guaranteed.
 
 
-### Recipe 8 — Warning level: manual VACUUM FREEZE
+### Recipe 8 — Warning level: ordinary VACUUM
 
 
-When `WARNING: database "X" must be vacuumed within N transactions` fires (~40M XIDs left; ~100M on PG19):
+When `WARNING: database "X" must be vacuumed within N transactions` fires:
 
-1. Verify horizon is moving (Recipe 3). **Do not skip this.** A VACUUM cannot freeze if the horizon is pinned, regardless of how aggressively you run it.
-2. Identify the offending database (the warning message names it).
-3. Connect to that database and freeze the largest-age table first:
+1. Connect to the named database as a superuser so system catalogs are included.
+2. Inspect old prepared transactions, open transactions, and replication slots (Recipe 3). Resolve each with its owner or coordinator; dropping a live consumer's slot can require rebuilding it.
+3. Run ordinary database-wide VACUUM outside a transaction block:
 
-        VACUUM (FREEZE, VERBOSE, PARALLEL 4) ONLY public.events;
+        VACUUM (VERBOSE);
 
-4. Continue in age-descending order until `age(datfrozenxid) < autovacuum_freeze_max_age`.
+4. Monitor `age(datfrozenxid)` and resolve any remaining blockers. Do not use `FULL` or `FREEZE` for emergency recovery: `FULL` needs an XID and `FREEZE` adds work beyond the minimum needed to restore operation.[^routine]
 
-`vacuumdb` from the command line is the parallel alternative:
-
-    vacuumdb --all --freeze --jobs=8 --analyze --verbose
-
-Use `--analyze-in-stages` if you have a tight maintenance window — it does three coarse-to-fine `ANALYZE` passes so the planner has *some* stats early.
+For several affected databases, run the same procedure in each. Targeting the oldest relations can reduce elapsed time, but a database-wide pass is simpler and includes catalogs.
 
 
 ### Recipe 9 — Hard stop level: cluster refusing commands
@@ -473,56 +466,30 @@ Use `--analyze-in-stages` if you have a tight maintenance window — it does thr
 When `ERROR: database is not accepting commands to avoid wraparound data loss` fires:
 
 1. **Do NOT stop the postmaster.** The in-server hint is wrong; the docs themselves contradict it.[^routine]
-2. Connect as superuser (the connection limit is still allowed for superusers up to a small reserve).
-3. Run Recipe 3 to find the xmin-horizon blocker. The hard stop is almost always caused by a stuck blocker, not by autovacuum being too slow.
-4. Clear the blocker:
-   - `SELECT pg_terminate_backend(pid)` for idle-in-transaction sessions
-   - `ROLLBACK PREPARED 'gid'` for stale prepared transactions
-   - `SELECT pg_drop_replication_slot('name')` for abandoned slots (verify orphan first)
-5. Connect to the offending database and run `VACUUM (FREEZE, VERBOSE) ONLY <largest-age-table>;` in age-descending order.
-6. Monitor `age(datfrozenxid)` until it drops below `autovacuum_freeze_max_age`.
-7. Commands accept again automatically as soon as the database's `datfrozenxid` advances past the hard-stop threshold.
+2. Connect as a superuser to the affected database. XID exhaustion does not itself prevent a connection or read-only diagnostics.
+3. Run Recipe 3 to inspect old prepared transactions, `backend_xid`, `backend_xmin`, and slot horizons.
+4. Resolve blockers with their owners. End unneeded sessions, ask the coordinator to decide prepared transactions, and drop only retired slots or slots whose consumers can be rebuilt.
+5. Run `VACUUM (VERBOSE);` outside a transaction block. Do not specify `FULL` or `FREEZE`; `VACUUM (FREEZE)` and `VACUUM FREEZE` request the same extra freezing work.[^routine]
+6. Monitor `age(datfrozenxid)`. New XID allocation resumes once the horizon advances beyond the hard-stop threshold. Then repair autovacuum configuration and monitor continued progress.
 
-**Why not single-user mode?** Three reasons: (a) it requires postmaster shutdown, multiplying downtime; (b) it serializes the whole cluster instead of letting you parallelize across databases; (c) the underlying cause (a stuck horizon-blocker) is the same in both modes and must be cleared either way.
-
-The only scenario where single-user mode is appropriate is *if the postmaster won't start at all* due to other corruption — that's Recipe 10's territory.
+Single-user mode is not needed to run VACUUM here. The manual reserves it for expert-directed `DROP` or `TRUNCATE` of unneeded tables when avoiding their vacuum work is necessary. It requires downtime and disables wraparound safeguards; the remaining XID margin is finite.[^routine]
 
 
 ### Recipe 10 — Last resort: pg_resetwal
 
 
-`pg_resetwal` is the nuclear option, used **only when the server refuses to start** due to control-file corruption, missing WAL, or a wraparound situation so severe that the cluster cannot even open a connection.
+`pg_resetwal` is not a fix for XID exhaustion or a failure to connect. Use it only for expert-directed salvage when WAL or `pg_control` corruption prevents startup and recovery from a valid backup is unavailable. Follow [`88-corruption-recovery.md`](./88-corruption-recovery.md#recipe-8--pg_resetwal-last-resort): stop and isolate the server, preserve the complete cluster including external WAL and tablespaces, inspect a dry run with same-major binaries, salvage into a separate new cluster, and validate the restored data.[^pg-resetwal]
 
-Docs: *"It should be used only as a last resort, when the server will not start due to such corruption."* And: *"After running this command, it should be possible to start the server, but bear in mind that the database might contain inconsistent data due to partially-committed transactions. You should immediately dump your data, run initdb, and restore."*[^pg-resetwal]
+If `pg_control` cannot supply the next XID, the manual's reconstruction rule for a standard build is:
 
-Procedure:
+    next_xid = (numerically_largest_pg_xact_filename_in_hex + 1) * 0x100000
+    largest file 02FB -> 0x02FC * 0x100000 = 0x2FC00000 = 801112064
 
-    # ensure server is stopped
-    pg_ctl -D /var/lib/postgresql/16/main stop -m immediate
+Each standard `pg_xact` segment covers 1,048,576 XIDs (32 pages times 32,768 XIDs per page). A dry-run illustration, **only if `02FB` is actually the numerically largest segment on the stopped salvage copy**, is:
 
-    # back up everything first
-    cp -a /var/lib/postgresql/16/main /backup/main.pre-resetwal
+    pg_resetwal --dry-run -x 0x2FC00000 -D "$PGDATA"
 
-    # examine current control values (do not modify yet)
-    pg_resetwal --dry-run -D /var/lib/postgresql/16/main
-
-    # actually reset (use -f only if dry-run looked reasonable)
-    pg_resetwal -f -D /var/lib/postgresql/16/main
-
-    # start the server
-    pg_ctl -D /var/lib/postgresql/16/main start
-
-    # IMMEDIATELY dump everything
-    pg_dumpall -f /backup/post-resetwal-dump.sql
-
-    # then: rm -rf data dir, initdb, restore the dump
-
-To manually advance the XID counter:
-
-    # the safe value is largest pg_xact filename + 1, multiplied by 1048576 (0x100000)
-    ls /var/lib/postgresql/16/main/pg_xact | tail -1
-    # e.g., if file is 02FB, next safe XID = (0x02FC * 0x100000) = 50069504
-    pg_resetwal -x 50069504 -D /var/lib/postgresql/16/main
+Do not reuse that illustrative value for another cluster, infer the largest segment from unordered `ls` output, or advance the XID counter to bypass wraparound protection. Other damaged control fields may also require reconstruction; a plausible dry run does not establish data consistency.[^pg-resetwal]
 
 **Cross-reference [`88-corruption-recovery.md`](./88-corruption-recovery.md)** for the full corruption-recovery surface — `pg_resetwal` is one tool among several.
 
@@ -530,7 +497,7 @@ To manually advance the XID counter:
 ### Recipe 11 — MultiXact wraparound runbook
 
 
-Same as XID wraparound (Recipes 8 and 9), but using the MultiXact GUCs:
+Use the same ordinary-VACUUM recovery procedure as Recipes 8 and 9, but inspect MultiXact age and its separate thresholds:
 
     -- find which DB is closest to MXID wraparound
     SELECT datname, mxid_age(datminmxid) AS mxid_age
@@ -547,10 +514,12 @@ Same as XID wraparound (Recipes 8 and 9), but using the MultiXact GUCs:
       AND c.relminmxid IS NOT NULL
     ORDER BY mxid_age(c.relminmxid) DESC LIMIT 20;
 
-    -- vacuum with multixact freeze
-    VACUUM (FREEZE, VERBOSE) ONLY public.high_lock_table;
+    -- ordinary vacuum; no FULL or FREEZE during emergency recovery
+    VACUUM (VERBOSE) public.high_lock_table;
 
 Cross-reference [`27 §MultiXact`](./27-mvcc-internals.md#multixact-and-tuple-locking) for what creates MultiXacts. Heavy FK enforcement / heavy `FOR KEY SHARE` workloads are the usual sources.
+
+Replication slots do not directly hold back MultiXact cleanup. Inspect transactions that could be members of old MultiXacts; dropping slots is not the corresponding MXID remedy. MXID exhaustion blocks operations that need new MultiXacts, not necessarily every write.[^routine]
 
 
 ### Recipe 12 — Audit tables with autovacuum disabled
@@ -576,21 +545,22 @@ If a table appears here, either (a) re-enable autovacuum and accept the routine 
 ### Recipe 13 — Capacity planning for a high-TPS cluster
 
 
-On a cluster doing 10,000 write TPS, you consume 10,000 XIDs/second = **864 million XIDs/day**. At default `autovacuum_freeze_max_age = 200M`, anti-wraparound autovacuum fires roughly every 5.5 hours per high-traffic table. Per-table tuning:
+At 10,000 assigned XIDs per second, the cluster consumes 864 million XIDs per day and advances through 200 million XIDs in about 5.6 hours. Measure XID consumption rather than equating it with write TPS: transactions can consume subtransaction IDs, and some operations assign no XID. Age advances cluster-wide, including for idle tables. Budget enough time for freezing before the configured age thresholds:
 
-    -- pick the per-table threshold so anti-wraparound runs on YOUR schedule, not Postgres's
+    -- Inspect cluster settings and restart requirements before tuning.
+    SELECT name, setting, unit, context, pending_restart
+    FROM pg_settings
+    WHERE name IN ('autovacuum_freeze_max_age',
+                   'autovacuum_multixact_freeze_max_age',
+                   'vacuum_failsafe_age', 'vacuum_multixact_failsafe_age');
+
+    -- Example: start freezing this table earlier than the cluster maxima.
     ALTER TABLE public.events SET (
-        autovacuum_freeze_max_age = 1500000000,            -- 1.5B: fire roughly daily
-        autovacuum_multixact_freeze_max_age = 1500000000
+        autovacuum_freeze_max_age = 100000000,
+        autovacuum_multixact_freeze_max_age = 200000000
     );
 
-    -- raise the cluster GUC to allow it
-    ALTER SYSTEM SET autovacuum_freeze_max_age = 1500000000;
-    ALTER SYSTEM SET autovacuum_multixact_freeze_max_age = 1500000000;
-    SELECT pg_reload_conf();
-    -- requires restart for autovacuum_freeze_max_age
-
-**Tradeoff to be aware of**: raising `autovacuum_freeze_max_age` means more pages stay un-frozen for longer, which means each anti-wraparound vacuum has more work. Pair with PG16+ opportunistic freezing or PG18+ eager freezing for the lazy-freeze-during-routine-vacuum recapture.
+Budget enough time for the oldest relations to finish vacuuming before failsafe and hard-stop ages at the measured XID rate. Raising max-age settings reduces that margin; it is not a substitute for adequate vacuum throughput. Both cluster-wide autovacuum freeze max-age settings require a restart on PG16, and larger per-table overrides are ignored until the corresponding cluster maximum permits them.[^autovacuum-freeze-max-age][^autovac-multi-max]
 
 
 ## Gotchas / Anti-patterns
@@ -602,7 +572,7 @@ On a cluster doing 10,000 write TPS, you consume 10,000 XIDs/second = **864 mill
 
 3. **`autovacuum = off` does not exempt you from anti-wraparound autovacuum.** *"This will happen even if autovacuum is disabled."*[^routine] Per-table `autovacuum_enabled = false` has the same exception per the per-table docs.[^per-table-autovac] Disabling autovacuum is at best a delay, never an exemption.
 
-4. **Anti-wraparound autovacuum cannot be cancelled by `lock_timeout` or session statement_timeout.** It will hold its `SHARE UPDATE EXCLUSIVE` lock against blocked DDL indefinitely. If you have DDL planned during a maintenance window, run `SELECT pid FROM pg_stat_activity WHERE query LIKE '%(to prevent wraparound)%'` first and wait for it to finish.
+4. **Anti-wraparound autovacuum is not automatically canceled by conflicting locks.** It can still be explicitly canceled or terminated. A waiting DDL statement's own `lock_timeout` cancels that statement, not the vacuum; do not disable application timeouts on the assumption that they cannot fire.[^routine]
 
 5. **Long-running transactions defeat freeze advancement no matter how aggressively you tune autovacuum.** Without xmin-horizon advancement, no freezing happens. Tuning `autovacuum_freeze_max_age` lower in this state only makes anti-wraparound vacuum run more often *without making progress*. Fix the horizon first.
 
@@ -620,21 +590,21 @@ On a cluster doing 10,000 write TPS, you consume 10,000 XIDs/second = **864 mill
 
 12. **MultiXact members storage can hit ~20GB and trigger wraparound at low MXID age.** *"if the storage occupied by multixacts members exceeds about 10GB, aggressive vacuum scans will occur more often."*[^routine] A cluster with `pg_multixact/members/` directory > 10GB has a problem regardless of `mxid_age()`.
 
-13. **Disabling autovacuum cluster-wide is operationally fatal.** Some shops do this thinking they will "run vacuum manually on a schedule." This is wrong. Without autovacuum, you lose anti-wraparound, freeze advancement, statistics updates, dead-tuple reclamation, and visibility-map maintenance. The right answer is to leave autovacuum on and tune it.
+13. **Disabling routine autovacuum removes automatic reclamation and analysis, not anti-wraparound protection.** Leave it enabled unless deliberate manual maintenance replaces its routine work. Forced anti-wraparound vacuum still runs when `autovacuum` is off.[^routine]
 
-14. **VACUUM FULL during wraparound is doubly wrong.** Verbatim docs: *"Do not use VACUUM FULL in this scenario, because it requires an XID."*[^routine] VACUUM FULL allocates new XIDs as part of rewriting tuples, which moves you closer to wraparound, not further. The same docs note: *"Do not use VACUUM FREEZE either."* The right command in normal operation is plain `VACUUM (FREEZE)` not `VACUUM FREEZE`.
+14. **Use ordinary VACUUM at the wraparound hard stop.** `FULL` requires an XID, while `FREEZE` does more work than recovery needs. `VACUUM FREEZE` and `VACUUM (FREEZE)` are equivalent spellings; neither is the emergency command.[^routine]
 
-15. **`pg_resetwal` discards data integrity.** It clears WAL and resets control file values. Use only when the server won't start; *immediately* `pg_dumpall`, `initdb`, and restore. Do not run DML between `pg_resetwal` and the dump.
+15. **`pg_resetwal` discards data integrity.** It clears WAL and resets control file values. It is not a wraparound fix. Run it only on an isolated salvage copy, with same-major binaries, when WAL or `pg_control` corruption prevents startup and no valid backup exists, then dump and restore into a separate new cluster. See Recipe 10.[^pg-resetwal]
 
-16. **Anti-wraparound autovacuum on a 500GB table can take many hours**. Don't trigger a maintenance window assuming you can pause it. The right strategy is to lower per-table `autovacuum_freeze_max_age` enough that anti-wraparound runs more often (each pass touches fewer pages), or pre-emptively `VACUUM FREEZE` during off-hours.
+16. **Anti-wraparound vacuum on a 500GB table can take many hours.** Allow enough time before age thresholds are reached. Earlier scheduled vacuum or lower per-table freeze ages can spread maintenance over time, but do not guarantee that each pass scans fewer pages.
 
-17. **`pg_xact` filenames are CLOG segments, each covering 32,768 XIDs.** When sized to manually compute a `-x` argument for `pg_resetwal`, the formula in the docs: *"A safe value can be determined by looking for the numerically largest file name in the directory pg_xact ... adding one, and then multiplying by 1048576 (0x100000)."*[^pg-resetwal] The 0x100000 multiplier (not 0x8000) accounts for the segment-and-page layout.
+17. **Do not confuse `pg_xact` pages with segments.** On a standard build a page covers 32,768 XIDs and a segment covers 1,048,576. Reconstructing `pg_resetwal -x` from a segment filename uses `(largest_hex_filename + 1) * 1048576`, not a per-page multiplier. See Recipe 10.[^pg-resetwal]
 
 18. **Idle replicas continue receiving WAL but do not advance the primary's xmin horizon.** Only `hot_standby_feedback = on` connections do that. So a quiescent replica is safe; an analytics replica with feedback enabled is the concern.
 
-19. **`VACUUM FREEZE` against a small subset of tables in a low-age database is fine, but cluster-wide `VACUUMDB --all --freeze` rewrites every page everywhere.** That's a lot of IO. Use Recipe 8 to target only high-age tables, not a blanket `--all --freeze`.
+19. **Pre-emptive FREEZE is maintenance, not hard-stop recovery.** It scans pages not already all-frozen and freezes eligible tuples. It does not necessarily rewrite every page, and even a fully frozen table still needs later horizon bookkeeping as cluster XIDs advance.[^routine]
 
-20. **Templates count.** `pg_database.datfrozenxid` for `template0` and `template1` count toward the cluster-wide minimum. If you have an idle `template0` that's never vacuumed, the cluster horizon won't advance past its frozen-xid. Autovacuum *does* visit `template0` but only when it's enabled (typically yes); verify with `SELECT datname, datallowconn, age(datfrozenxid) FROM pg_database;`. Sometimes operators set `datallowconn = false` on `template0` thinking it locks the template safely — that's correct but autovacuum still needs to visit, which it does as the autovacuum launcher (not as a backend).
+20. **Templates count toward the cluster minimum.** Monitor `datfrozenxid` for `template0` and `template1`. `template0` normally has `datallowconn = false`; autovacuum can still visit it, including forced anti-wraparound work when routine autovacuum is disabled.[^routine]
 
 21. **Warning thresholds changed in PG14.** Verbatim: *"Increase warning time and hard limit before transaction id and multi-transaction wraparound."*[^pg14-warnings] Pre-PG14 clusters had less runway between first warning and hard-stop. If you maintain monitoring built for PG12/PG13, retest alerts on PG14+ — they may fire earlier (more runway = more warning time).
 

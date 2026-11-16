@@ -206,8 +206,7 @@ Implications:
   and seq scan based on the literal value) can be more accurate per call.
 - Catalog DDL between calls is automatically picked up by the next call — no `DISCARD
   PLANS` needed for a function that uses `EXECUTE`.
-- If the *only* thing that varies is the `USING` values, the cost of re-planning is
-  pure overhead. In that case, drop `EXECUTE` and use embedded SQL.
+- If only `USING` values vary, embedded SQL avoids repeated planning. Keep `EXECUTE` when a parameter-specific plan is worth that cost.
 
 ### SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE`
 
@@ -307,9 +306,7 @@ for the catalog joins.
 ### 3. Dynamic `WHERE` with optional filters
 
 
-The injection-safe pattern for "any combination of optional filters" is to build the
-SQL with positional `$N` placeholders, accumulate values in a `text[]`, and pass them
-through `EXECUTE ... USING VARIADIC v_args`.
+Build optional predicates with fixed parameter positions and pass typed arguments through `USING`. PL/pgSQL does not support `USING VARIADIC` to unpack an array.
 
     CREATE FUNCTION search_orders(
         p_owner    text        DEFAULT NULL,
@@ -322,32 +319,22 @@ through `EXECUTE ... USING VARIADIC v_args`.
     LANGUAGE plpgsql AS $$
     DECLARE
         v_sql  text   := 'SELECT * FROM orders WHERE TRUE';
-        v_args text[] := ARRAY[]::text[];
-        v_idx  int    := 0;
         v_dir  text;
     BEGIN
         IF p_owner IS NOT NULL THEN
-            v_idx := v_idx + 1;
-            v_sql := v_sql || format(' AND owner = $%s', v_idx);
-            v_args := v_args || p_owner;
+            v_sql := v_sql || ' AND owner = $1';
         END IF;
 
         IF p_status IS NOT NULL THEN
-            v_idx := v_idx + 1;
-            v_sql := v_sql || format(' AND status = $%s', v_idx);
-            v_args := v_args || p_status;
+            v_sql := v_sql || ' AND status = $2';
         END IF;
 
         IF p_since IS NOT NULL THEN
-            v_idx := v_idx + 1;
-            v_sql := v_sql || format(' AND placed_at >= $%s', v_idx);
-            v_args := v_args || p_since::text;
+            v_sql := v_sql || ' AND placed_at >= $3';
         END IF;
 
         IF p_min_amt IS NOT NULL THEN
-            v_idx := v_idx + 1;
-            v_sql := v_sql || format(' AND total >= $%s', v_idx);
-            v_args := v_args || p_min_amt::text;
+            v_sql := v_sql || ' AND total >= $4';
         END IF;
 
         -- Validate caller-supplied identifier/keyword against an allowlist.
@@ -359,14 +346,14 @@ through `EXECUTE ... USING VARIADIC v_args`.
 
         v_sql := v_sql || format(' ORDER BY %I %s', p_sort_col, v_dir);
 
-        RETURN QUERY EXECUTE v_sql USING VARIADIC v_args;
+        RETURN QUERY EXECUTE v_sql USING p_owner, p_status, p_since, p_min_amt;
     END;
     $$;
 
 Key points:
 
 - The `WHERE TRUE` seed makes every appended predicate a uniform `AND ...`.
-- The accumulated `$N` indices ensure `USING VARIADIC` matches by position.
+- The fixed `$N` positions match the typed expressions in `USING`, including arguments for omitted predicates.
 - Caller-supplied `p_sort_col` is checked against a hardcoded allowlist and then routed
   through `%I` — the allowlist is the actual security boundary; `%I` is defense in
   depth.
@@ -691,16 +678,9 @@ The decision tree from any candidate `EXECUTE`:
    (`FROM tbl`) cannot accept bind parameters. Pre-validate against a hardcoded set and
    substitute as `%s` from that set.
 
-6. **`USING` count mismatch.** If the command string references `$1..$3` but you pass two
-   `USING` expressions, the call fails at execution. When building positional
-   placeholders dynamically (recipe 3), increment `v_idx` *and* append to `v_args` in
-   the same conditional branch so they stay in lockstep.
+6. **`USING` count mismatch.** If the command string references `$3`, the third `USING` expression must be supplied. Keep placeholder positions fixed when predicates are optional.
 
-7. **`SELECT ... INTO ...` inside the dynamic command string.** PL/pgSQL's `INTO` is a
-   modifier on `EXECUTE`, not part of the SQL. Writing `EXECUTE 'SELECT ... INTO foo
-   FROM ...'` will either fail or — worse — create a table named `foo` if your dynamic
-   text accidentally hits the `SELECT INTO` *DDL* form. Always put `INTO` *outside* the
-   string.[^plpgsql-stmts]
+7. **`SELECT ... INTO ...` inside the dynamic command string.** PL/pgSQL does not support this form inside `EXECUTE`; put `INTO` on the `EXECUTE` statement itself. To create a table, use `CREATE TABLE ... AS SELECT`.[^plpgsql-stmts]
 
 8. **Expecting `EXECUTE` to use the prepared-statement plan cache.** It doesn't. Every
    call is replanned. If a dynamic query is on a hot path with fixed text, refactor

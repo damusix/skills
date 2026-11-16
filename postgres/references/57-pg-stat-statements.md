@@ -55,17 +55,17 @@ Five rules drive almost every interaction with `pg_stat_statements`:
 | You want to … | Order by / filter | Avoid | Why |
 |---|---|---|---|
 | Find queries consuming most cumulative time | `ORDER BY total_exec_time DESC` | `ORDER BY mean_exec_time DESC` | Mean misses high-frequency moderate-cost queries that dominate aggregate load |
-| Find p99-tail outliers | `ORDER BY max_exec_time DESC` filter `calls > 100` | `mean_exec_time` alone | `mean` averages out tail latency; `max_exec_time` shows the worst single execution |
+| Find worst observed executions | `ORDER BY max_exec_time DESC` filter `calls > 100` | treating maximum as p99 | pg_stat_statements does not provide percentiles |
 | Find queries spilling to temp files | `WHERE temp_blks_written > 0 ORDER BY temp_blks_written DESC` | guessing from `work_mem` | Temp-block I/O is the direct evidence of `work_mem` undersizing — cross-reference [`54-memory-tuning.md`](./54-memory-tuning.md) Recipe 5 |
 | Find queries emitting most WAL | `ORDER BY wal_bytes DESC` filter `wal_records > 0` | guessing from `INSERT/UPDATE/DELETE` text | `wal_bytes` is the direct measurement; surfaces hot indexed columns and HOT failures — cross-reference [`30-hot-updates.md`](./30-hot-updates.md) |
-| Find queries doing most disk reads | `ORDER BY shared_blks_read DESC` | `shared_blks_hit` alone | `_read` is buffer misses (disk); `_hit` is buffer hits (cache) — `_read` reveals working-set vs `shared_buffers` mismatch |
+| Find queries with shared-buffer misses | `ORDER BY shared_blks_read DESC` | assuming every read reached disk | Reads may be served by the OS cache |
 | Find queries where planning dominates execution | `WHERE total_plan_time > total_exec_time AND track_planning=on` | tracking planning by default | `track_planning=off` by default; turn on only when investigating planning overhead, cross-reference Recipe 8 |
 | Diagnose dealloc pressure | `SELECT dealloc FROM pg_stat_statements_info` | guessing `max` setting | Non-zero `dealloc` means buffer too small; raise `pg_stat_statements.max` and restart |
 | Find JIT-impacted queries (PG15+) | `WHERE jit_functions > 0 ORDER BY jit_generation_time DESC` | global JIT-off as the first fix | JIT columns are per-query; identify the offenders before disabling cluster-wide — cross-reference [`61-jit-compilation.md`](./61-jit-compilation.md) |
 | Reset stats for one query without resetting all | `pg_stat_statements_reset(userid=0, dbid=0, queryid=<id>)` | `pg_stat_statements_reset()` no-args | Three-arg form is per-query; no-args resets everything |
 | Reset only minmax tails (PG17+) | `pg_stat_statements_reset(0, 0, 0, true)` | full reset to clear outliers | `minmax_only=true` PG17+ clears just `min/max_plan_time` and `min/max_exec_time`[^reset-minmax] |
 | Correlate aggregate stats with a running query | join `pg_stat_activity.query_id = pg_stat_statements.queryid` | matching by SQL text | `compute_query_id = auto` (default) populates `pg_stat_activity.query_id` when pg_stat_statements loaded[^compute-query-id] |
-| Compare before/after a deployment | snapshot, change, compare deltas via `stats_since` columns (PG17+) | full reset between deploys | PG17+ `stats_since` lets you compute deltas without resetting[^pg17-stats-since] |
+| Compare before/after a deployment | capture two snapshots and compare full keys | computing deltas from one snapshot | PG17+ `stats_since` helps detect resets, not derive prior counters[^pg17-stats-since] |
 
 Three smell signals to act on before any deep query analysis:
 
@@ -494,6 +494,7 @@ SELECT
     a.query
 FROM pg_stat_activity a
 LEFT JOIN pg_stat_statements s ON s.queryid = a.query_id
+    AND s.userid = a.usesysid AND s.dbid = a.datid AND s.toplevel
 WHERE a.state = 'active'
   AND a.pid != pg_backend_pid()
   AND a.query_start < now() - interval '10 seconds'
@@ -525,34 +526,15 @@ Interpretation tiers:
 - `dealloc_per_hour 10–1000` — buffer undersized by ~2×; raise `pg_stat_statements.max` to 10000 or 20000
 - `dealloc_per_hour > 1000` — severe pressure; raise `max` to 50000 + investigate whether `track_utility = on` is needed (turning it off may be cleaner than raising max indefinitely)
 
-### Recipe 12: Track query stability across deployments (PG17+)
+### Recipe 12: Track query stability across deployments
 
-Pre-PG17 the only delta computation is "snapshot, wait, diff" with two separate snapshots. PG17+ adds per-row `stats_since` and `minmax_stats_since` so you can compute deltas without locking:
-
-```sql
--- PG17+ delta-without-reset pattern
-WITH baseline AS (
-    SELECT queryid, query, calls, total_exec_time, stats_since
-    FROM pg_stat_statements
-)
-SELECT
-    queryid,
-    calls - lag(calls) OVER (PARTITION BY queryid ORDER BY stats_since)
-        AS calls_delta,
-    total_exec_time - lag(total_exec_time) OVER (PARTITION BY queryid ORDER BY stats_since)
-        AS exec_time_delta,
-    substr(query, 1, 100) AS query
-FROM baseline
-WHERE stats_since > now() - interval '1 hour'
-ORDER BY exec_time_delta DESC NULLS LAST
-LIMIT 20;
-```
-
-Pre-PG17 alternative: capture a snapshot before the deploy:
+Capture two snapshots. PG17+ `stats_since` helps detect an entry reset or eviction; it does not contain the previous counters needed to compute a delta.
 
 ```sql
+-- PG17+. On PG16 and earlier, drop stats_since from both statements.
 CREATE TABLE pss_baseline AS
-SELECT queryid, calls, total_exec_time, total_plan_time,
+SELECT userid, dbid, toplevel, queryid, stats_since,
+       calls, total_exec_time, total_plan_time,
        shared_blks_hit, shared_blks_read, wal_bytes,
        now() AS captured_at
 FROM pg_stat_statements;
@@ -560,14 +542,17 @@ FROM pg_stat_statements;
 -- After the deploy + sample period
 SELECT
     s.queryid,
-    s.calls - coalesce(b.calls, 0) AS calls_delta,
-    s.total_exec_time - coalesce(b.total_exec_time, 0) AS exec_delta,
+    s.calls - b.calls AS calls_delta,
+    s.total_exec_time - b.total_exec_time AS exec_delta,
     substr(s.query, 1, 100) AS query
 FROM pg_stat_statements s
-LEFT JOIN pss_baseline b ON b.queryid = s.queryid
-ORDER BY (s.total_exec_time - coalesce(b.total_exec_time, 0)) DESC
+JOIN pss_baseline b USING (userid, dbid, toplevel, queryid, stats_since)
+WHERE s.calls >= b.calls AND s.total_exec_time >= b.total_exec_time
+ORDER BY s.total_exec_time - b.total_exec_time DESC
 LIMIT 20;
 ```
+
+Reject intervals with resets or evictions. Joining on `stats_since` (PG17+) drops every entry that was reset or evicted and re-created since the baseline, because its `stats_since` changes. A counter increase alone cannot prove continuity after an eviction and reappearance.
 
 ### Recipe 13: Find regressed queries after deploy
 
@@ -587,7 +572,7 @@ WITH delta AS (
         b.total_exec_time / nullif(b.calls, 0) AS old_mean_ms,
         s.query
     FROM pg_stat_statements s
-    JOIN pss_before b ON b.queryid = s.queryid
+    JOIN pss_before b USING (userid, dbid, toplevel, queryid)
     WHERE s.calls > b.calls + 100  -- only queries called many times in the window
 )
 SELECT

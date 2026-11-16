@@ -38,15 +38,15 @@ Do **not** load this file for: index *type* selection (use [`22-indexes-overview
 
 Five rules that should drive every decision in this file.
 
-1. **CONCURRENTLY is the recommended practice in production.** Any `CREATE INDEX` / `REINDEX` / `DROP INDEX` on a non-trivial table in production should use `CONCURRENTLY`. Without it, the plain form takes `ACCESS EXCLUSIVE` on the table for the duration and blocks every read and write. With it, the operation takes `SHARE UPDATE EXCLUSIVE` and lets concurrent reads + DML proceed. The cost: CONCURRENTLY does *two* table scans and waits for concurrent transactions to drain between scans, so it runs roughly 2–3× longer than the plain form.[^createindex]
+1. **Choose CONCURRENTLY when writes must continue.** Plain `CREATE INDEX` takes `SHARE` on the table and blocks writes, but permits reads. Plain `DROP INDEX` takes `ACCESS EXCLUSIVE`; REINDEX has its own locking rules. Concurrent operations allow ordinary DML but still acquire locks, wait for transactions and consume I/O. A concurrent build performs two scans.[^createindex]
 
 2. **CONCURRENTLY cannot run inside a transaction block.** *"a regular CREATE INDEX command can be performed within a transaction block, but CREATE INDEX CONCURRENTLY cannot"*[^createindex]. Same rule applies to `DROP INDEX CONCURRENTLY`[^dropindex] and `REINDEX CONCURRENTLY`. No `BEGIN; CREATE INDEX CONCURRENTLY ...; COMMIT;`, no migration framework that wraps every statement in a transaction — you need its "raw" or "transactional: false" escape hatch.
 
 3. **Failed CONCURRENTLY leaves a ghost index behind.** *"If a problem arises while scanning the table, such as a deadlock or a uniqueness violation in a unique index, the CREATE INDEX command will fail but leave behind an 'invalid' index. This index will be ignored for querying purposes because it might be incomplete; however it will still consume update overhead."*[^createindex] Same trap for `REINDEX CONCURRENTLY` with `_ccnew` / `_ccold` suffixed indexes[^reindex]. **Always audit `indisvalid = false` before re-running.**
 
-4. **REINDEX rebuilds; it doesn't shrink the table.** `REINDEX` is for *index* bloat. On PG14–18, heap bloat from dead-tuple churn requires `VACUUM FULL` (offline) or `pg_repack` / `pg_squeeze` (online); PG19 adds `REPACK (CONCURRENTLY)` (see [REPACK](#repack-pg19)). A REINDEX-CONCURRENTLY pass that "didn't help query performance" almost always means heap bloat, not index bloat — go diagnose with [`pgstattuple`](#bloat-detection-with-pgstattuple) first.
+4. **REINDEX rebuilds indexes, not the table heap.** It does not fix heap bloat or guarantee faster queries. Diagnose relation size, free space, and query plans before choosing a rewrite or rebuild. See [`pgstattuple`](#bloat-detection-with-pgstattuple).
 
-5. **The visibility map and FSM track the heap, not the index.** Index-only scans depend on the heap's visibility map being current (see [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md)); a freshly REINDEXed index still requires an UP-TO-DATE visibility map to skip the heap fetch. If you REINDEX and `Heap Fetches` in `EXPLAIN ANALYZE` remains nonzero, the problem is autovacuum lag on the *table*, not the index.
+5. **The visibility map and FSM track the heap, not the index.** Index-only scans depend on the heap's visibility map being current (see [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md)); a freshly REINDEXed index still requires an UP-TO-DATE visibility map to skip the heap fetch. If you REINDEX and `Heap Fetches` in `EXPLAIN ANALYZE` remains nonzero, look at the *table's* visibility map, not the index: recently modified pages and snapshots that delay vacuum leave all-visible bits unset, and autovacuum lag is only one cause.
 
 ## Decision Matrix
 
@@ -54,25 +54,25 @@ Ten rows mapping operational scenario to the right tool. Rows ordered: most comm
 
 | Scenario                                                | Use                                              | Avoid                                  | Why                                                                                                    |
 | ------------------------------------------------------- | ------------------------------------------------ | -------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| Build a new index on a production table                 | **`CREATE INDEX CONCURRENTLY`**                  | plain `CREATE INDEX`                   | Plain form takes `ACCESS EXCLUSIVE` for the duration — blocks all reads + writes.                      |
+| Build a new index on a production table                 | **`CREATE INDEX CONCURRENTLY`**                  | plain `CREATE INDEX` when writes must continue | Plain form takes `SHARE` and blocks writes, but allows reads. |
 | Rebuild a single bloated index in production            | **`REINDEX INDEX CONCURRENTLY`** (PG12+)[^pg12-rc] | `DROP + CREATE INDEX CONCURRENTLY`     | REINDEX preserves constraints / FK references; drop+create requires temporarily unconstraining.        |
 | Rebuild all indexes on a table                          | **`REINDEX TABLE CONCURRENTLY`** (PG12+)         | per-index loop                         | One command, handles TOAST table indexes, atomic per-index swap.                                       |
 | Drop an old / unused index                              | **`DROP INDEX CONCURRENTLY`**                    | plain `DROP INDEX`                     | Plain form takes `ACCESS EXCLUSIVE`; CONCURRENTLY waits for conflicting transactions instead.          |
-| Clean up an `INVALID` index from a failed CIC           | **`DROP INDEX [CONCURRENTLY]`** + retry CIC      | `REINDEX`                              | See §Failure Recovery below for exact procedure.                                                        |
+| Clean up an `INVALID` index from a failed CIC           | **`DROP INDEX [CONCURRENTLY]`** + retry CIC, or **`REINDEX INDEX CONCURRENTLY`** | retrying before fixing the cause | See §Failure Recovery below for exact procedure.                                                        |
 | Clean up `_ccnew` / `_ccold` from a failed `REINDEX CC` | **`DROP INDEX`** by suffix                       | re-run REINDEX                         | See §`_ccnew` / `_ccold` Suffix Recovery below for decision tree.                                      |
 | Heap bloat from dead-tuple churn                        | **`pg_repack`** or **`pg_squeeze`**              | `REINDEX`, `VACUUM FULL`               | REINDEX fixes only index bloat; `VACUUM FULL` is offline; community tools are online (PG14–18).        |
 | Post-`pg_upgrade` dedup migration (PG12 → ≥PG13)        | **`REINDEX INDEX CONCURRENTLY`** per B-tree      | leave it                               | PG13+ B-tree dedup requires REINDEX after pg_upgrade to take effect[^pg13-dedup-cite].                 |
 | Post-libc/ICU upgrade (collation version mismatch)      | **`REINDEX INDEX CONCURRENTLY`** on text indexes | trust the cluster                      | Silent corruption risk; pg_amcheck flags `XX002 index_corrupted`. See [`65-collations-encoding.md`](./65-collations-encoding.md). |
-| Periodic preventive reindex on a churn-heavy table      | **`REINDEX TABLE CONCURRENTLY`** monthly         | `pg_repack` for index-only             | REINDEX CONCURRENTLY is the in-core, lower-overhead choice when heap is not bloated.                   |
+| Rebuild an index after measuring a useful benefit | `REINDEX INDEX CONCURRENTLY` or `REINDEX TABLE CONCURRENTLY` | automatic monthly rebuilds without evidence | Rebuilds consume I/O, CPU, WAL, and temporary disk space. |
 
 > [!NOTE] PostgreSQL 19
 > The guidance above to prefer `pg_repack` or `pg_squeeze` over the offline `VACUUM FULL` holds for PG14–18. PostgreSQL 19 adds the in-core `REPACK (CONCURRENTLY)` command, which rebuilds tables without access-exclusive locking. `pg_repack` and `pg_squeeze` remain the online options on PG18 and earlier.[^pg19-repack]
 
 Three smell signals for wrong tool:
 
-- **REINDEX did not change query latency.** Almost always means heap bloat, not index bloat. Run `pgstattuple` on the *table* before reaching for REINDEX again.
+- **REINDEX did not change query latency.** Index bloat was not the bottleneck; heap bloat is a common cause. Run `pgstattuple` on the *table* and compare plans before reaching for REINDEX again.
 - **CIC takes 5×+ longer than the plain form.** Almost always means a long-running transaction is blocking the "wait for existing transactions" phase. Check `pg_stat_activity` for `xact_start` older than your CIC start time — kill or wait.
-- **Same `INVALID` index name keeps reappearing.** A unique-index CIC failing on unique violations: data already has duplicates. Use a non-unique CIC, dedupe, then add the UNIQUE constraint via `ALTER TABLE ... ADD CONSTRAINT ... USING INDEX` (which requires a non-unique-then-promote pattern won't actually help — the real fix is dedupe first, then create the unique index).
+- **Same `INVALID` unique index keeps reappearing.** Investigate the failure and resolve duplicate data or concurrent conflicting writes before retrying the unique build.
 
 ## CREATE INDEX CONCURRENTLY
 
@@ -120,7 +120,7 @@ Translation: once the first scan completes, every concurrent INSERT or UPDATE th
 
 > *"The recommended recovery method in such cases is to drop the index and try again to perform CREATE INDEX CONCURRENTLY. (Another possibility is to rebuild the index with REINDEX INDEX CONCURRENTLY)."*[^createindex]
 
-The drop-and-retry path is the safer default. REINDEX-the-invalid-index works in principle but couples your retry to whatever caused the original failure — if the cause was a data issue (duplicate values for a unique index, NULL violations for a CHECK on the column), it will fail again the same way.
+Both drop-and-retry and `REINDEX INDEX CONCURRENTLY` require diagnosing the original failure first. Resolve duplicate keys or failing index expressions before retrying; changing the rebuild method does not remove the cause.
 
 ### Audit for Failed CICs
 
@@ -138,7 +138,7 @@ The drop-and-retry path is the safer default. REINDEX-the-invalid-index works in
     WHERE NOT i.indisvalid OR NOT i.indisready
     ORDER BY pg_relation_size(c.oid) DESC;
 
-Any row here is consuming write overhead for zero query benefit. Drop it.
+Investigate each row before taking action. An active build, an intentionally incomplete partitioned index, or a constraint-backed index can appear here. Only drop confirmed failed leftovers after checking dependencies and build state.
 
 ## REINDEX CONCURRENTLY
 
@@ -184,7 +184,7 @@ Decision tree:
 
 Two hard constraints to remember:
 
-- **Exclusion-constraint indexes** (typically `EXCLUDE USING gist`) — REINDEX CONCURRENTLY *skips* them silently when reindexing a whole table or database. To rebuild them you must drop the constraint and recreate it (which requires `ACCESS EXCLUSIVE`).
+- **Exclusion-constraint indexes** (typically `EXCLUDE USING gist`) cannot be reindexed concurrently. A table-level concurrent rebuild skips them; use ordinary `REINDEX` during a maintenance window if appropriate.
 - **System catalogs** — `REINDEX SYSTEM` is offline-only. Schedule a maintenance window or use a logical replication failover (see [`87-major-version-upgrade.md`](./87-major-version-upgrade.md)).
 
 > [!WARNING] Minor releases 2026-11-12
@@ -246,9 +246,9 @@ Per docs: *"By default, only the role `pg_stat_scan_tables` has EXECUTE privileg
 | Function                        | Target           | Cost        | What it returns                                                            |
 | ------------------------------- | ---------------- | ----------- | -------------------------------------------------------------------------- |
 | `pgstattuple(regclass)`         | Tables, any index | Full scan   | `tuple_count`, `dead_tuple_count`, `dead_tuple_percent`, `free_percent`    |
-| `pgstattuple_approx(regclass)`  | Tables, B-tree   | Sampled     | `scanned_percent`, `approx_tuple_percent`, `dead_tuple_percent`            |
+| `pgstattuple_approx(regclass)`  | Heap tables      | Partial scan | `scanned_percent`, `approx_tuple_percent`, `dead_tuple_percent` |
 | `pgstatindex(regclass)`         | B-tree           | Full scan   | `avg_leaf_density`, `leaf_fragmentation`, `deleted_pages`, `empty_pages`   |
-| `pgstatginindex(regclass)`      | GIN              | Full scan   | `pending_pages`, `pending_tuples`                                          |
+| `pgstatginindex(regclass)`      | GIN              | Pending-list statistics | `pending_pages`, `pending_tuples`                              |
 | `pgstathashindex(regclass)`     | Hash (PG10+)     | Full scan   | `bucket_pages`, `overflow_pages`, `live_items`, `dead_tuples`, `free_percent` |
 | `pg_relpages(regclass)`         | Any              | O(1)        | Page count                                                                 |
 
@@ -446,7 +446,7 @@ Cumulative summary of index-maintenance-relevant changes.
 
 ### Recipe 1 — Inventory all invalid indexes
 
-Audit before any maintenance work. Anything returned is consuming write overhead for zero query benefit.
+Audit before maintenance. Invalid indexes can be active builds or intentionally incomplete partitioned indexes; investigate before dropping any.
 
     SELECT
         n.nspname  AS schema,
@@ -466,7 +466,7 @@ Action per row:
 
 - Name ends in `_ccnew` or `_ccnewN` → drop it, retry REINDEX CONCURRENTLY after fixing the underlying cause.
 - Name ends in `_ccold` or `_ccoldN` → drop it; the new index is already in service.
-- Plain name → failed CIC; drop and retry per docs.
+- Plain name → investigate whether it is a failed CIC, an active build, or an incomplete partitioned index before deciding what to do.
 
 ### Recipe 2 — Safe production CIC migration script
 
@@ -547,7 +547,7 @@ Standard `ALTER TABLE ... ADD UNIQUE` takes `ACCESS EXCLUSIVE`. The CONCURRENTLY
 
     -- Step 1: build a unique index concurrently.
     CREATE UNIQUE INDEX CONCURRENTLY uq_users_email_new
-        ON users (lower(email));
+        ON users (email);
 
     -- Verify valid before promoting.
     SELECT indisvalid FROM pg_index
@@ -652,7 +652,7 @@ Decision:
 
 ### Recipe 11 — Recover from a failed unique-index CIC
 
-Failed CIC on a unique index leaves an `INVALID` index that *still rejects writes* per the unique-constraint enforcement rule.
+An invalid unique index can continue enforcing uniqueness if the failure occurs during its second scan.[^createindex]
 
     -- 1. Symptoms: writes failing with unique_violation pointing at the half-built index.
     SELECT indexrelid::regclass AS index_name, indisvalid, indisready
@@ -733,9 +733,9 @@ See [`65-collations-encoding.md`](./65-collations-encoding.md) for the full work
 
 7. **CIC blocks `VACUUM`, `ANALYZE`, and `ALTER TABLE` for its duration.** All four operations conflict on `SHARE UPDATE EXCLUSIVE`. A long-running CIC on a hot table delays autovacuum, which can compound into bloat. Monitor `n_dead_tup` during long CICs.
 
-8. **REINDEX CONCURRENTLY silently skips exclusion-constraint indexes.** *"those indexes will be skipped"*[^reindex] when reindexing a table or database. The only way to rebuild them is `DROP CONSTRAINT` + `ADD CONSTRAINT` (which takes `ACCESS EXCLUSIVE`). Plan a window.
+8. **REINDEX CONCURRENTLY skips exclusion-constraint indexes** when reindexing a table or database. Use ordinary `REINDEX` during a maintenance window if they require rebuilding.[^reindex]
 
-9. **REINDEX SYSTEM cannot use CONCURRENTLY.** Per docs[^reindex]. The only way to rebuild system catalog indexes is offline. For HA clusters: rebuild on a standby then promote.
+9. **REINDEX SYSTEM cannot use CONCURRENTLY.** Plan a maintenance window. A physical standby is read-only and cannot run `REINDEX`; follow the documented system-index recovery procedure if corruption is suspected.[^reindex]
 
 10. **DROP INDEX CONCURRENTLY cannot drop a unique/PK-backing index.** *"the CASCADE option is not supported. (Thus, an index that supports a UNIQUE or PRIMARY KEY constraint cannot be dropped this way.)"*[^dropindex] Must drop the constraint first (which takes `ACCESS EXCLUSIVE` briefly).
 
@@ -759,7 +759,7 @@ See [`65-collations-encoding.md`](./65-collations-encoding.md) for the full work
 
 20. **`pg_squeeze` requires `wal_level = logical`.** This bumps WAL volume across the cluster, not just for the squeezed table — measure the WAL throughput impact before turning it on for `pg_squeeze` alone.
 
-21. **CIC parallelism (PG18 parallel GIN, PG17 parallel BRIN, PG11 parallel B-tree) does not apply to CONCURRENTLY.** Parallel index builds use `max_parallel_maintenance_workers` for the *plain* build path. `CREATE INDEX CONCURRENTLY` performs its scans serially. Plan for the slower wall-clock when you need CONCURRENTLY.
+21. **Concurrent index builds can use parallel workers.** On supported access methods only the first scan is parallel; validation is serial.[^createindex]
 
 22. **`ALTER TABLE ... ADD CONSTRAINT ... USING INDEX` requires the index to be UNIQUE and to match the constraint columns exactly.** The `USING INDEX` shortcut is the only way to promote a CIC-built unique index to a constraint without rebuilding. See recipe 6.
 

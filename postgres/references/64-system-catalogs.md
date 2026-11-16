@@ -42,7 +42,7 @@ When you need to inspect cluster state via SQL: "what tables exist", "which inde
 
 Five rules. Each names a misconception.
 
-1. **`pg_catalog` is always in `search_path` implicitly** — defeating "I need to `SET search_path = pg_catalog, ...`". Verbatim docs[^pgcatalog]: *"`pg_catalog` is always effectively part of the search path. ... `pg_catalog` will be searched before any of these. This ensures that built-in names will always be findable."* Qualify with `pg_catalog.` only if user table shadows a system name.
+1. **`pg_catalog` is always effectively in `search_path`.** When not explicitly listed, it is searched before user schemas. If explicitly listed later, earlier schemas can shadow built-ins; use a secure search path and schema qualification in security-sensitive code.[^pgcatalog]
 
 2. **The 8-letter `relkind` enumeration is the discriminator for `pg_class`** — defeating "I'll filter `pg_class` by `relname LIKE '%_pkey'`". Values: `r` ordinary table, `i` index, `v` view, `m` materialized view, `c` composite type, `t` TOAST table, `p` partitioned table, `I` partitioned index, `f` foreign table, `S` sequence. Filter by `relkind IN ('r', 'p')` to find "all heap-storing tables including partitioned."
 
@@ -81,7 +81,7 @@ Three smell signals you reached for the wrong catalog:
 
 ### pg_catalog Schema Position
 
-`pg_catalog` is created by `initdb` in every cluster. Sits implicitly first in `search_path` regardless of GUC value. Schema-qualify only when user object shadows a system name (rare; PG reserves `pg_*` prefix).
+`pg_catalog` is searched implicitly before configured schemas unless explicitly listed in `search_path`, in which case its specified position is used.[^pgcatalog]
 
 ```sql
 -- Reveal the implicit position
@@ -433,13 +433,13 @@ ORDER BY sent_lag_bytes DESC NULLS LAST;
 ```sql
 SELECT
   slot_name, slot_type, active, wal_status,
-  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal,
-  inactive_since                                       -- PG17+
+  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
+  -- Add inactive_since on PG17+.
 FROM pg_replication_slots
 ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC NULLS LAST;
 ```
 
-`wal_status = 'lost'` means the slot exceeded `max_slot_wal_keep_size` and was invalidated; standby must be rebuilt.
+`wal_status = 'lost'` means required WAL is no longer available to this slot. Investigate its invalidation cause and recover or recreate the consumer as appropriate; a physical standby may be able to retrieve WAL from an archive.
 
 ### Recipe 9 — Autovacuum-overdue tables
 
@@ -463,7 +463,7 @@ ORDER BY dead_pct DESC NULLS LAST
 LIMIT 20;
 ```
 
-Thresholds: `dead_pct < 5%` is fine; `5-20%` may need raised autovacuum scale factor; `>20%` with `last_autovacuum` stale means autovacuum is being canceled by lock conflicts or xmin horizon is held back. Cross-ref [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md) and [`27-mvcc-internals.md`](./27-mvcc-internals.md).
+Treat `dead_pct` as an estimate, not a universal threshold. High values or stale `last_autovacuum` warrant checking the table's vacuum threshold, worker capacity, lock conflicts, and old snapshots. Lowering the scale factor makes vacuum eligible earlier; raising it delays eligibility. See [PG16 autovacuum thresholds](https://www.postgresql.org/docs/16/routine-vacuuming.html#AUTOVACUUM).
 
 ### Recipe 10 — Longest-running transactions holding xmin horizon back
 
@@ -518,7 +518,7 @@ LEFT JOIN pg_available_extensions av ON av.name = e.extname
 ORDER BY status DESC, e.extname;
 ```
 
-`pg_available_extensions` shows what the cluster has install scripts for. After a major-version upgrade, run `ALTER EXTENSION <name> UPDATE` for each extension with `status = 'upgrade available'`. Cross-ref [`69-extensions.md`](./69-extensions.md).
+`pg_available_extensions` shows available control files. A different default version does not guarantee an update path; inspect available versions and extension-specific upgrade instructions before updating. [PG16 extension upgrades](https://www.postgresql.org/docs/16/extend-extensions.html#EXTEND-EXTENSIONS-UPDATES)
 
 ### Recipe 13 — Partition hierarchy
 
@@ -538,27 +538,15 @@ ORDER BY pt.level, pt.relid::regclass::text;
 ### Recipe 14 — Role membership tree
 
 ```sql
-WITH RECURSIVE membership AS (
-  SELECT
-    r.oid, r.rolname, NULL::name AS member_of, 0 AS depth
-  FROM pg_roles r
-  WHERE r.rolname NOT LIKE 'pg\_%'
-
-  UNION ALL
-
-  SELECT
-    r.oid, r.rolname, parent.rolname, m.depth + 1
-  FROM membership m
-  JOIN pg_auth_members am ON am.member = m.oid
-  JOIN pg_roles parent ON parent.oid = am.roleid
-  JOIN pg_roles r ON r.oid = m.oid
-)
-SELECT lpad('', depth * 2) || rolname AS role_tree, member_of
-FROM membership
-ORDER BY rolname, depth;
+SELECT member_role.rolname AS member,
+       granted_role.rolname AS member_of
+FROM pg_auth_members am
+JOIN pg_roles member_role ON member_role.oid = am.member
+JOIN pg_roles granted_role ON granted_role.oid = am.roleid
+ORDER BY member, member_of;
 ```
 
-Walks the grants graph in `pg_auth_members`. PG16+ added per-grant `WITH SET`/`WITH INHERIT` options visible in `pg_auth_members.set_option`/`inherit_option` — check those when debugging "I'm a member of X but cannot use its privileges". Cross-ref [`46-roles-privileges.md`](./46-roles-privileges.md).
+This lists direct grants. PG16+ records per-grant `SET` and `INHERIT` options in `pg_auth_members`; inspect them when debugging effective privileges.
 
 ## Gotchas / Anti-patterns
 
@@ -602,7 +590,7 @@ Walks the grants graph in `pg_auth_members`. PG16+ added per-grant `WITH SET`/`W
 
 20. **`pg_partitioned_table.partattrs` is `int2vector`**, not `int[]` — must cast via `partattrs::int[]` to use array operators.
 
-21. **`pg_extension.extconfig` is the array of OIDs for user-table configuration data the extension owns** — pg_dump preserves their contents across dump/restore. If an extension's config table contains user data, that data survives `DROP EXTENSION ... CASCADE` and `pg_restore`.
+21. **`pg_extension.extconfig` identifies extension configuration tables whose contents `pg_dump` includes.** Dropping the extension drops its member objects, including configuration tables; preserve and verify a backup before doing so. [PG16 extension configuration tables](https://www.postgresql.org/docs/16/extend-extensions.html#EXTEND-EXTENSIONS-CONFIG-TABLES)
 
 22. **`pg_database.datfrozenxid` advancing slowly across hours of writes** is a wraparound-risk signal — combine with `age()` and cross-ref [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md).
 

@@ -50,7 +50,7 @@ Use this file when you need to encrypt or hash data stored *inside* the database
 | Encrypt heap, WAL, temp files at rest | LUKS / ZFS / dm-crypt / third-party TDE patch | pgcrypto (cell-only) | pgcrypto can't reach the storage layer |
 | Encrypt one column's value reversibly | `pgp_sym_encrypt(plain, key)` returning `bytea` | hand-rolled AES via `encrypt()` | PGP envelope gives auth-tag (MDC), versioned format, sane defaults |
 | Encrypt with public/private key pair | `pgp_pub_encrypt(plain, pubkey_bytea)` | self-managed RSA | PGP envelope handles session-key wrap, format, MDC |
-| Hash a password for login verification | `crypt(input, stored_hash) = stored_hash` with `gen_salt('bf', 12)` at insert | `digest()` / `md5()` | `crypt()` is adaptive (cost factor), salted, side-channel-aware |
+| Hash a password for login verification | `crypt(input, stored_hash) = stored_hash` with `gen_salt('bf', 12)` at insert | `digest()` / `md5()` | bcrypt is salted and adaptive; pgcrypto does not resist side-channel attacks |
 | Compute a content hash for dedup / fingerprint | `digest(data, 'sha256')` | `md5()` (collision-prone) | SHA-256 is cryptographically current; MD5/SHA-1 are not |
 | Sign a payload for integrity | `hmac(data, secret, 'sha256')` | naked `digest()` | HMAC requires the secret — prevents length-extension attacks |
 | Generate cryptographic random bytes | `gen_random_bytes(32)` | `random()` from core | core `random()` is *not* cryptographically secure |
@@ -242,7 +242,7 @@ SELECT pgp_sym_encrypt(
     'cipher-algo=aes256, compress-algo=2, compress-level=6'
 );
 
--- Decrypt — returns text (or NULL if password wrong / data corrupt / MDC fails)
+-- Decrypt — returns text; wrong password or corrupt data raises an error
 SELECT pgp_sym_decrypt(payload, current_setting('app.master_key'))
 FROM secrets WHERE name = 'api_key';
 ```
@@ -328,10 +328,9 @@ SELECT fips_mode();   -- t or f
 ALTER SYSTEM SET pgcrypto.builtin_crypto_enabled = 'fips';
 SELECT pg_reload_conf();
 
--- Under FIPS, password hashing must use OpenSSL-validated SHA-2; bcrypt becomes unavailable
--- because its blowfish primitive is not FIPS-validated. Use sha256crypt/sha512crypt instead:
-INSERT INTO users (email, password_hash)
-VALUES ('bob@example.com', crypt('plaintext', gen_salt('sha512crypt', 656000)));
+-- When FIPS mode is active, this setting disables both crypt() and gen_salt(),
+-- including sha256crypt and sha512crypt. Hash passwords in a suitable
+-- validated external implementation instead.
 ```
 
 ## Key Management — the Actual Hard Problem
@@ -349,9 +348,9 @@ INSERT INTO secrets (data) VALUES (pgp_sym_encrypt('hello', current_setting('app
 SELECT pgp_sym_decrypt(data, current_setting('app.master_key')) FROM secrets;
 ```
 
-**Pros:** key never written to disk, never appears in `pg_stat_statements` if you used `current_setting()`, naturally cleared on disconnect.
+**Pros:** the key is session-scoped and cleared on disconnect.
 
-**Cons:** key is visible to the DBA via memory dump or via `current_setting()` in another session if they `SET ROLE`. Connection pooler may reuse backend across users — clear the GUC explicitly on connection-checkout (cross-reference [`81-pgbouncer.md`](./81-pgbouncer.md)).
+**Cons:** the `SET` statement itself can expose the key in query text or logs. Bind parameters can also be logged; protect logs and pooler state. A DBA can inspect backend memory. Settings are session-local; `SET ROLE` in a different session does not expose this session's value.
 
 ### Pattern B — Key in a separate secrets store, app decrypts (recommended)
 
@@ -377,7 +376,7 @@ The application reads the encryption key from a secrets manager (AWS KMS, HashiC
 -- Master key in a session GUC; per-row key = HMAC(master, row_id)
 CREATE FUNCTION row_key(master text, row_id bigint) RETURNS bytea
 LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
-AS $$ SELECT hmac(row_id::text, master::bytea, 'sha256') $$;
+AS $$ SELECT hmac(row_id::text, master, 'sha256') $$;
 
 INSERT INTO secrets (id, payload)
 VALUES (
@@ -475,16 +474,18 @@ Cost factor 12 (bcrypt) is a defensible 2025 default on commodity hardware (~250
 CREATE OR REPLACE FUNCTION login_and_maybe_rehash(p_email citext, p_password text, p_target_cost int DEFAULT 12)
 RETURNS bigint
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
-SET search_path = pg_catalog, public
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
     v_user_id bigint;
     v_current_hash text;
 BEGIN
+    -- citext's = lives in public; an unqualified = would resolve to the
+    -- case-sensitive text = in pg_catalog.
     SELECT id, password_hash INTO v_user_id, v_current_hash
-    FROM users
-    WHERE email = p_email
-      AND password_hash = crypt(p_password, password_hash);
+    FROM public.users
+    WHERE email OPERATOR(public.=) p_email
+      AND password_hash = public.crypt(p_password, password_hash);
 
     IF v_user_id IS NULL THEN
         RETURN NULL;
@@ -492,14 +493,20 @@ BEGIN
 
     -- bcrypt hash format: $2a$<cost>$<salt22><hash31> — extract cost
     IF substring(v_current_hash from '\$2.\$(\d+)\$')::int < p_target_cost THEN
-        UPDATE users SET password_hash = crypt(p_password, gen_salt('bf', p_target_cost))
+        UPDATE public.users
+        SET password_hash = public.crypt(p_password, public.gen_salt('bf', p_target_cost))
         WHERE id = v_user_id;
     END IF;
 
     RETURN v_user_id;
 END;
 $$;
+
+REVOKE EXECUTE ON FUNCTION login_and_maybe_rehash(citext, text, int) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION login_and_maybe_rehash(citext, text, int) TO app_login;
 ```
+
+`SECURITY DEFINER` keeps `password_hash` out of the application role's reach: `app_login` needs only `EXECUTE`, not `SELECT` or `UPDATE` on `users`, so a compromised application connection cannot dump every hash. The pinned `search_path` with `pg_temp` last and the schema-qualified table, functions, and operator stop a caller from substituting its own objects. The example assumes `users` and pgcrypto live in `public`; adjust the qualifiers to match your schemas.
 
 The hash itself encodes the cost factor — you can detect stale-cost hashes without a separate column.
 
@@ -512,11 +519,10 @@ CREATE TABLE customer_pii (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 
--- Encryption goes through a SECURITY DEFINER wrapper so the master key is set per-session
+-- The caller must have the necessary table privileges.
 CREATE OR REPLACE FUNCTION store_ssn(p_customer_id bigint, p_ssn text)
 RETURNS void
-LANGUAGE sql VOLATILE SECURITY DEFINER
-SET search_path = pg_catalog, public
+LANGUAGE sql VOLATILE SECURITY INVOKER
 AS $$
     INSERT INTO customer_pii (customer_id, ssn_encrypted)
     VALUES (p_customer_id, pgp_sym_encrypt(p_ssn, current_setting('app.pii_key')))
@@ -526,8 +532,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION read_ssn(p_customer_id bigint)
 RETURNS text
-LANGUAGE sql STABLE SECURITY DEFINER
-SET search_path = pg_catalog, public
+LANGUAGE sql STABLE SECURITY INVOKER
 AS $$
     SELECT pgp_sym_decrypt(ssn_encrypted, current_setting('app.pii_key'))
     FROM customer_pii WHERE customer_id = p_customer_id;
@@ -538,8 +543,7 @@ SET app.pii_key = 'master-key-fetched-from-secrets-manager';
 SELECT store_ssn(42, '123-45-6789');
 SELECT read_ssn(42);
 ```
-
-Use `SECURITY DEFINER` plus a pinned `search_path` to prevent privilege-escalation via `search_path` injection ([`06-functions.md`](./06-functions.md) gotcha #2).
+These invoker functions do not create an authorization boundary. If using `SECURITY DEFINER`, use only trusted schemas in `search_path`, place `pg_temp` last, revoke default `PUBLIC` execution, grant only intended callers, and authorize each requested customer explicitly. See [CREATE FUNCTION security](https://www.postgresql.org/docs/16/sql-createfunction.html).
 
 ### Recipe 4 — Application-side encryption (key never enters Postgres)
 
@@ -594,11 +598,13 @@ CREATE TABLE uploads (
 
 The generated column is computed on INSERT/UPDATE and stored, so the UNIQUE index works without re-hashing on every query.
 
-### Recipe 7 — Bytea column encryption migration (online add-column pattern)
+### Recipe 7 — Bytea column encryption migration with a write pause
 
 ```sql
 -- Step 1: add the new encrypted column
 ALTER TABLE customers ADD COLUMN ssn_encrypted bytea;
+-- Stop all writes to customers.ssn and keep them stopped until the cutover.
+-- Ensure no old writers can reconnect; back up and test restoration first.
 
 -- Step 2: backfill in batches (set a session key first)
 SET app.pii_key = 'master-key';
@@ -614,16 +620,20 @@ SET ssn_encrypted = pgp_sym_encrypt(c.ssn, current_setting('app.pii_key'))
 FROM batch
 WHERE c.customer_id = batch.customer_id;
 
--- Repeat until zero rows updated. Use SKIP LOCKED to allow multiple workers.
-
--- Step 3: deploy application reading from ssn_encrypted, fall back to ssn on NULL.
--- Step 4: backfill complete — set ssn = NULL (or drop column entirely after confidence period).
+-- Repeat in separate transactions; SKIP LOCKED can return zero while rows
+-- are locked, so wait for workers to finish, then verify without SKIP LOCKED:
+SELECT count(*) FROM customers WHERE ssn IS NOT NULL AND ssn_encrypted IS NULL;
+-- Proceed only when the count is zero and encrypted values have been validated.
+-- Deploy the application using ssn_encrypted before resuming writes.
+-- Remove the old values only after a verified cutover:
 ALTER TABLE customers ALTER COLUMN ssn DROP NOT NULL;
 UPDATE customers SET ssn = NULL WHERE ssn_encrypted IS NOT NULL;
 
 -- Step 5: drop the plaintext column.
 ALTER TABLE customers DROP COLUMN ssn;
 ```
+
+Dropping a column does not securely erase plaintext from old heap versions, WAL, replicas, snapshots, or backups. Apply the relevant retention, secure disposal, and storage-encryption controls to those copies.
 
 Cross-references [`26-index-maintenance.md`](./26-index-maintenance.md) for similar online-migration patterns and [`43-locking.md`](./43-locking.md) Recipe 4 for `SKIP LOCKED` worker patterns.
 
@@ -641,42 +651,25 @@ SELECT 'tok_' || replace(replace(encode(gen_random_bytes(32), 'base64'), '+', '-
 ### Recipe 9 — Detect FIPS mode (PG18+) and choose appropriate algorithm
 
 ```sql
--- PG18+: choose gen_salt() type based on FIPS mode at runtime
--- pgcrypto has no GUC for this — check fips_mode() and branch in application code or a helper function.
-CREATE OR REPLACE FUNCTION pick_salt() RETURNS text LANGUAGE sql AS $$
-    SELECT CASE WHEN fips_mode() THEN gen_salt('sha512crypt') ELSE gen_salt('bf') END;
-$$;
-
--- Usage
-SELECT crypt('user_password', pick_salt());
+-- PG18+: inspect both FIPS mode and the pgcrypto policy.
+SELECT fips_mode(), current_setting('pgcrypto.builtin_crypto_enabled', true);
 ```
 
-### Recipe 10 — Hide encryption keys from `pg_stat_statements`
+If FIPS mode is active and the setting is `fips`, both `crypt()` and `gen_salt()` are disabled, regardless of the algorithm. Use an appropriate validated external password-hashing implementation.
 
-```sql
--- BAD: master key literal in SQL — appears verbatim in pg_stat_statements
-SELECT pgp_sym_encrypt('payload', 'my-secret-key');
+### Recipe 10 — Limit secret exposure in query text
 
--- GOOD: pass key as a bind parameter — pg_stat_statements normalizes it to $2
-PREPARE encrypt_one(text, text) AS SELECT pgp_sym_encrypt($1, $2);
-EXECUTE encrypt_one('payload', 'my-secret-key');
-
--- BETTER: key in session GUC, never appears in any SQL text
-SET app.master_key = 'my-secret-key';
-SELECT pgp_sym_encrypt('payload', current_setting('app.master_key'));
-```
-
-Verify with `pg_stat_statements` query inspection ([`57-pg-stat-statements.md`](./57-pg-stat-statements.md)).
+Use application-side encryption where possible. If using pgcrypto, send secrets as protocol bind parameters rather than SQL literals; SQL `EXECUTE` and `SET` statements containing literals still expose them in their text. Bind values can also be logged by server logging or auditing, so review logging settings and access controls. `pg_stat_statements` normalizes constants in many queries but is not a secret-redaction boundary, especially for utility statements. See [pg_stat_statements security](https://www.postgresql.org/docs/16/pgstatstatements.html).
 
 ### Recipe 11 — Block-cipher modes worked example
 
 ```sql
 -- AES-256-CBC (default mode)
-SELECT encode(encrypt_iv('plaintext', '\xfeedface...32bytes...0123'::bytea,
+SELECT encode(encrypt_iv('plaintext', decode(repeat('ab', 32), 'hex'),
                           gen_random_bytes(16), 'aes-cbc/pad:pkcs'), 'hex');
 
 -- AES-256-CFB (PG18+)
-SELECT encode(encrypt_iv('plaintext', '\xfeedface...32bytes...0123'::bytea,
+SELECT encode(encrypt_iv('plaintext', decode(repeat('ab', 32), 'hex'),
                           gen_random_bytes(16), 'aes-cfb/pad:none'), 'hex');
 
 -- AES-256-ECB — DO NOT USE for production; the docs literally call it test-only
@@ -726,12 +719,12 @@ Adopt a column-naming convention (`*_encrypted` suffix or column comment contain
 ## Gotchas / Anti-patterns
 
 1. **pgcrypto is not at-rest encryption.** Cell-level encryption leaves heap files, WAL, indexes, temp files, and `pg_dump` output unencrypted for every non-pgcrypto-protected column. For whole-cluster at-rest, use filesystem encryption or a TDE distribution.
-2. **Keys passed as SQL literals appear in `pg_stat_statements` and server logs.** Use bind parameters or session GUCs to keep keys out of the query text. With `log_statement = 'all'` or `log_min_duration_statement = 0`, all queries (and their literals) hit the log.
+2. **SQL literals and bind parameters can expose keys in logs.** Prefer application-side encryption; protect logs and pooling state. `pg_stat_statements` normalizes many constants but is not a secret-redaction boundary.
 3. **`gen_random_uuid()` is core in PG13+** — you do not need pgcrypto installed for it. Verbatim release note: *"Previously UUID generation functions were only available in the external modules uuid-ossp and pgcrypto."*[^pg13-uuid] Continuing to install pgcrypto solely for UUIDs is an upgrade-stale habit.
 4. **Raw `encrypt()` does not authenticate ciphertext.** Bit-flip attacks are not detected; `decrypt()` returns garbage. Use `pgp_sym_encrypt` (built-in MDC) unless you need bit-exact wire compatibility with an external system.
 5. **CBC mode requires a fresh IV per encryption.** Reusing an IV with the same key leaks information. Always use `encrypt_iv()` with `gen_random_bytes(16)`, never `encrypt()` (which uses an internal predictable IV).
 6. **ECB mode is for testing only.** Verbatim from the docs: *"`ecb` — each block is encrypted separately (for testing only)"*[^pgcrypto-raw]. Identical plaintext blocks produce identical ciphertext blocks under ECB, leaking structure.
-7. **bcrypt silently truncates passwords longer than 72 bytes.** Two passwords identical in their first 72 bytes hash to the same value. For passphrase-style inputs that could exceed 72 bytes, use PG18 `sha256crypt`/`sha512crypt`, or pre-hash with SHA-256 before passing to `crypt()`.
+7. **bcrypt truncates passwords longer than 72 bytes.** Two passwords identical in their first 72 bytes hash to the same value. Reject overly long passwords, or on PG18+ use `sha256crypt` or `sha512crypt`, which have no password-length limit.[^pg18-shacrypt] Do not invent a pre-hashing construction without a vetted design.
 8. **Default `gen_salt('bf')` cost is 6 — too low.** Pass an explicit cost: `gen_salt('bf', 12)`. Periodically re-benchmark and raise as hardware speeds increase.
 9. **`crypt()` cost factor is not stored separately — it is embedded in the hash.** You can detect stale-cost hashes by parsing the hash format (`$2a$<cost>$...`), but you cannot raise cost in-place; you must rehash on next successful login.
 10. **`digest('md5')` and `md5()` are broken.** Both produce MD5; both are collision-vulnerable for cryptographic purposes. Use SHA-256 or BLAKE2.

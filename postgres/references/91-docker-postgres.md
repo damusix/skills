@@ -51,7 +51,7 @@ Five rules.
 | Minimal image | Alpine variant (`postgres:17-alpine3.24`) | ~50MB vs ~80MB |
 | Glibc dependencies (PostGIS, plpython3u, plperl) | Debian variant (`postgres:17` = trixie) | Some C extensions ship glibc-only binaries |
 | Custom extensions | Custom Dockerfile `FROM postgres:17` + install | Build once, version-control the result |
-| Sensitive secrets | Docker secrets via `POSTGRES_PASSWORD_FILE` | No password in image history or process list |
+| Sensitive secrets | Docker secrets via `POSTGRES_PASSWORD_FILE` | Keeps the value out of image history and container configuration; restrict access to the secret and process environment |
 | Custom `postgresql.conf` | Bind-mount config + `command: postgres -c config_file=...` | Decouple config from image |
 | Multi-arch deployment | Pull official image (10 architectures supported) | amd64/arm64/ppc64le/s390x all published |
 | Run as non-root | Set `--user UID:GID` after `chown -R UID:GID` of volume | UID 70 (Alpine) or 999 (Debian) default |
@@ -123,7 +123,7 @@ volumes:
     pgdata: {}
 ```
 
-Password lives in a file not the process environment — does not show up in `docker inspect`, image history, or container env list.
+The secret is not embedded in the image or container configuration. The entrypoint reads the file and exports `POSTGRES_PASSWORD` into its process environment, so privileged process access can still expose it. See <https://github.com/docker-library/postgres/blob/master/docker-entrypoint.sh>.
 
 ### Init Scripts (`/docker-entrypoint-initdb.d/`)
 
@@ -181,7 +181,7 @@ volumes:
 
 - Docker manages ownership. Volume lives at `/var/lib/docker/volumes/<name>/_data` on host.
 - Survives container removal (`docker rm`). Lost on volume removal (`docker volume rm`).
-- Backup via `docker run --rm -v pgdata:/data -v $(pwd):/backup alpine tar czf /backup/pgdata.tar.gz -C /data .` or via `pg_dump` (preferred).
+- Use `pg_dump` for a logical backup, or `pg_basebackup` with the necessary WAL for an online physical backup. A plain tar of a live volume is not a usable backup; for a filesystem copy, stop PostgreSQL and include the whole cluster, WAL, and any external tablespaces. See <https://www.postgresql.org/docs/16/backup-file.html>.
 
 **Option 2 (problematic): bind mount**
 
@@ -311,7 +311,7 @@ services:
 
 ```sh
 # postgresql.conf in image's default location has:
-# include_dir = 'conf.d'
+# Add include_dir = 'conf.d' to the active postgresql.conf; it is not enabled by default.
 ```
 
 Bind-mount your additions:
@@ -345,9 +345,9 @@ Force pull a specific architecture (rare; usually for cross-build):
 docker pull --platform=linux/arm64 postgres:17-bookworm
 ```
 
-> [!WARNING] Cross-architecture restore is impossible
+> [!WARNING] Physical backups are architecture-dependent
 >
-> A `pg_basebackup` or `pg_dump -Fc` backup taken from an amd64 container cannot be restored into an arm64 container. Use `pg_dump` plain SQL (`-Fp`) for cross-architecture migration. Same rule applies as bare-metal: physical backup is byte-level; logical backup is portable. See [`83-backup-pg-dump.md`](./83-backup-pg-dump.md) and [`84-backup-physical-pitr.md`](./84-backup-physical-pitr.md).
+> A physical `pg_basebackup` from an amd64 container is not a portable arm64 backup. Logical `pg_dump` archives, including custom (`-Fc`) format, are portable across architectures; restore them with `pg_restore`. See <https://www.postgresql.org/docs/16/app-pgdump.html>.
 
 ### Per-Version Timeline
 
@@ -422,16 +422,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         postgresql-17-pg-stat-kcache \
         postgresql-17-cron \
     && rm -rf /var/lib/apt/lists/*
-
-# Pre-load shared libraries in postgresql.conf
-COPY postgresql.conf.snippet /etc/postgresql/conf.d/extensions.conf
-```
-
-`postgresql.conf.snippet`:
-
-```ini
-shared_preload_libraries = 'pg_stat_statements,pg_stat_kcache,pg_cron'
-pg_cron.database_name = 'appdb'
 ```
 
 Build + run:
@@ -440,8 +430,12 @@ Build + run:
 docker build -t myapp/postgres:17 .
 docker run -d --name pg \
     -e POSTGRES_PASSWORD_FILE=/run/secrets/pg_password \
+    -e POSTGRES_DB=appdb \
+    --mount type=bind,src="$(pwd)/pg_password",dst=/run/secrets/pg_password,readonly \
     -v pgdata:/var/lib/postgresql/data \
-    myapp/postgres:17
+    myapp/postgres:17 \
+    -c shared_preload_libraries=pg_stat_statements,pg_stat_kcache,pg_cron \
+    -c cron.database_name=appdb
 ```
 
 ### 3. Override `postgresql.conf` via per-GUC command flags
@@ -518,7 +512,7 @@ docker run --rm \
     --network=container:pg17 \
     -v $(pwd):/backup \
     postgres:17-bookworm \
-    pg_dump -h db -U postgres -Fc -d appdb -f /backup/backup-$(date +%F).dump
+    pg_dump -h 127.0.0.1 -U postgres -Fc -d appdb -f /backup/backup-$(date +%F).dump
 ```
 
 For production, schedule via cron on host or use a sidecar container with `pg_dump` + `aws s3 cp`. See [`85-backup-tools.md`](./85-backup-tools.md) for production-grade tools.
@@ -618,7 +612,7 @@ Fix: set `POSTGRES_PASSWORD` env var, or `POSTGRES_PASSWORD_FILE=/run/secrets/..
 
 1. **Init scripts run ONCE.** First container startup with empty `$PGDATA` only. Re-running with existing data dir SKIPS them. They are NOT a migration tool. Use Flyway / Liquibase / Alembic / Sqitch.
 
-2. **Bind-mount UID mismatch.** Container runs as UID 999 (Debian) or 70 (Alpine). Host directory must match or be world-writable. Symptom: `initdb: error: could not change permissions of directory ...`. Fix: `chown -R 999:999 ./pgdata` before mounting.
+2. **Bind-mount UID mismatch.** Ensure the container's PostgreSQL user owns the mounted data directory and that its permissions satisfy `initdb`; do not make database data world-writable. Verify the image UID and host path before changing ownership. See <https://github.com/docker-library/docs/blob/master/postgres/README.md>.
 
 3. **Default `/dev/shm` is 64MB — too small.** Workloads with parallel queries, many connections, or large temp files hit `ERROR: out of shared memory`. Set `shm_size: 1gb` or larger in Compose.
 
@@ -636,11 +630,11 @@ Fix: set `POSTGRES_PASSWORD` env var, or `POSTGRES_PASSWORD_FILE=/run/secrets/..
 
 10. **`pg_isready` exit code 1 (rejecting) during startup is normal.** The server is up but in recovery / not yet accepting clients. Set `start_period: 30s` in healthcheck so initial restarts don't mark the container unhealthy.
 
-11. **`docker stop` sends SIGTERM, default 10s grace.** Postgres on SIGTERM does a "fast shutdown" — closes connections + flushes WAL. 10s usually fine but raise `--time=30` for large `shared_buffers`. SIGKILL after timeout = unclean shutdown = potential recovery on next start.
+11. **Allow time for shutdown.** The official image sets `STOPSIGNAL SIGINT`, PostgreSQL's fast-shutdown signal. Docker eventually sends SIGKILL if its stop timeout expires, requiring crash recovery; choose a timeout suitable for the workload. See <https://github.com/docker-library/postgres/blob/master/17/bookworm/Dockerfile>.
 
 12. **`postgres:18` defaults to data-checksums on.** `pg_upgrade` from a non-checksum pre-PG18 cluster needs `--no-data-checksums` on the new initdb. See [`88-corruption-recovery.md`](./88-corruption-recovery.md) gotcha #11.
 
-13. **Cross-architecture restore is impossible.** A `pg_basebackup` from an amd64 container cannot restore into an arm64 container. Use `pg_dump -Fp` for cross-arch migration.
+13. **Physical backups are architecture-dependent.** Use a logical `pg_dump` archive for cross-architecture migration; custom archives are portable too.
 
 14. **`PGDATA` env var override is rarely useful.** The image defaults to `/var/lib/postgresql/data` on PG14-17 and `/var/lib/postgresql/18/docker` on PG18+ (mount the volume at `/var/lib/postgresql` there). Overriding requires also updating volume mount paths. Common source of "volume mounted but database appears empty" confusion.
 

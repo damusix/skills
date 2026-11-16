@@ -136,7 +136,7 @@ When to use each:
 
 In practice, write CTEs without either keyword by default and add one explicitly only when you've confirmed via `EXPLAIN` that the default decision is wrong. `MATERIALIZED` is the more common explicit choice because the "compute once" semantics are what people typically reach for CTEs to get.
 
-`NOT MATERIALIZED` only applies to **non-recursive, side-effect-free** CTEs. Specifying it on a `WITH RECURSIVE` or a data-modifying CTE has no effect.[^queries-with]
+`NOT MATERIALIZED` only applies to **non-recursive, side-effect-free** CTEs. It is ignored if the CTE is recursive or is not side-effect-free; the presence of `WITH RECURSIVE` alone does not make every CTE recursive.[^queries-with]
 
 
 ### WITH RECURSIVE: shape, evaluation order, termination
@@ -383,7 +383,7 @@ Caveats:
 ### 3. Audit-log capture on UPDATE
 
 
-Capture the before-state of a row update into an audit table in a single statement.
+Capture the before-state of a row update into an audit table in a single statement. This arithmetic reconstruction assumes no trigger modifies `balance`; use a trigger or PG18 `OLD`/`NEW` for authoritative old values when that assumption is not guaranteed.
 
     WITH updated AS (
         UPDATE accounts
@@ -502,11 +502,11 @@ Compute total raw-material quantities for a finished product whose parts have su
     )
     SELECT component_id, sum(qty) AS total_qty
     FROM exploded
-    WHERE component_id NOT IN (SELECT DISTINCT product_id FROM bom)  -- only raw materials
+    WHERE NOT EXISTS (SELECT 1 FROM bom b WHERE b.product_id = exploded.component_id)  -- raw materials
     GROUP BY component_id
     ORDER BY total_qty DESC;
 
-This walks the assembly tree multiplying quantities as it descends. The leaf filter (`component_id NOT IN (SELECT DISTINCT product_id FROM bom)`) keeps only items that are *not themselves assembled* — i.e., raw materials.
+This walks the assembly tree multiplying quantities as it descends. The anti-join keeps items that are *not themselves assembled*, i.e., raw materials.
 
 
 ### 8. Graph reachability with CYCLE detection
@@ -558,7 +558,7 @@ When you can't use `generate_series` (e.g., generating dates with business-logic
     SELECT d
     FROM business_days
     WHERE extract(dow FROM d) NOT IN (0, 6)                 -- skip weekends
-      AND d NOT IN (SELECT holiday_date FROM holidays);
+      AND NOT EXISTS (SELECT 1 FROM holidays h WHERE h.holiday_date = business_days.d);
 
 For straight numeric or date ranges, `generate_series` is faster and clearer; recursive CTEs are the right tool when each step depends on the previous step's value (Fibonacci, compound-interest accumulation, walking a linked-list-style structure).
 
@@ -566,7 +566,7 @@ For straight numeric or date ranges, `generate_series` is faster and clearer; re
 ### 10. Pagination of expensive ranking
 
 
-Compute scores once, paginate over them without re-ranking.
+Compute top candidates once within a statement, then order and paginate them. Repeated page requests rerun the statement and recompute scores.
 
     WITH scored AS MATERIALIZED (
         SELECT
@@ -575,13 +575,14 @@ Compute scores once, paginate over them without re-ranking.
             ts_rank_cd(d.tsv, websearch_to_tsquery('english', $1)) AS rank
         FROM documents d
         WHERE d.tsv @@ websearch_to_tsquery('english', $1)
-        ORDER BY rank DESC
+        ORDER BY rank DESC, d.id
         LIMIT 1000                                          -- top-1000 candidates
     )
     SELECT * FROM scored
+    ORDER BY rank DESC, id
     OFFSET $2 LIMIT $3;
 
-The `MATERIALIZED` keyword is technically redundant here because `LIMIT` is a side-effectless `SELECT` operation and a single-reference CTE would inline; but writing it explicitly documents the intent and prevents a future refactor that adds a second reference from accidentally double-ranking.
+`MATERIALIZED` explicitly prevents folding this CTE into its parent query. The inner `ORDER BY ... LIMIT` selects the candidate set; the outer `ORDER BY` determines page order. A side-effect-free CTE referenced once can otherwise be folded, while multiple references normally cause materialization. Neither form caches scores between separate page requests.[^queries-with]
 
 
 ### 11. Partitioned cleanup: data-modifying recursion

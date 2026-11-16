@@ -1,7 +1,7 @@
 # 39 — Triggers
 
 
-PostgreSQL triggers reference: `CREATE TRIGGER` grammar including `OR REPLACE` (PG14+), the timing/event/level matrix (`BEFORE`/`AFTER`/`INSTEAD OF` × `INSERT`/`UPDATE`/`DELETE`/`TRUNCATE` × `FOR EACH ROW`/`FOR EACH STATEMENT`), `NEW` and `OLD` records, the full `TG_*` special-variable catalog, transition tables via `REFERENCING { OLD | NEW } TABLE AS` (statement-level only), constraint triggers with `DEFERRABLE INITIALLY DEFERRED`, trigger firing order (alphabetical by name), data-change visibility rules within trigger functions, `ALTER TABLE ... DISABLE/ENABLE/ENABLE REPLICA/ENABLE ALWAYS TRIGGER` and the `session_replication_role` interaction, `ALTER TRIGGER ... RENAME` partition-recursion (PG15+), TRUNCATE triggers on foreign tables (PG16+), and the PG18 silent semantic change that `AFTER` triggers now execute as the role active at queue time. For `INSTEAD OF` triggers on views, cross-reference [`05-views.md`](./05-views.md); for the RI-trigger mechanism that backs FK enforcement, cross-reference [`38-foreign-keys-deep.md`](./38-foreign-keys-deep.md); for PL/pgSQL trigger function bodies, cross-reference [`08-plpgsql.md`](./08-plpgsql.md).
+PostgreSQL triggers reference: timing, events, row and statement levels, transition tables, constraint triggers, ordering, replication roles, and partition behavior. See [`40-event-triggers.md`](./40-event-triggers.md) for DDL event triggers.
 
 
 ## Table of Contents
@@ -112,9 +112,9 @@ Five rules drive everything else:
 
     The two are not interchangeable — pick row-level only when you need per-row context (`NEW`/`OLD`); pick statement-level when you need a global view of all changed rows. Transition tables (rule 4) bridge the gap.
 
-4. **Transition tables (PG10+) give STATEMENT triggers access to all changed rows.** Declared via `REFERENCING { OLD | NEW } TABLE AS name`, they materialize the before-image / after-image sets and let you write a single set-based query instead of running the trigger body N times. **STATEMENT-level only on plain tables; not allowed on partitions or inheritance children, not on foreign tables, not on constraint triggers, and `UPDATE` triggers using them cannot specify a `column_name` list**[^trans-tables-restrict].
+4. **Transition tables give AFTER triggers access to changed row sets.** Both row-level and statement-level AFTER triggers can request them. Row-level triggers requesting transition relations cannot be defined on partitions or inheritance children; foreign tables and constraint triggers cannot request them.[^trans-tables-restrict]
 
-5. **User triggers fire AFTER internal RI triggers.** Foreign-key enforcement happens via internal triggers with `tgisinternal = true` and names like `RI_ConstraintTrigger_a_*` / `RI_ConstraintTrigger_c_*` (see [`38-foreign-keys-deep.md`](./38-foreign-keys-deep.md)). User-level `AFTER` triggers see the world *after* FK constraints have already been checked. The verbatim docs ordering is **alphabetical by trigger name within the same timing/event**[^firing-order]:
+5. **Trigger order is alphabetical for triggers of the same kind and event.** Internal RI triggers share this ordering, but deferred checks can run later. Do not assume every FK check precedes every user AFTER trigger.[^firing-order]
 
     > "If more than one trigger is defined for the same event on the same relation, the triggers will be fired in alphabetical order by trigger name."
 
@@ -136,7 +136,7 @@ Five rules drive everything else:
 | You want to ... | Trigger choice | Avoid | Why |
 |---|---|---|---|
 | Modify or validate a row before it's written | `BEFORE ROW INSERT OR UPDATE` returning `NEW` (or modified `NEW`, or `NULL`) | AFTER trigger that issues a corrective UPDATE | BEFORE row can substitute the value at no extra cost; AFTER round-trips through DML again |
-| Audit-log every changed row | `AFTER STATEMENT INSERT OR UPDATE OR DELETE` with `REFERENCING NEW TABLE AS n, OLD TABLE AS o` plus a single `INSERT INTO audit_log SELECT ... FROM n` | AFTER ROW logging one INSERT per affected row | Transition-table set-based logging is dramatically faster on bulk DML; cross-ref [Recipe 4](#examples--recipes) |
+| Audit-log changed rows | Separate `AFTER INSERT`, `AFTER UPDATE`, and `AFTER DELETE` statement triggers with appropriate transition tables | One multi-event trigger requesting transition tables | Transition relations cannot be requested by a multi-event trigger. |
 | Reject DML that violates a complex (cross-row or cross-table) rule | `BEFORE ROW` with `RAISE EXCEPTION` | CHECK constraint (cannot reference other rows or tables) | Triggers can run SQL queries; CHECK constraints cannot, see [`37-constraints.md`](./37-constraints.md) gotcha #12 |
 | Make a view writable | `INSTEAD OF ROW INSERT OR UPDATE OR DELETE` on the view | Updatable view auto-rewrite (works only for simple views) | INSTEAD OF triggers are the canonical way to make a view writable, cross-ref [`05-views.md`](./05-views.md) |
 | Defer a check until COMMIT (e.g., cross-row uniqueness during a multi-step swap) | `CREATE CONSTRAINT TRIGGER ... DEFERRABLE INITIALLY DEFERRED` | regular trigger | Only `CONSTRAINT TRIGGER` can be deferred; the deferral is `SET CONSTRAINTS`-controlled |
@@ -200,7 +200,7 @@ Eight orthogonal options:
 
 6. `DEFERRABLE` / `INITIALLY IMMEDIATE` / `INITIALLY DEFERRED` — for constraint triggers; same `SET CONSTRAINTS` mechanism as deferrable FKs.
 
-7. `REFERENCING ... TABLE AS name` — transition tables (statement-level AFTER triggers only on plain tables).
+7. `REFERENCING ... TABLE AS name` — transition tables for eligible AFTER row or statement triggers.
 
 8. `WHEN (condition)` — boolean filter; the trigger function is not even invoked when the condition is false. Cannot reference subqueries.
 
@@ -384,7 +384,7 @@ Five operational consequences:
 
 1. **AFTER triggers only.** BEFORE triggers cannot use transition tables because the changes have not been applied yet.
 
-2. **Plain tables only.** Not foreign tables, not partitions / inheritance children — though the parent of a partitioned table can have them (and they see rows across all partitions of that statement).
+2. **Not foreign tables.** Row-level triggers with transition relations cannot be defined on partitions or inheritance children; statement-level triggers can use transition relations on eligible tables, including a partitioned parent.
 
 3. **Not constraint triggers.** Constraint triggers fire on a per-row basis with deferral; they cannot collect a set of rows.
 
@@ -488,14 +488,9 @@ Visibility table:
 ### Trigger and RI-trigger interaction
 
 
-The internal RI-enforcement triggers (`tgisinternal = true`, names like `RI_ConstraintTrigger_a_*` and `RI_ConstraintTrigger_c_*`) are **just AFTER ROW triggers** in the same firing-order pool as user triggers. They fire in alphabetical order with everything else. The `RI_ConstraintTrigger_a_*` prefix sorts ahead of most user trigger names, which is why FK enforcement effectively happens before most user AFTER triggers.
+Internal RI triggers can be deferred. Triggers of the same kind and event fire alphabetically by name, but do not assume a user trigger always runs before or after FK enforcement. Any audit rows written by a trigger roll back if the statement or transaction fails.[^firing-order]
 
-
-Two consequences:
-
-1. **A user AFTER trigger named `aa_audit` runs before FK enforcement (because `aa_audit` < `RI_ConstraintTrigger_a_...` alphabetically).** If your audit trigger logs the post-state, and an FK violation later aborts the statement, the audit row is still rolled back with the rest of the transaction — but the audit trigger has *seen* a state that violated the FK. Usually fine; occasionally a source of debugging confusion.
-
-2. **`DISABLE TRIGGER ALL` disables ALL user triggers AND requires superuser to also disable internal RI triggers.** The default `DISABLE TRIGGER ALL` excludes the internal ones[^disable-all-excludes-internal]:
+**`DISABLE TRIGGER ALL` includes internal RI triggers** and requires superuser privileges to disable them. `DISABLE TRIGGER USER` excludes internally generated constraint triggers.[^disable-all-excludes-internal]
 
     > "One can disable or enable a single trigger specified by name, or all triggers on the table, or only user triggers (this option excludes internally generated constraint triggers, such as those that are used to implement foreign key constraints or deferrable uniqueness and exclusion constraints)."
 
@@ -889,7 +884,7 @@ An alternative for replication-style bulk loads:
     COMMIT;  -- session_replication_role reverts
 
 
-This is per-session/per-transaction and doesn't require ALTER TABLE (no AccessExclusiveLock).
+This is per-session/per-transaction and avoids `ALTER TABLE`, but also disables ordinary FK enforcement. Use only when integrity is independently guaranteed and checked; it requires superuser or appropriate `SET` privilege. See <https://www.postgresql.org/docs/16/runtime-config-client.html>.
 
 
 ### Recipe 7 — circular-dependency consistency via constraint trigger
@@ -926,7 +921,7 @@ Constraint triggers can be `DEFERRABLE INITIALLY DEFERRED` — useful for cross-
     EXECUTE FUNCTION check_team_has_lead();
 
 
-With the trigger initially deferred, intermediate states are allowed mid-transaction — you can demote the current lead and promote a new one in two statements, with the check happening at COMMIT. Use `SET CONSTRAINTS team_must_have_lead IMMEDIATE` to force an early check.
+This illustrates deferred timing, not a complete integrity constraint: creating a team without members never fires this trigger, and concurrent changes can race under READ COMMITTED. A production rule needs checks on all relevant tables plus a concurrency-safe locking or SERIALIZABLE-and-retry design. `SET CONSTRAINTS team_must_have_lead IMMEDIATE` forces pending checks early.
 
 
 ### Recipe 8 — audit query for all triggers on a table
@@ -1128,7 +1123,7 @@ Mitigation strategies:
 
 4. **Trigger firing order is alphabetical by name, not creation order.** SQL standard says creation order; PostgreSQL says name order[^compat-name-order]. The verbatim docs note: *"SQL specifies that multiple triggers should be fired in time-of-creation order. PostgreSQL uses name order, which was judged to be more convenient."* Prefix names with `01_`, `02_`, `99_` etc. to encode ordering explicitly.
 
-5. **Transition tables are AFTER STATEMENT only, plain tables only.** Cannot be used on BEFORE triggers, cannot be used on constraint triggers, cannot be used on partitions / inheritance children (defined on the parent works), cannot be used with `UPDATE OF col_list` (UPDATE triggers using transition tables can't have a column list).
+5. **Transition tables require eligible AFTER triggers.** Row and statement triggers can request them, but not foreign-table or constraint triggers; row triggers on partitions or inheritance children cannot request them. A trigger using transition tables cannot combine events or use `UPDATE OF`.[^trans-tables-restrict]
 
 6. **`UPDATE OF col1, col2` filters at the event-registration level, not by value equality.** `UPDATE orders SET status = status WHERE id = 1` fires `AFTER UPDATE OF status` (because `status` is in the SET list) even though the value doesn't change. Add a `WHEN (OLD.status IS DISTINCT FROM NEW.status)` for value-equality skipping.
 
@@ -1140,7 +1135,7 @@ Mitigation strategies:
 
 10. **`DISABLE TRIGGER ALL` includes RI triggers and requires superuser.** Use `DISABLE TRIGGER USER` to disable only user-level triggers and preserve FK enforcement[^disable-all-excludes-internal]. The verbatim docs note: *"Disabling or enabling internally generated constraint triggers requires superuser privileges; it should be done with caution since of course the integrity of the constraint cannot be guaranteed if the triggers are not executed."*
 
-11. **`ALTER TABLE ... DISABLE TRIGGER` takes ACCESS EXCLUSIVE on the table.** Even though it's a metadata-only change conceptually, it locks the table out for the duration. For high-traffic tables, `SET session_replication_role = 'replica'` per-session is the lock-free alternative.
+11. **`ALTER TABLE ... DISABLE TRIGGER` takes `SHARE ROW EXCLUSIVE`**, blocking concurrent writes until commit. `session_replication_role = 'replica'` is session-local but also bypasses ordinary foreign-key enforcement; use it only with an explicit integrity plan. See <https://www.postgresql.org/docs/16/sql-altertable.html>.
 
 12. **TG_RELNAME is deprecated.** Use `TG_TABLE_NAME` instead. Code that still uses `TG_RELNAME` works on current PG but will break in some future version.
 
@@ -1150,7 +1145,7 @@ Mitigation strategies:
 
 15. **Triggers fire on partitioned tables but the parent's statement-level triggers only fire once even when many partitions are affected.** Statement triggers are per-statement, not per-partition. Row-level triggers fire on each affected partition (cloned to children).
 
-16. **A partition-key UPDATE that moves a row fires DELETE then INSERT triggers, not UPDATE.** Verbatim[^partition-rowmove]: *"If an UPDATE on a partitioned table causes a row to move to another partition, it will be performed as a DELETE from the original partition followed by an INSERT into the new partition."* Audit triggers that count UPDATE events will undercount in row-movement scenarios.
+16. **A partition-key UPDATE that moves a row executes row-level DELETE and INSERT triggers.** The original partition's `BEFORE UPDATE` and `BEFORE DELETE` row triggers also fire; `AFTER UPDATE` row triggers do not. Statement-level UPDATE triggers fire for the original statement.[^partition-rowmove]
 
 17. **`ENABLE REPLICA TRIGGER` doesn't bypass `DISABLE TRIGGER ALL`.** The four states (DISABLE / ENABLE / ENABLE REPLICA / ENABLE ALWAYS) are mutually exclusive — a trigger can only be in one state at a time. `DISABLE TRIGGER name` overrides any prior `ENABLE REPLICA TRIGGER name`.
 
@@ -1162,7 +1157,7 @@ Mitigation strategies:
 
 21. **PG18 silent role-binding change for AFTER triggers.** Pre-PG18: AFTER trigger ran as the role active at execution time (effectively COMMIT time for deferred). PG18+: AFTER trigger runs as the role active at queue time (when the DML happened)[^pg18-role]. Audit code paths that rely on `current_user` inside AFTER trigger functions.
 
-22. **Triggers do not fire on COPY FROM with FREEZE.** `COPY ... FREEZE` requires that no triggers fire on the target table (and several other restrictions). This is one of the reasons FREEZE is a niche optimization.
+22. **`COPY FROM ... FREEZE` invokes triggers and CHECK constraints.** It has special visibility and eligibility restrictions; it does not bypass trigger processing. See <https://www.postgresql.org/docs/16/sql-copy.html>.
 
 23. **`pg_get_triggerdef(oid)` returns a reconstruction, not the original SQL.** Verbatim semantics of `pg_get_*` functions (cross-ref `pg_get_constraintdef` from [`38-foreign-keys-deep.md`](./38-foreign-keys-deep.md) gotcha #13): the output is a decompiled reconstruction. It is functionally equivalent but may differ from the exact source text (whitespace, quoting, alias expansion).
 

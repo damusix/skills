@@ -56,11 +56,11 @@ Five rules drive every physical-backup + PITR decision.
 
 | Need | Use | Default | Production value | Why |
 |---|---|---|---|---|
-| One-time full physical backup, no PITR | `pg_basebackup -D /backup -Ft -X stream` | stream | `-Fp -X stream` directory format for parallel restore | tar format = single archive, harder to parse |
+| One-time full physical backup, no PITR | `pg_basebackup -D /backup -Fp -X stream` | stream | plain format with checksums verified | Includes WAL required to make the backup consistent |
 | Full backup + WAL archive for PITR | `pg_basebackup -D /backup -X stream -Fp` + `archive_library` set | stream | -Fp directory with checksums verified | -X stream guarantees WAL-needed-for-consistency captured |
 | Set up standby from base backup | `pg_basebackup -D /var/lib/pgsql/data -X stream -R` | — | `-R` writes `standby.signal` + `primary_conninfo` | -R = zero post-config |
-| Server-side compression (PG15+) | `pg_basebackup --target=server:/backup --compress=server-zstd:5` | client-side | server-side for fewer client-server bytes | client-side compression wastes CPU on backup server |
-| Modern archiving (PG15+) | `archive_library = 'basic_archive'` + `basic_archive.archive_directory` | empty | Custom C archive module (pgBackRest and Barman document `archive_command` only) | `archive_command` shell overhead caps throughput |
+| Server-side compression (PG15+) | `pg_basebackup --target=server:/backup -X fetch --compress=server-zstd:5` | client-side | use where server-side storage is appropriate | server targets cannot use streamed WAL |
+| Modular archiving (PG15+) | `archive_library = 'basic_archive'` + `basic_archive.archive_directory` | empty | select an archiver meeting durability requirements | archiving can use a module or shell command |
 | Cluster never archived → enable | Set `archive_mode = on`, `wal_level >= replica`, `archive_command` OR `archive_library`, restart | off | both `archive_mode=on` AND archive target | restart required for archive_mode change |
 | PITR to specific timestamp | `recovery_target_time = '2026-05-13 14:00:00 UTC'` | — | Always pair with `recovery_target_action = pause` | pause lets you verify before promotion |
 | PITR to LSN | `recovery_target_lsn = '0/1500000'` | — | Useful when you know exact transaction position | timestamp granularity is COMMIT-record-resolution |
@@ -71,7 +71,7 @@ Five rules drive every physical-backup + PITR decision.
 
 Three smell signals:
 
-- **`archive_command` returning success without durable storage** — `archive_command = 'cp %p /archive/'` is broken; `cp` returns 0 before `fsync` of target. Use `test ! -f /archive/%f && cp %p /archive/%f` AND a tool that fsync's.
+- **`archive_command` returning success without durable storage** — `cp` alone does not guarantee durable storage. Use a tested archiver that handles fsync and verifies any pre-existing segment before reporting success. See <https://www.postgresql.org/docs/16/continuous-archiving.html>.
 - **Base backup taken but no WAL archive** — base backup alone restores to its end-LSN only, not arbitrary point-in-time. WAL archive mandatory for PITR.
 - **`pg_basebackup` to standby without `-R`** — every restore + signal-file-write cycle wastes time; `-R` writes the config automatically.
 
@@ -99,7 +99,7 @@ Flag inventory:
 | `-F` | `--format` | `plain` (default, like data dir) or `tar` |
 | `-X` | `--wal-method` | `stream` (parallel, default), `fetch` (at end), `none` |
 | `-R` | `--write-recovery-conf` | Writes `standby.signal` + `primary_conninfo` in postgresql.auto.conf |
-| `-S` | `--slot` | Use named replication slot (recommended for standbys to bound WAL retention) |
+| `-S` | `--slot` | Use named replication slot; monitor WAL retention and slot validity |
 | `-c` | `--checkpoint` | `fast` (immediate) or `spread` (slower, lighter I/O) |
 | `-Z` | `--compress` | PG15+ `[server-]<method>[:level]` form: `server-zstd:5`, `client-lz4:1`, `gzip:9` |
 | `--target` | (PG15+) | `client` (default), `server[:/path]`, `blackhole` (test) |
@@ -200,11 +200,9 @@ Verbatim definition of `archive_library`[^archive-library]:
 
 **Wrong.** `cp` returns 0 before `fsync`. After a crash, the WAL may not be on disk. Also overwrites silently if `%f` exists.
 
-#### `archive_command` example (durable)
+#### `archive_command` durability
 
-    archive_command = 'test ! -f /var/lib/pgsql/archive/%f && cp %p /var/lib/pgsql/archive/%f && fsync /var/lib/pgsql/archive/%f'
-
-Refuses to overwrite. `fsync` ensures durability. Production teams use **pgBackRest** / **Barman** / **WAL-G** instead — see [`85-backup-tools.md`](./85-backup-tools.md).
+Use a tested archiving tool such as pgBackRest, Barman, or WAL-G rather than a `cp`/`fsync` shell recipe. A correct archiver must durably store the file and directory entry, avoid overwriting different contents, and treat an already-durable identical file as success so crash retries can continue. See <https://www.postgresql.org/docs/16/continuous-archiving.html>.
 
 #### `archive_library` example
 
@@ -212,7 +210,7 @@ Refuses to overwrite. `fsync` ensures durability. Production teams use **pgBackR
     archive_library = 'basic_archive'
     basic_archive.archive_directory = '/var/lib/pgsql/archive'
 
-Restart required for `archive_library` change. `basic_archive` is reference module; production tools (pgBackRest, Barman, WAL-G) document `archive_command`; see [`85-backup-tools.md`](./85-backup-tools.md).
+Reload after changing `archive_library`; PostgreSQL restarts the archiver process. `basic_archive` is a reference module; production tools document their own archive integration. See [`85-backup-tools.md`](./85-backup-tools.md).
 
 #### Monitoring archiving
 
@@ -276,7 +274,7 @@ Verbatim definition of `recovery_target_action`[^recovery-action]:
 | `promote` | Recovery completes; server promotes to primary; accepts writes; timeline incremented | Production rollback decisions |
 | `shutdown` | Recovery stops; server shuts down | Inspect data dir offline before deciding |
 
-Workflow: set `recovery_target_action = pause` initially; connect via `psql`; verify data state via `SELECT * FROM critical_table WHERE ...`; if good, run `SELECT pg_wal_replay_resume();` and the server promotes; if wrong, shut down and restart with different `recovery_target_time`.
+Workflow: pause at the target, inspect through a read-only connection, then resume if correct. For a later target, shut down, set the later target, and restart. For an earlier target, stop the server and restore the base backup again before replaying; replay cannot undo changes already applied. <https://www.postgresql.org/docs/16/continuous-archiving.html>
 
 ### Incremental backups (PG17+)
 
@@ -418,12 +416,12 @@ Procedure:
     # 1. On a fresh server (NOT the primary), stop PG if running
     sudo systemctl stop postgresql-16
 
-    # 2. Wipe the target data directory (verify path FIRST)
-    sudo rm -rf /var/lib/pgsql/16/data
-    sudo -u postgres mkdir -p /var/lib/pgsql/16/data
-    sudo -u postgres chmod 0700 /var/lib/pgsql/16/data
+    # 2. Create an empty target on the isolated restore host.
+    # Preserve any existing data, all external tablespaces and unarchived WAL.
+    sudo -u postgres mkdir -m 0700 /var/lib/pgsql/16/data
 
-    # 3. Restore the most recent base backup taken BEFORE 14:32 UTC
+    # 3. Restore a base backup completed before the 14:31 target.
+    # Restore every tablespace to an isolated path as well.
     sudo -u postgres tar -xf /backups/full_20260513.tar \
       -C /var/lib/pgsql/16/data
 
@@ -433,6 +431,9 @@ Procedure:
     recovery_target_time = '2026-05-13 14:31:00+00'
     recovery_target_inclusive = on
     recovery_target_action = pause
+    # The restored config still points at the production archive.
+    # Keep the new timeline's WAL and .history files out of it.
+    archive_mode = off
     EOF
 
     # 5. Create recovery.signal to enter archive recovery
@@ -452,13 +453,7 @@ If correct, promote:
 
     psql -c "SELECT pg_wal_replay_resume();"
 
-After `pg_wal_replay_resume()`, server completes recovery, timeline increments, accepts writes. Cluster is now ON A NEW TIMELINE — the old primary should NOT be re-attached without `pg_rewind` (see [`89-pg-rewind.md`](./89-pg-rewind.md)).
-
-If recovery state is wrong, shut down and restart with different `recovery_target_time`:
-
-    sudo systemctl stop postgresql-16
-    # Edit postgresql.auto.conf, change recovery_target_time
-    sudo systemctl start postgresql-16
+If the target is too early, shut down, set a later `recovery_target_time`, and restart. If it is too late, stop the server, restore the base backup again, and replay WAL with the earlier target. Restarting the already-recovered data directory cannot undo replayed WAL. Before this cluster archives to any repository, point `archive_command` at a separate archive.
 
 ### Recipe 3: Named restore point before risky DDL
 
@@ -514,7 +509,7 @@ Start the standby; it begins streaming replication immediately. Cross-reference 
 Saves client-server bandwidth on the backup network path:
 
     pg_basebackup \
-      --pgdata=/backups/full_$(date +%Y%m%d).tar.zst \
+      --pgdata=/backups/full_$(date +%Y%m%d) \
       --format=tar \
       --target=client \
       --wal-method=stream \
@@ -528,7 +523,7 @@ Server-side compression to server-local path (requires `pg_write_server_files`):
     pg_basebackup \
       --target=server:/var/lib/pgsql/backups/full \
       --compress=server-zstd:6 \
-      --wal-method=stream \
+      --wal-method=fetch \
       --format=tar
 
 ### Recipe 6: PG17+ incremental backup chain
@@ -571,17 +566,7 @@ Restore via `pg_combinebackup`:
 
 Then run normal PITR procedure (Recipe 2) using `/var/lib/pgsql/16/data` as the base.
 
-PG18+ hard-link to save disk:
-
-    pg_combinebackup \
-      /backups/full \
-      /backups/incr_mon \
-      /backups/incr_tue \
-      --link \
-      -o /var/lib/pgsql/16/data
-
-> [!WARNING] `--link` shares inodes
-> Hard-linking is only safe if the synthetic backup is consumed once and discarded. Any write to a hard-linked file corrupts ALL backups sharing that inode.
+PG18+ `--link` can reduce copying only when all linked backups will be consumed together and never used independently. Starting PostgreSQL on the linked output changes shared files and can invalidate the source backups. Use the independent copy above for a restore. See <https://www.postgresql.org/docs/18/app-pgcombinebackup.html>.
 
 ### Recipe 7: Stop-the-line PITR — recover to LSN
 
@@ -618,7 +603,7 @@ Common archive failures:
 |---|---|---|
 | `cp: cannot create` | Target directory missing or read-only | Check permissions; create directory |
 | `archive_command failed with exit code 1` | Wrong command syntax (e.g., `cp %p /archive` without `/%f`) | Test command with sample WAL segment |
-| `file already exists` | Idempotency missing | Use `test ! -f /archive/%f && cp ...` |
+| `file already exists` | Retry after crash or conflicting archive contents | Verify identical contents are fully durable; report success only for identical durable files |
 | `No space left on device` | Archive target full | Provision more storage; consider retention policy |
 | `connection refused` (network archive) | Network problem | Validate connectivity; use retries |
 
@@ -629,40 +614,20 @@ To cancel running `pg_basebackup` cleanly:
     # On the client (running pg_basebackup):
     kill -INT <pid>
 
-    # On the server, terminate the replication walsender:
-    SELECT pg_terminate_backend(pid)
-    FROM pg_stat_replication
-    WHERE application_name = 'pg_basebackup';
+    # Identify the exact backup connection before terminating it.
+    SELECT pid, application_name, client_addr, state
+    FROM pg_stat_replication WHERE application_name = 'pg_basebackup';
 
-    # If using a replication slot, drop and recreate:
+Temporary slots disappear when their session ends. For a persistent slot, verify its owner and purpose before cleanup; never drop a slot used by a standby or another backup. Remove an unused dedicated slot only after confirming it is inactive:
+
+    SELECT slot_name, active FROM pg_replication_slots WHERE slot_name = 'backup_slot';
     SELECT pg_drop_replication_slot('backup_slot');
-    SELECT pg_create_physical_replication_slot('backup_slot');
-
-Cancellation is safe; no on-server state to clean up other than the slot.
 
 ### Recipe 10: Test base backup is restorable (verify weekly)
 
 Discipline: every base backup gets a test restore. Schedule weekly:
 
-    #!/bin/bash
-    # Test restore on a disposable host
-    set -e
-    BACKUP=$(ls -td /backups/full_* | head -1)
-    TARGET=/tmp/restore_test/$(basename $BACKUP)
-    rm -rf $TARGET
-    mkdir -p $TARGET
-    cp -r $BACKUP/* $TARGET/
-    pg_verifybackup $TARGET
-
-    # Try to start it (different port to avoid conflict)
-    pg_ctl -D $TARGET -o "-p 6543" start
-    sleep 5
-    psql -p 6543 -c "SELECT now();"
-    pg_ctl -D $TARGET stop
-
-    rm -rf $TARGET
-
-Schedule via cron weekly. Catch corruption / misconfiguration before disaster.
+Restore on a disposable, isolated host using the normal restore procedure. Include all tablespaces and required WAL, and prevent the restored server from connecting to production or writing to production archives. Run `pg_verifybackup` where supported, start the restored cluster, and inspect application data. See <https://www.postgresql.org/docs/16/app-pgverifybackup.html> and <https://www.postgresql.org/docs/16/continuous-archiving.html>.
 
 ### Recipe 11: Audit WAL retention slots blocking archive cleanup
 
@@ -682,16 +647,16 @@ Slots with `retained_wal > 10GB` are the most common cause of disk-fill emergenc
 
 For external snapshot tools (LVM, filesystem snapshots, cloud volume snapshots):
 
-    -- Mark beginning of backup; obtains low-level backup label
-    SELECT pg_backup_start('snapshot_2026_05_13', false);  -- false = spread checkpoint
+    -- Keep this same database session open throughout the backup.
+    SELECT pg_backup_start('snapshot_2026_05_13', false);
 
-    -- ... take volume snapshot via your provisioner (LVM, EBS, etc.) ...
+    -- Take snapshots of PGDATA, external WAL, and every tablespace.
+    -- In the same session, stop backup and capture all three returned fields:
+    SELECT * FROM pg_backup_stop(true);
 
-    -- Mark end of backup; returns LSN and label file content
-    SELECT * FROM pg_backup_stop(true);  -- true = wait for archive
-
-    -- Store the returned 'labelfile' content as backup_label inside the snapshot
-    -- This file is REQUIRED for the snapshot to be restorable.
+    -- Store labelfile byte-for-byte as backup_label at the backup root.
+    -- If spcmapfile is nonempty, store it byte-for-byte as tablespace_map.
+    -- Retain every WAL segment required from backup start through backup end.
 
 `pg_backup_start`/`pg_backup_stop` replaced `pg_start_backup`/`pg_stop_backup` in PG15. Pre-PG15 used old names. Cross-reference [`33-wal.md`](./33-wal.md) for `backup_label` mechanics.
 
@@ -715,33 +680,33 @@ Useful for "restore last full backup with no point-in-time twist" — server pro
 
 2. **`archive_library` and `archive_command` are mutually exclusive in PG16+.** Earlier versions: `archive_library` silently overrode `archive_command`. Now setting both is hard error. Pick one.
 
-3. **`archive_command` returning 0 without `fsync` = silent corruption.** `cp %p /archive/%f` looks correct but `cp` returns before the file is durable. Use durable wrappers: `test ! -f /archive/%f && cp %p /archive/%f && fsync /archive/%f`. Production teams use pgBackRest / Barman / WAL-G which handle durability.
+3. **`archive_command` returning 0 before durable storage can lose WAL.** Use a tested archiving tool that handles durability, conflict detection, and retry of identical archived files. See <https://www.postgresql.org/docs/16/continuous-archiving.html>.
 
 4. **Base backup without WAL archive = restore to backup-end-LSN only.** No PITR possible. To enable PITR, set up continuous archiving BEFORE taking the base backup.
 
-5. **`-X fetch` is brittle.** Single-connection WAL retrieval at end of backup; if backup takes longer than `wal_keep_size` worth of WAL is retained, backup is unusable. Always use `-X stream`.
+5. **`-X fetch` needs enough WAL retained until backup ends.** Prefer `-X stream` for client-side backups; `--target=server` instead requires `-X fetch` or `-X none`. Monitor WAL retention and verify the resulting backup.
 
 6. **PG17 incremental backup requires `summarize_wal = on` BEFORE the base backup.** WAL summaries are written only after `summarize_wal` is enabled. An incremental against a base backup taken before summarization started will fail.
 
 7. **`pg_combinebackup` requires complete chain.** If any incremental in the chain is missing, the synthetic restore fails. Retain at least one full + complete chain.
 
-8. **`pg_combinebackup --link` (PG18+) shares inodes.** Modifying or reorganizing one of the linked files corrupts the others. Only use for one-shot consumption.
+8. **`pg_combinebackup --link` (PG18+) shares inodes.** Starting or modifying the linked output can invalidate the source backups. Do not use it when the backups must remain independent.
 
 9. **`recovery_target_inclusive` default is `on` — stops AFTER target.** Want to stop BEFORE a specific bad transaction at XID 5000? Set `recovery_target_xid = 5000` AND `recovery_target_inclusive = off`.
 
-10. **At most one `recovery_target_*` setting may be active.** Setting two raises an error on PG12+ (verbatim from `runtime-config-wal.html`). Comment out unused settings explicitly.
+10. **Select at most one recovery target selector:** `recovery_target`, `recovery_target_lsn`, `recovery_target_name`, `recovery_target_time`, or `recovery_target_xid`. These are mutually exclusive. Compatible modifiers such as `recovery_target_action`, `recovery_target_inclusive`, and `recovery_target_timeline` may accompany a selector. See <https://www.postgresql.org/docs/16/runtime-config-wal.html#RUNTIME-CONFIG-WAL-RECOVERY-TARGET>.
 
-11. **`recovery_target_action = pause` (default) leaves server in recovery mode.** Connections are read-only. Run `SELECT pg_wal_replay_resume();` to promote; `pg_ctl stop` to shut down without promotion; restart with different target to retry.
+11. **`recovery_target_action = pause` leaves the server in recovery.** Resume with `pg_wal_replay_resume()` if correct. To choose an earlier target, restore the base backup anew and replay with the revised target.
 
 12. **`pg_basebackup` to local disk uses local disk.** No magic — if the backup destination is the same disk as `$PGDATA`, you've doubled disk usage and an `fsync` storm. Mount backup-destination disk separately.
 
-13. **`pg_basebackup` from a standby works** — but the standby must be running with `hot_standby = on` and the backup will include only WAL that was applied at the standby up to the backup-start time. Verify the standby is not lagging.
+13. **`pg_basebackup` from a standby has extra prerequisites.** The standby must accept replication connections: set `max_wal_senders` and `hot_standby`, and allow the replication connection in its `pg_hba.conf`. Enable `full_page_writes` on the primary; ensure required backup WAL remains available. A promotion during the backup causes it to fail. See <https://www.postgresql.org/docs/16/app-pgbasebackup.html>.
 
 14. **`max_slot_wal_keep_size` default is `-1` (unlimited).** Set to a finite size in production to prevent abandoned replication slots from filling `pg_wal/`. See [`75-replication-slots.md`](./75-replication-slots.md).
 
 15. **`archive_mode = always` (not `on`) archives on standbys too.** Useful if primary's archive target is unreachable but standby's is reachable. Without `always`, only primary archives, so a primary's outage breaks archiving.
 
-16. **Tablespaces require `--tablespace-mapping`.** `pg_basebackup` of a cluster with tablespaces must remap them to new paths on the destination: `pg_basebackup --tablespace-mapping=/old/ts1=/new/ts1 ...` for each. Otherwise restore fails. Same for `pg_combinebackup`.
+16. **Tablespace destinations must be safe.** Plain-format backups use original tablespace paths unless mapped. Map to empty, isolated paths where necessary, especially when source and destination share a host. See <https://www.postgresql.org/docs/16/app-pgbasebackup.html> and <https://www.postgresql.org/docs/17/app-pgcombinebackup.html>.
 
 17. **Cross-version restore is impossible.** PG16 base backup cannot restore on PG17. Use logical backup ([`83-backup-pg-dump.md`](./83-backup-pg-dump.md)) or logical replication ([`74-logical-replication.md`](./74-logical-replication.md)) for cross-version migration.
 
@@ -749,7 +714,7 @@ Useful for "restore last full backup with no point-in-time twist" — server pro
 
 19. **`pg_basebackup` runs at primary's I/O cost.** During backup, primary reads entire cluster + ships WAL. Spread checkpoint (`-c spread`, default) mitigates checkpoint storm; `--max-rate` throttles network. Don't run during peak hours without throttling.
 
-20. **`pg_verifybackup` validates manifest only.** Doesn't catch WAL corruption between backup-start LSN and backup-end LSN. Pair with periodic test-restores (Recipe 10).
+20. **`pg_verifybackup` checks manifest files and parses required WAL by default; it does not replace an actual test restore.** See <https://www.postgresql.org/docs/16/app-pgverifybackup.html>.
 
 21. **PG15 server-side compression to `--target=server` requires `pg_write_server_files` role membership.** Otherwise: `permission denied`. Cross-reference [`46-roles-privileges.md`](./46-roles-privileges.md) gotcha #14.
 

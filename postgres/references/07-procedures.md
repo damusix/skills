@@ -52,7 +52,7 @@ Use this file when:
 - You need a routine that returns data via **`OUT` / `INOUT` parameters** (introduced for procedures in PostgreSQL 14[^pg14-out]).
 - You are deciding **procedure vs function** for new code and need the contract sheet that separates them.
 - You hit the error `invalid transaction termination` while trying to `COMMIT` inside a function, a `SECURITY DEFINER` procedure, a procedure with a `SET` clause, an `EXCEPTION` block, or a cursor loop over a non-read-only command.
-- You need to call a procedure from PL/pgSQL and want the right `CALL ... INTO ...` form.
+- You need to call a procedure from PL/pgSQL and pass variables for its `OUT` parameters.
 - You're scheduling a periodic job with [`pg_cron`](./98-pg-cron.md) and need to know whether to register a function or a procedure.
 
 For function mechanics (mutability, parallel safety, polymorphic types, SQL-function inlining, `LEAKPROOF`, `COST`/`ROWS`, `STRICT`), see [`06-functions.md`](./06-functions.md). For PL/pgSQL block grammar — `DECLARE`, control flow, exception handling, dynamic SQL — see [`08-plpgsql.md`](./08-plpgsql.md). For transactions and isolation generally, see [`41-transactions.md`](./41-transactions.md) and [`42-isolation-levels.md`](./42-isolation-levels.md).
@@ -76,7 +76,7 @@ For function mechanics (mutability, parallel safety, polymorphic types, SQL-func
 | `STRICT` / `CALLED ON NULL INPUT` | yes | not applicable[^xproc] |
 | `LEAKPROOF` | yes (planner-relevant) | not applicable |
 | `COST` / `ROWS` | yes | not applicable |
-| `SECURITY DEFINER` / `INVOKER` | yes | yes (but **disables** transaction control)[^createproc] |
+| `SECURITY DEFINER` / `INVOKER` | yes | yes (only `DEFINER` disables transaction control)[^createproc] |
 | `SET configuration_parameter` | yes | yes (but **disables** transaction control)[^createproc] |
 | Usable in expressions | yes | no |
 | Usable in index expressions | yes (`IMMUTABLE` only) | no |
@@ -195,7 +195,7 @@ Same as functions — `DEFAULT expr` or `= expr`. Trailing arguments with defaul
 Same flag meaning as functions: `SECURITY INVOKER` (default) runs as the caller; `SECURITY DEFINER` runs as the owner.
 
 > [!WARNING] SECURITY DEFINER blocks COMMIT
-> If you mark a procedure `SECURITY DEFINER`, any `COMMIT` or `ROLLBACK` inside it will fail at runtime with `invalid transaction termination`. The grammar accepts the combination at `CREATE PROCEDURE` time; the failure surfaces when you actually `CALL` it. To get both privileged execution and mid-procedure `COMMIT`, use a two-procedure pattern: a small `SECURITY DEFINER` outer procedure for privileged setup, and a separate non-`SECURITY DEFINER` worker procedure for the transactional loop.
+> A `SECURITY DEFINER` procedure cannot execute transaction control. For privileged work with intermediate commits, call a narrowly scoped definer routine from a top-level invoker procedure, return from that call, and commit in the invoker after the privileged work completes.[^createproc]
 
 
 ### SET configuration parameters
@@ -206,7 +206,7 @@ Same flag meaning as functions: `SECURITY INVOKER` (default) runs as the caller;
 
 > *"If a `SET` clause is attached to a procedure, then that procedure cannot execute transaction control statements (for example, `COMMIT` and `ROLLBACK`, depending on the language)."*
 
-This is the *single most surprising* procedure restriction. If you need a chunked-loop procedure that also pins `search_path`, do the `SET` **inside** the procedure body (e.g., `PERFORM set_config('search_path', 'audit, public', false);` once at entry) instead of using a `SET` clause on `CREATE PROCEDURE`.
+For a procedure that commits, schema-qualify its objects or set a trusted `search_path` at each transaction boundary. A transaction-local setting ends at each commit; a session setting persists after the procedure returns.
 
 There is a subtle interaction with `SET LOCAL` from within the procedure[^createproc]:
 
@@ -220,11 +220,13 @@ There is a subtle interaction with `SET LOCAL` from within the procedure[^create
 
 Example:
 
-    CREATE PROCEDURE bump_versions(table_name regclass)
+    CREATE PROCEDURE bump_versions()
     LANGUAGE sql
     BEGIN ATOMIC
-        UPDATE table_name SET version = version + 1;
+        UPDATE app.versions SET version = version + 1;
     END;
+
+Identifiers cannot be supplied as SQL parameters. For a runtime table name, use PL/pgSQL `EXECUTE` with identifier quoting.
 
 `BEGIN ATOMIC` SQL procedures cannot use `COMMIT` / `ROLLBACK` (no procedural control flow). They are a clean choice for grouping a fixed sequence of DML statements behind a `CALL`.
 
@@ -342,7 +344,7 @@ The right hardening boilerplate is the same as for functions[^funcsec]:
     REVOKE EXECUTE ON PROCEDURE audit.archive_orders(date) FROM PUBLIC;
     GRANT  EXECUTE ON PROCEDURE audit.archive_orders(date) TO ops_admin;
 
-For new schemas, prefer `ALTER DEFAULT PRIVILEGES IN SCHEMA audit REVOKE EXECUTE ON ROUTINES FROM PUBLIC;` so the next procedure created in that schema is hardened too. See [`46-roles-privileges.md`](./46-roles-privileges.md) for the default-privileges machinery.
+To remove the global default PUBLIC grant for future routines created by a given owner, use `ALTER DEFAULT PRIVILEGES FOR ROLE owner_role REVOKE EXECUTE ON ROUTINES FROM PUBLIC;`. A per-schema REVOKE cannot remove the global default grant; existing routines need explicit REVOKE. See [`46-roles-privileges.md`](./46-roles-privileges.md).
 
 
 ### Lock-level summary for procedure DDL
@@ -413,7 +415,7 @@ A frequent procedure pattern is `FOR row IN SELECT ... FROM ... ORDER BY ... LOO
 
 > *"Normally, cursors are automatically closed at transaction commit. However, a cursor created as part of a loop like this is automatically converted to a holdable cursor by the first `COMMIT` or `ROLLBACK`. That means that the cursor is fully evaluated at the first `COMMIT` or `ROLLBACK` rather than row by row."*
 
-Consequence: the entire result set is **materialized in memory** at the first commit. For a 50-million-row loop, that is not what you want. The right pattern is to **drive the loop by a `WHERE ... LIMIT N` query** that's re-run each iteration, not by an open cursor — see Recipe 1 below.
+Consequence: the entire result set is **materialized in memory or temporary storage** at the first commit. For a 50-million-row loop, that is not what you want. Drive the loop with bounded queries re-issued each iteration; see Recipe 1.
 
 
 ## Examples / Recipes
@@ -452,10 +454,10 @@ The canonical "delete N million rows without blowing up WAL / autovacuum / lock 
 
     CALL archive_old_orders('2024-01-01'::timestamptz);
 
-Why this shape: each iteration is its own transaction, so vacuum can reclaim space between batches, `FOR UPDATE SKIP LOCKED` lets concurrent updaters proceed, and the `LIMIT` keeps lock count predictable.
+Each iteration commits separately. `SKIP LOCKED` may leave locked qualifying rows behind: a zero-row batch does not prove completion. Retry later or run a final pass without `SKIP LOCKED`.
 
 > [!WARNING] Do not wrap the LOOP body in BEGIN ... EXCEPTION
-> Adding `EXCEPTION WHEN OTHERS THEN ...` around the iteration disables `COMMIT` inside the loop (subtransaction rule). If you need error handling, log via `RAISE LOG` from outside an exception block, or use a wrapper procedure that calls this one and catches at that layer.
+> Adding `EXCEPTION WHEN OTHERS THEN ...` around the iteration disables `COMMIT` inside the block. A caller's active exception block also creates a subtransaction, so it cannot wrap a committing worker.
 
 
 ### Recipe 2 — Procedure with OUT parameters (PG14+)
@@ -493,9 +495,7 @@ Useful when each step is independent and you want crash-safe progress (a crash m
         REFRESH MATERIALIZED VIEW CONCURRENTLY mv_sales_daily;
         COMMIT;
 
-        RAISE LOG 'maintenance: step 2 — vacuum hot table';
-        VACUUM (ANALYZE) orders;
-        COMMIT;
+        -- Run VACUUM separately as a top-level client command after CALL returns.
 
         RAISE LOG 'maintenance: step 3 — roll partitions';
         CALL partition_admin.rotate_orders(retention_days => 90);
@@ -505,31 +505,28 @@ Useful when each step is independent and you want crash-safe progress (a crash m
     END;
     $$;
 
-(Note: `VACUUM` cannot run inside a transaction block — but in a procedure, between commits, each statement is its own top-level transaction, so `VACUUM` works. This is one of the strongest reasons to use a procedure over a script of `psql -c '...'` calls.)
+Run `VACUUM (ANALYZE) orders` separately as a top-level client command. `VACUUM` cannot execute inside the procedure.
 
 
 ### Recipe 4 — COMMIT AND CHAIN to preserve isolation
 
 If your loop body relies on `REPEATABLE READ`, use `COMMIT AND CHAIN` so the next iteration inherits the isolation level instead of falling back to `read committed`:
 
-    CREATE PROCEDURE consistent_export()
+    CREATE PROCEDURE commit_with_same_isolation()
     LANGUAGE plpgsql
     AS $$
     BEGIN
+        COMMIT;  -- CALL already ran a query in the caller's transaction
         SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
-
-        FOR partition_name IN
-            SELECT inhrelid::regclass::text
-            FROM pg_inherits
-            WHERE inhparent = 'orders'::regclass
-            ORDER BY 1
-        LOOP
-            -- ... export this partition snapshotted ...
-            EXECUTE format('COPY %I TO ''/exports/%I.csv'' CSV', partition_name, partition_name);
-            COMMIT AND CHAIN;
-        END LOOP;
+        INSERT INTO export_log(message) VALUES ('first batch');
+        COMMIT AND CHAIN;
+        INSERT INTO export_log(message) VALUES ('second batch');
     END;
     $$;
+
+`SET TRANSACTION ISOLATION LEVEL` as the first statement of the body fails with *"SET TRANSACTION ISOLATION LEVEL must be called before any query"*, because `CALL` has already taken a snapshot in the current transaction. The opening `COMMIT` starts a fresh transaction, which requires a top-level `CALL` outside an explicit transaction block.[^plpgsql-tx-test]
+
+Each transaction receives a fresh snapshot. `COMMIT AND CHAIN` preserves the isolation level, not one consistent snapshot across transactions.
 
 
 ### Recipe 5 — SECURITY DEFINER procedure that pins search_path
@@ -547,25 +544,7 @@ Hardening pattern for a privileged procedure. Note: this version **cannot use `C
     REVOKE EXECUTE ON PROCEDURE audit.record_login(bigint, inet) FROM PUBLIC;
     GRANT  EXECUTE ON PROCEDURE audit.record_login(bigint, inet) TO app_role;
 
-Two-procedure pattern for `SECURITY DEFINER` + `COMMIT` (see [WARNING above](#security-definer-vs-security-invoker)):
-
-    -- non-SECURITY-DEFINER worker can commit; runs as caller
-    CREATE PROCEDURE archive_worker(...)
-    LANGUAGE plpgsql AS $$ ... COMMIT; ... $$;
-
-    -- thin SECURITY DEFINER wrapper for privilege escalation;
-    -- does NOT call COMMIT and does NOT have a SET clause that would block one in the worker.
-    -- (We must set search_path inline instead of via SET clause to avoid the restriction.)
-    CREATE OR REPLACE PROCEDURE archive_admin(...)
-    SECURITY DEFINER
-    LANGUAGE plpgsql AS $$
-    BEGIN
-        PERFORM set_config('search_path', 'audit, pg_catalog', true);  -- transaction-local
-        CALL archive_worker(...);  -- still no COMMIT here either
-    END;
-    $$;
-
-The wrapper cannot `COMMIT` either — `SECURITY DEFINER` and chunked `COMMIT` are incompatible inside a single procedure. The caller must invoke the worker directly with appropriate privileges.
+A committing invoker procedure can call a narrowly scoped `SECURITY DEFINER` routine for each privileged operation, then commit after that routine returns. Restrict the definer's execute privilege and pin its path to trusted schemas.
 
 
 ### Recipe 6 — Procedure as the orchestrator, functions as the building blocks
@@ -612,8 +591,9 @@ Combine with [`pg_cron`](./98-pg-cron.md) for nightly scheduling. Each operation
         );
         COMMIT;
 
-        IF EXISTS (SELECT 1 FROM pg_class WHERE relname = old_part) THEN
-            EXECUTE format('ALTER TABLE orders DETACH PARTITION %I CONCURRENTLY', old_part);
+        IF to_regclass(old_part) IS NOT NULL THEN
+            -- Plain DETACH: CONCURRENTLY cannot run inside a procedure body.
+            EXECUTE format('ALTER TABLE orders DETACH PARTITION %I', old_part);
             COMMIT;
             EXECUTE format('DROP TABLE %I', old_part);
             COMMIT;
@@ -625,6 +605,8 @@ Schedule with pg_cron:
 
     SELECT cron.schedule('rotate-orders', '5 2 * * *',
                          $$CALL rotate_orders_partitions(90)$$);
+
+A plain `DETACH PARTITION` takes `ACCESS EXCLUSIVE` on `orders` until its transaction commits. `DETACH PARTITION CONCURRENTLY` cannot execute inside a transaction block, including a procedure body. To avoid the stronger lock, drop the detach and drop steps from the procedure and schedule `ALTER TABLE orders DETACH PARTITION … CONCURRENTLY` as its own pg_cron job, which runs as a top-level statement. See [`01-syntax-ddl.md`](./01-syntax-ddl.md#recipe-rotate-a-partition-into-the-archive).
 
 
 ### Recipe 8 — Idempotent CREATE OR REPLACE PROCEDURE boilerplate
@@ -695,7 +677,7 @@ Procedures live in `pg_proc` like functions, distinguished by `prokind = 'p'`. (
       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
     ORDER BY 1, 2;
 
-For the audit script that finds every `SECURITY DEFINER` procedure missing a pinned `search_path`, see [`06-functions.md`](./06-functions.md#recipe-11--pin-search_path-on-every-security-definer-and-index-used-function) — the same query works against `prokind IN ('f','p')` to cover both.
+For the audit script that finds every `SECURITY DEFINER` procedure missing a pinned `search_path`, see [`06-functions.md`](./06-functions.md#recipe-11--audit-security-definer-functions-without-a-pinned-search_path) — the same query works against `prokind IN ('f','p')` to cover both.
 
 
 ## Gotchas / Anti-patterns
@@ -703,13 +685,13 @@ For the audit script that finds every `SECURITY DEFINER` procedure missing a pin
 
 1. **Trying to `COMMIT` inside a function.** Functions cannot end the transaction they're embedded in. If you find yourself wanting to, refactor to a procedure.
 
-2. **`SECURITY DEFINER` + `COMMIT` in the same procedure.** Grammatically accepted; fails at runtime. Choose one. If you must have both, escalate privilege at the **outer** call site (e.g., a security-definer thin wrapper that does nothing requiring commit) and put the commit loop in a separate non-`SECURITY DEFINER` procedure granted to a privileged role.
+2. **`SECURITY DEFINER` + `COMMIT` in the same procedure.** Call a restricted definer routine from an invoker procedure and commit only after the definer returns.
 
-3. **`SET search_path = '...'` clause on a chunked-COMMIT procedure.** Same problem as #2. Use `PERFORM set_config('search_path', '...', true)` at the top of the body instead.
+3. **`SET search_path` clause on a chunked-COMMIT procedure.** Schema-qualify object names or set a trusted path per transaction. Transaction-local settings expire on each commit.
 
-4. **`EXCEPTION` block in the loop body.** The exception handler creates a subtransaction (`SAVEPOINT`), which disables `COMMIT` inside the block and adds `subtrans` SLRU pressure. If you need per-iteration error handling, do it at the calling layer or use a savepoint-free strategy like inspecting `GET DIAGNOSTICS` after each `UPDATE`.
+4. **`EXCEPTION` block around a commit.** The handler creates a subtransaction, so a commit cannot occur inside it or inside a worker it calls. Handle errors in the client after `CALL` returns, or keep handling outside the committing block.
 
-5. **Holdable-cursor materialization.** `FOR row IN SELECT ... LOOP COMMIT; END LOOP;` does **not** stream row-by-row after the first commit — the cursor is fully materialized in memory. For large sets, drive the loop with `LIMIT N` re-issued each iteration, not by a `FOR row IN ...` cursor.
+5. **Holdable-cursor materialization.** `FOR row IN SELECT ... LOOP COMMIT; END LOOP;` materializes the cursor at the first commit in memory or temporary storage. For large sets, drive the loop with a bounded query re-issued each iteration.
 
 6. **Snapshot reset after `COMMIT`.** Code that reads a value pre-`COMMIT` and assumes it's still current post-`COMMIT` is wrong; concurrent writers may have committed in between. Re-read inside each transaction.
 
@@ -717,7 +699,7 @@ For the audit script that finds every `SECURITY DEFINER` procedure missing a pin
 
 8. **`CALL` inside a `BEGIN; ... COMMIT;` from the client.** The procedure cannot commit because it's nested in an explicit transaction block. The caller must run `CALL` outside an open transaction.
 
-9. **Procedures + connection pooling in transaction mode.** Procedures often hold a backend across multiple transactions (one per commit cycle). Transaction-pooled connections (pgBouncer `pool_mode = transaction`) will rotate the underlying backend at every commit, breaking session-scoped advisory locks and `SET LOCAL`. For procedures that commit, use session-pool mode or call them from a dedicated worker, not from the request-path pool. See [`81-pgbouncer.md`](./81-pgbouncer.md).
+9. **Procedures + transaction pooling.** A single `CALL` remains on its backend until it finishes, even if the procedure commits internally. Transaction-local settings still expire at each commit, and session state must not be assumed to survive a later pool checkout. Release session advisory locks reliably before returning.
 
 10. **`SECURITY DEFINER` without `REVOKE EXECUTE ... FROM PUBLIC`.** Same gotcha as functions: `PUBLIC` gets `EXECUTE` by default. A `SECURITY DEFINER` procedure that you intended only for one role is, by default, callable by anyone in the database. Always revoke `PUBLIC` and grant explicitly.
 
@@ -762,6 +744,8 @@ For the audit script that finds every `SECURITY DEFINER` procedure missing a pin
 [^alterproc]: PostgreSQL 16, `ALTER PROCEDURE` reference page. Documents the supported actions: `RENAME TO`, `OWNER TO`, `SET SCHEMA`, `SECURITY DEFINER`/`INVOKER`, `SET configuration_parameter`, `RESET`, `DEPENDS ON EXTENSION`. https://www.postgresql.org/docs/16/sql-alterprocedure.html
 
 [^plpgsql-tx]: PostgreSQL 16, *"43.8. Transaction Management"* (PL/pgSQL chapter). Includes the verbatim restrictions *"Transaction control is only possible in `CALL` or `DO` invocations from the top level or nested `CALL` or `DO` invocations without any other intervening command."*, *"A transaction cannot be ended inside a block with exception handlers."*, *"Transaction commands are not allowed in cursor loops driven by commands that are not read-only (for example `UPDATE ... RETURNING`)."*, and the holdable-cursor materialization note *"a cursor created as part of a loop like this is automatically converted to a holdable cursor by the first `COMMIT` or `ROLLBACK`. That means that the cursor is fully evaluated at the first `COMMIT` or `ROLLBACK` rather than row by row."* https://www.postgresql.org/docs/16/plpgsql-transactions.html
+
+[^plpgsql-tx-test]: PostgreSQL 16 regression test `src/pl/plpgsql/src/expected/plpgsql_transaction.out`: `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ` as the first statement of a PL/pgSQL block raises *"SET TRANSACTION ISOLATION LEVEL must be called before any query"*; the same statement after a `COMMIT` succeeds. https://github.com/postgres/postgres/blob/REL_16_STABLE/src/pl/plpgsql/src/expected/plpgsql_transaction.out
 
 [^xproc]: PostgreSQL 16, *"38.4. User-Defined Procedures"*. Includes the verbatim function/procedure distinctions *"A procedure can commit or roll back transactions during its execution (then automatically beginning a new transaction), so long as the invoking `CALL` command is not part of an explicit transaction block. A function cannot do that."* and *"Certain function attributes, such as strictness, don't apply to procedures. Those attributes control how the function is used in a query, which isn't relevant to procedures."* https://www.postgresql.org/docs/16/xproc.html
 

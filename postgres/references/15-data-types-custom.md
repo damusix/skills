@@ -137,6 +137,8 @@ When the field shape really is a row in disguise (it has its own identity, lifec
 A domain is a base type plus a name, optional collation, optional default, and zero or more `CHECK` / `NOT NULL` constraints[^createdomain]:
 
 ```sql
+CREATE EXTENSION IF NOT EXISTS citext;
+
 CREATE DOMAIN positive_int AS integer
     CHECK (VALUE > 0);
 
@@ -240,7 +242,7 @@ WHERE enumtypid = 'mood'::regtype
 ORDER BY enumsortorder;
 ```
 
-The `enumsortorder` float8 column drives positional comparison. When you `ADD VALUE BEFORE x`, PG picks an `enumsortorder` value between the neighbor positions; this is why insertions never require rewriting existing tables (the on-disk OID for each label is fixed when the label is created).
+The `enumsortorder` float4 column drives positional comparison. When you `ADD VALUE BEFORE x`, PG picks an order value between neighbors without rewriting stored enum values.
 
 
 
@@ -373,7 +375,7 @@ For a discrete subtype, supply a `canonical = your_canonicalize_fn` function. Fo
 | `RENAME CONSTRAINT … TO …` | |
 | `RENAME TO` / `OWNER TO` / `SET SCHEMA` | |
 
-The **`NOT VALID` + `VALIDATE`** pattern is the same as for tables: add the constraint without scanning existing rows (instant), then validate when the resulting `SHARE UPDATE EXCLUSIVE` scan is acceptable[^alterdomain]:
+For a reliable online rollout, add the constraint `NOT VALID`, commit, wait for all transactions that started before that commit to finish, then validate. Concurrent older transactions otherwise might insert unchecked values.[^alterdomain]
 
 ```sql
 ALTER DOMAIN us_zip
@@ -439,6 +441,8 @@ For more than one or two fields, prefer separate columns — composite columns w
 An RFC-ish email domain reused across multiple tables:
 
 ```sql
+CREATE EXTENSION IF NOT EXISTS citext;
+
 CREATE DOMAIN email_addr AS citext
     CHECK (VALUE ~ '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$');
 
@@ -467,9 +471,10 @@ ALTER DOMAIN positive_int
     ADD CONSTRAINT no_zero CHECK (VALUE > 0)
     NOT VALID;
 
--- application is updated to reject zero on the way in
+-- Commit, then wait for transactions that began before the constraint commit
+-- to finish before validating, so they cannot insert unchecked values later.
 
--- during maintenance: confirm all existing data also conforms
+-- During maintenance: confirm all existing data also conforms.
 ALTER DOMAIN positive_int VALIDATE CONSTRAINT no_zero;
 ```
 
@@ -642,8 +647,8 @@ CREATE TABLE feature_support (
 );
 
 INSERT INTO feature_support VALUES
-    ('jsonb_path_query',  int4range(120000, 999999, '[)')),
-    ('virtual_generated', int4range(180000, 999999, '[)'));
+    ('jsonb_path_query',  semver_range(120000, 999999, '[)')),
+    ('virtual_generated', semver_range(180000, 999999, '[)'));
 
 -- Which features support v15.4 = 150004?
 SELECT feature FROM feature_support WHERE versions @> 150004;
@@ -770,7 +775,7 @@ For dependencies that route through composite/array/range, walk `pg_depend` — 
 
 13. **`range_agg` and `range_intersect_agg` are PG14+.** On earlier versions you need to write your own aggregate or fall back to client-side computation.
 
-14. **GiST/SP-GiST indexes accelerate range operators; b-tree does not.** A b-tree index on a range column only supports equality. For `&&`, `@>`, `<@`, `-|-` you must use `USING gist` or `USING spgist` (the latter is often smaller and faster to build for the built-in range types).
+14. **GiST/SP-GiST indexes accelerate range operators; b-tree does not.** B-tree supports equality and an ordering comparison, but that ordering is rarely useful for range semantics. For `&&`, `@>`, `<@`, or `-|-`, use GiST or SP-GiST.[^rangetypes]
 
 15. **Range exclusion constraints require `btree_gist` only when combining b-tree-only operators (like `=`) with range operators.** `EXCLUDE USING gist (during WITH &&)` alone works without `btree_gist`; adding `room_id WITH =` to the constraint is what pulls in the extension.
 

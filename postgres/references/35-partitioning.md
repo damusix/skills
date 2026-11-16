@@ -71,7 +71,7 @@ Use this matrix to pick a strategy before reaching for syntax. Three smell signa
 | Need to drop ≥monthly partitions without affecting writers | **DETACH PARTITION CONCURRENTLY** (PG14+) | `DELETE WHERE date < …` | DETACH is metadata-only after CHECK is validated; DELETE generates bloat and WAL. |
 | Need to load a large staging table and atomically add it to the partitioned set | **ATTACH PARTITION with pre-built `CHECK` constraint matching the partition bound** | `INSERT INTO partitioned SELECT` | ATTACH avoids the full table scan when a matching `CHECK` already exists. |
 | Want unique constraints across the whole partitioned set | **Include all partition-key columns in the unique constraint** | Per-partition uniqueness | A unique constraint must include the partition key — see Gotcha #1. |
-| Want a foreign key from partitioned to partitioned | **Same partition strategy on both sides** | Mismatched strategies | FKs work but each leaf partition gets a per-partition FK index. |
+| Want a foreign key from partitioned to partitioned | **Use a referenced unique or primary key including its partition key** | Assuming matching partition strategies are required | Index referencing columns separately when the workload needs it. |
 | Sub-1 GB tables with no retention policy | **Do not partition** | Partitioning a 50 MB table | Planner overhead and lock-fanout overwhelm any pruning benefit. |
 | Append-only time-series < 1 TB on PG16+ | **BRIN on timestamp without partitioning** as Plan A | Partitioning by reflex | BRIN gives most of the locality win without the operational overhead. Cross-reference [`25-brin-hash-spgist-bloom-indexes.md`](./25-brin-hash-spgist-bloom-indexes.md). |
 
@@ -94,7 +94,7 @@ A partitioned table declares its partition strategy at `CREATE TABLE` time. Once
 ```sql
 -- RANGE on a timestamp
 CREATE TABLE events (
-    id          bigint GENERATED ALWAYS AS IDENTITY,
+    id          bigserial,
     occurred_at timestamptz NOT NULL,
     tenant_id   bigint NOT NULL,
     payload     jsonb NOT NULL
@@ -102,14 +102,14 @@ CREATE TABLE events (
 
 -- LIST on a category
 CREATE TABLE shipments (
-    id         bigint GENERATED ALWAYS AS IDENTITY,
+    id         bigserial,
     region     text NOT NULL,
     weight_g   integer NOT NULL
 ) PARTITION BY LIST (region);
 
 -- HASH on a tenant key with modulus 16
 CREATE TABLE tenant_events (
-    id         bigint GENERATED ALWAYS AS IDENTITY,
+    id         bigserial,
     tenant_id  bigint NOT NULL,
     occurred_at timestamptz NOT NULL,
     payload    jsonb NOT NULL
@@ -196,7 +196,7 @@ A partition can itself be partitioned. The most common pattern is year → month
 
 ```sql
 CREATE TABLE events (
-    id          bigint GENERATED ALWAYS AS IDENTITY,
+    id          bigserial,
     occurred_at timestamptz NOT NULL,
     payload     jsonb NOT NULL
 ) PARTITION BY RANGE (occurred_at);
@@ -288,8 +288,11 @@ UPDATE tenant_events
 -- The row is internally DELETEd from one partition and INSERTed into another.
 ```
 
+> [!NOTE] Row movement
+> An update that moves a row is implemented with a delete and insert; consult trigger and foreign-key rules when designing side effects.[^pg11-rowmove]
+
 > [!NOTE] PostgreSQL 15
-> Foreign-key actions on row movement were normalized in PG15[^pg15-fk]. Previously a partition-key UPDATE ran a `DELETE` action on the source partition and an `INSERT` action on the target, which could fire `ON DELETE` triggers and FK actions in surprising ways. PG15+ runs an UPDATE action on the partition root, giving the semantics most operators expect.
+> Foreign-key actions on row movement were normalized in PG15[^pg15-fk]. Previously a partition-key UPDATE ran a `DELETE` action on the source partition and an `INSERT` action on the target, which could fire `ON DELETE` FK actions in surprising ways. PG15+ runs an UPDATE action on the partition root.
 
 Row movement still has cost: the row is physically deleted from the source partition and inserted into the destination, which produces dead tuples in the source. Frequent partition-key UPDATEs negate the locality benefit of partitioning. If row movement is the norm, the partition key is wrong.
 
@@ -352,13 +355,13 @@ Practical consequence: if you partition by `occurred_at` and want a primary key,
 ```sql
 -- WRONG: PK on id alone with a non-PK partition key
 CREATE TABLE events (
-    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,  -- ERROR
+    id          bigserial PRIMARY KEY,  -- ERROR: partition key omitted
     occurred_at timestamptz NOT NULL
 ) PARTITION BY RANGE (occurred_at);
 
 -- RIGHT: composite PK including the partition key
 CREATE TABLE events (
-    id          bigint GENERATED ALWAYS AS IDENTITY,
+    id          bigserial,
     occurred_at timestamptz NOT NULL,
     PRIMARY KEY (id, occurred_at)
 ) PARTITION BY RANGE (occurred_at);
@@ -483,7 +486,7 @@ See [`39-triggers.md`](./39-triggers.md) (not yet written) for the trigger surfa
 The verbatim limitations list from `ddl-partitioning.html` §5.11.2.3[^limitations]:
 
 1. **Unique / PK constraints must include all partition key columns** (covered above).
-2. **No exclusion constraints spanning the whole partitioned table** pre-PG17 (PG17 relaxed this for partition-key-equality cases — see above).
+2. **No exclusion constraints spanning the whole partitioned table** before PG17; PG17 allows partition-key-equality cases (see above).
 3. **BEFORE ROW INSERT triggers cannot change destination partition.**
 4. **Cannot mix temporary and permanent relations in one partition tree.**
 5. **Partition cannot inherit from anything other than its partitioned parent**; no multiple inheritance.
@@ -500,15 +503,15 @@ The verbatim limitations list from `ddl-partitioning.html` §5.11.2.3[^limitatio
 
 | Version | Change | Cite |
 |---|---|---|
-| PG10 | Declarative partitioning introduced (RANGE + LIST); range, list partitioning, tuple-routing on INSERT/UPDATE | [^pg10-decl] |
+| PG10 | Declarative partitioning introduced (RANGE + LIST); INSERT routing | [^pg10-decl] |
 | PG11 | Hash partitioning; indexes on partitioned tables; FK on partitioned table (partitioned → non-partitioned); DEFAULT partition; FOR EACH ROW triggers; row movement on partition-key UPDATE; execution-time partition pruning; partitionwise join (default off); partitionwise aggregate (default off) | [^pg11-hash], [^pg11-index], [^pg11-fk], [^pg11-default], [^pg11-trigger], [^pg11-rowmove], [^pg11-pwjoin] |
 | PG12 | FK referencing partitioned table; partition pruning improvements; `COPY` into partitioned tables faster; reduced lock for ATTACH PARTITION; partition introspection functions (`pg_partition_root`, `pg_partition_ancestors`, `pg_partition_tree`); `\dP` in psql | [^pg12-fk-ref], [^pg12-bounds], [^pg12-attach], [^pg12-intro] |
 | PG13 | More partition pruning cases; partitionwise joins fire with non-matching bounds; BEFORE ROW triggers on partitioned tables; logical replication of partitioned tables (with `publish_via_partition_root`); subscribers can target partitioned tables | [^pg13-pwjoin], [^pg13-trigger], [^pg13-logical] |
 | PG14 | `DETACH PARTITION CONCURRENTLY` + `FINALIZE`; UPDATE/DELETE on partitioned tables much faster; `REINDEX` recurses through partition tree | [^pg14-detach], [^pg14-reindex] |
-| PG15 | Planning time for queries on many partitions improved; ordered scans of partitions usable in more cases (default + multi-value LIST partitions); FK actions on row movement normalized to UPDATE action on root; `CLUSTER` on partitioned tables; `ALTER TRIGGER RENAME` properly recurses | [^pg15-plan], [^pg15-fk], [^pg15-cluster], [^pg15-trigger-rename] |
+| PG15 | Planning and ordered scans of partitions improved; FK actions on row movement run as an UPDATE action on the root; `CLUSTER` on partitioned tables; `ALTER TRIGGER RENAME` recurses | [^pg15-plan], [^pg15-fk], [^pg15-cluster], [^pg15-trigger-rename] |
 | PG16 | RANGE and LIST partition lookup caching | [^pg16-cache] |
 | PG17 | Identity columns; exclusion constraints (with partition-key equality); partition pruning for `IS [NOT] UNKNOWN` on booleans; per-table access methods on partitioned tables | [^pg17-identity], [^pg17-exclude], [^pg17-bool-prune], [^pg17-am] |
-| PG18 | Non-btree unique indexes allowed as partition keys (index type must support equality); partitionwise join broader + lower memory; planning faster on many partitions; cost estimates improved; `VACUUM`/`ANALYZE` with `ONLY` skip partition children (useful since autovacuum does not process partitioned parents); **unlogged partitioned tables disallowed (incompatibility)** | [^pg18-nonbtree-unique], [^pg18-pwjoin], [^pg18-plan], [^pg18-cost], [^pg18-vac-only], [^pg18-unlogged] |
+| PG18 | Non-btree unique indexes allowed as partition keys (index type must support equality); broader partitionwise joins with lower memory; faster planning on many partitions; better partition cost estimates; `VACUUM`/`ANALYZE` with `ONLY`; unlogged partitioned tables disallowed | [^pg18-nonbtree-unique], [^pg18-pwjoin], [^pg18-plan], [^pg18-cost], [^pg18-vac-only], [^pg18-unlogged] |
 
 
 ## Examples / Recipes
@@ -520,7 +523,7 @@ The canonical schema for time-series events with monthly retention. Composite PK
 
 ```sql
 CREATE TABLE events (
-    id          bigint GENERATED ALWAYS AS IDENTITY,
+    id          bigserial,
     occurred_at timestamptz NOT NULL,
     tenant_id   bigint NOT NULL,
     event_type  text NOT NULL,
@@ -549,7 +552,7 @@ Production deployment automates partition creation via pg_partman + pg_cron — 
 The monthly cron job: detach last month + 12 months ago, drop the archived one, add the next future month. Uses `DETACH PARTITION CONCURRENTLY` (PG14+) and assumes no DEFAULT partition (the precondition for CONCURRENTLY).
 
 ```sql
--- 1. Add the next future month (does not block; SHARE UPDATE EXCLUSIVE on parent).
+-- 1. CREATE TABLE PARTITION OF takes ACCESS EXCLUSIVE on the parent.
 CREATE TABLE events_2026_10 PARTITION OF events
     FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
 
@@ -568,34 +571,20 @@ Cross-reference [`98-pg-cron.md`](./98-pg-cron.md) for scheduling this rotation;
 
 ### Recipe 3: Convert non-partitioned table to partitioned
 
-The standard online migration. Atomic swap at the end. Works on PG10+ but uses PG14+ DETACH/ATTACH semantics.
+For a correct cutover, stop writers or hold a write-blocking lock for the entire copy and swap. A high-water-mark top-up cannot capture updates, deletes, or late commits. Check dependent views, foreign keys, grants, sequences, triggers, and identity handling before cutover: renaming tables does not redirect dependencies to the new relation.
 
 ```sql
--- 1. Create new partitioned table with the same schema.
-CREATE TABLE events_new (LIKE events_old INCLUDING ALL)
-    PARTITION BY RANGE (occurred_at);
-
--- 2. Pre-create partitions covering all existing data + future room.
-CREATE TABLE events_new_2024 PARTITION OF events_new
-    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
-CREATE TABLE events_new_2025 PARTITION OF events_new
-    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
-CREATE TABLE events_new_2026 PARTITION OF events_new
-    FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
-
--- 3. Backfill in chunks. Use a tracking table or batched LIMIT pattern.
-INSERT INTO events_new SELECT * FROM events_old WHERE id BETWEEN  0 AND 1000000;
-INSERT INTO events_new SELECT * FROM events_old WHERE id BETWEEN 1000001 AND 2000000;
--- ... etc
-
--- 4. During a brief maintenance window: lock, top up, rename swap.
+-- Prepare an empty compatible partitioned table and all required partitions first.
+-- Explicitly design its keys: every unique key must include the partition key.
 BEGIN;
-LOCK TABLE events_old IN EXCLUSIVE MODE;  -- blocks writers, allows readers
-INSERT INTO events_new SELECT * FROM events_old WHERE id > (SELECT max(id) FROM events_new);
+LOCK TABLE events_old IN ACCESS EXCLUSIVE MODE;
+INSERT INTO events_new (id, occurred_at, tenant_id, payload)
+SELECT id, occurred_at, tenant_id, payload FROM events_old;
 ALTER TABLE events_old RENAME TO events_archive;
 ALTER TABLE events_new RENAME TO events;
 COMMIT;
--- 5. Drop events_archive when confidence is high.
+-- Keep the archive until data and dependencies have been verified.
+-- Rebind dependent objects before directing application traffic to the new table.
 ```
 
 For larger tables, use logical replication for the catch-up phase instead of `INSERT … SELECT`. See [`74-logical-replication.md`](./74-logical-replication.md) (not yet written).
@@ -686,7 +675,7 @@ Even distribution across N hash partitions. Pick MODULUS such that average parti
 
 ```sql
 CREATE TABLE tenant_events (
-    id          bigint GENERATED ALWAYS AS IDENTITY,
+    id          bigserial,
     tenant_id   bigint NOT NULL,
     occurred_at timestamptz NOT NULL,
     payload     jsonb NOT NULL,
@@ -709,7 +698,7 @@ EXPLAIN ANALYZE SELECT * FROM tenant_events WHERE tenant_id = 4242 LIMIT 10;
 -- Only one partition appears.
 ```
 
-**HASH partitioning warning:** the modulus is part of the data layout. To go from MODULUS=16 to MODULUS=32 you must rebuild — there is no online resize.
+**HASH partitioning:** compatible moduli permit incremental expansion: detach one modulus-16 partition, replace it with the corresponding two modulus-32 partitions, and redistribute its data. Plan for routing gaps, locks, concurrent writes, and data movement during each replacement. See <https://www.postgresql.org/docs/16/sql-createtable.html>.
 
 
 ### Recipe 8: Sub-partitioning (year then month)
@@ -718,7 +707,7 @@ For very high-volume time-series where a single-level monthly scheme would hit t
 
 ```sql
 CREATE TABLE events_subpart (
-    id          bigint GENERATED ALWAYS AS IDENTITY,
+    id          bigserial,
     occurred_at timestamptz NOT NULL,
     payload     jsonb NOT NULL,
     PRIMARY KEY (id, occurred_at)
@@ -842,16 +831,13 @@ SELECT e.id, b.amount
 ALTER TABLE events DETACH PARTITION events_2025_05 CONCURRENTLY;
 -- ^ Outside of transaction block. No DEFAULT partition exists.
 
--- The detached table is now standalone. Three options:
--- A. Drop it.
-DROP TABLE events_2025_05;
-
--- B. Rename and keep for compliance.
+-- Choose exactly one disposition after detach. For example, retain the
+-- standalone table under an archive name:
 ALTER TABLE events_2025_05 RENAME TO events_archive_2025_05;
 
--- C. Export to cold storage then drop.
-\copy events_2025_05 TO '/archive/events_2025_05.csv' (FORMAT csv);
-DROP TABLE events_2025_05;
+-- Alternatively, export it and verify the export before dropping the table:
+-- \copy events_2025_05 TO '/archive/events_2025_05.csv' (FORMAT csv)
+-- DROP TABLE events_2025_05;
 ```
 
 

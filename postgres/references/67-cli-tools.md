@@ -57,7 +57,7 @@ Reach for this file when:
 
 3. **`\watch N` re-runs the previous query every N seconds — the canonical "tail -f the catalog" pattern.** Build dashboards in psql by writing a single query and `\watch 5`. PG16 added options (count limit, named args, `0` for no-delay), PG17 added `min_rows` early-stop, PG18 added `WATCH_INTERVAL` variable for default.
 
-4. **CLI wrappers (`createdb`, `dropdb`, `vacuumdb`, `reindexdb`, `clusterdb`) are thin shells over SQL commands but offer parallelism (`--jobs N`) the SQL forms lack.** `vacuumdb -j 8` runs 8 concurrent `VACUUM` connections; the SQL `VACUUM` form is single-process for the table set passed in one call. For cluster-wide nightly maintenance, the wrappers are the right tool. Cross-reference [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md).
+4. **Maintenance wrappers can manage multiple connections.** `vacuumdb --jobs N` and `reindexdb --jobs N` parallelize independent commands. SQL `VACUUM (PARALLEL n)` separately parallelizes eligible index work within a table. `createdb`, `dropdb`, and PG16 `clusterdb` do not provide `--jobs`.[^vacuumdb-docs][^reindexdb-docs][^clusterdb-docs]
 
 5. **psql variables + `\gexec` enable scripting without a procedural language.** `\gexec` takes the result of the previous query (which must be SQL text) and executes each cell as its own statement — the canonical pattern for "generate DDL statements with `format()` then run them." Combine with `\if`/`\else` (PG10+) for conditional branches. No PL/pgSQL needed.
 
@@ -68,12 +68,12 @@ Reach for this file when:
 | Interactive query / DBA shell | `psql` | `pgcli` (third-party, missing some `\d*` forms) |
 | Connection check from script | `pg_isready -h host -p port -U user -d db -t 5` (no auth needed) | `psql -c 'SELECT 1'` (requires auth + opens full session) |
 | Cluster-wide nightly VACUUM ANALYZE | `vacuumdb --all --analyze --jobs $(nproc)` | per-DB loop calling `psql -c 'VACUUM ANALYZE'` |
-| One-table targeted REINDEX | `psql -c 'REINDEX INDEX CONCURRENTLY ...'` | `reindexdb --index ...` (no CONCURRENTLY before PG14; verify) |
+| One-index online REINDEX | `REINDEX INDEX CONCURRENTLY ...` or `reindexdb --concurrently --index ...` | blocking REINDEX without a maintenance window |
 | Post-pg_upgrade ANALYZE on PG≤17 | `vacuumdb --all --analyze-in-stages --jobs $(nproc)` | one-shot `ANALYZE` across all DBs |
-| Cluster-wide `vacuumdb` for PG18+ | `vacuumdb --all --analyze-only --missing-stats-only --jobs $(nproc)` | re-ANALYZE every table |
-| Stream large query to disk | `psql -At -c 'SELECT ...' \| gzip > out.gz` | `\copy (SELECT ...) TO ...` (works but pulls into memory at psql side) |
+| Post-pg_upgrade statistics on PG18+ | Run both commands in Recipe 7: missing statistics in stages, then a full analyze | assuming transferred statistics eliminate post-upgrade ANALYZE |
+| Stream a large query as CSV | `\copy (SELECT ...) TO ... WITH (FORMAT csv)` | treating comma-separated unaligned output as escaped CSV |
 | Bulk import CSV | `psql -c "\copy tbl FROM '/local/file.csv' WITH CSV HEADER"` | server-side `COPY` if file is on client machine |
-| Tail running queries every 5 s | `psql -c "SELECT pid, state, query FROM pg_stat_activity WHERE state='active'" -e -P pager=off` then `\watch 5` interactively | bash loop with `psql -c` (re-connects every iteration) |
+| Tail running queries every 5 s | Open interactive `psql`, execute the query, then run `\watch 5` | a shell loop that reconnects for each sample |
 | Generate-then-execute DDL | `\gexec` after a SELECT producing valid SQL strings | per-row `psql -c` invocation from bash loop |
 | Inspect a stopped cluster's WAL state | `pg_controldata $PGDATA` | starting the cluster (changes the very state you're inspecting) |
 | Fetch all rows of a huge SELECT in psql without OOM | `\set FETCH_COUNT 1000` | default behavior (psql buffers entire result set) |
@@ -81,21 +81,15 @@ Reach for this file when:
 
 **Three smell signals**
 
-1. **`bash for db in $(psql -At -c 'SELECT datname FROM pg_database') ; do psql -d $db -c 'VACUUM ANALYZE' ; done`** — re-implementing `vacuumdb --all --jobs $(nproc)` badly (no parallelism, no skip-locked, no progress).
-2. **`psql -c 'SELECT 1'` as a healthcheck** — opens a full session, requires valid credentials. Use `pg_isready` instead (no auth, returns exit code 0/1/2/3).
+1. **Shell loops that split database names on whitespace can target the wrong database.** Use `vacuumdb --all` for cluster-wide maintenance.
+2. **Choose the probe by what it must establish.** `pg_isready` checks server connection status; an authenticated application query checks credentials and query execution.
 3. **Bash loop over `psql -c` for many similar queries** — re-implementing `\gexec`. The loop pays per-invocation connection setup cost (typically 5–50 ms each).
 
 ## psql — The Client
 
 ### Connection + invocation
 
-Connection precedence (highest wins):
-
-1. Command-line flags (`-h`, `-p`, `-U`, `-d`)
-2. Connection URI (`-d 'postgresql://...'`)
-3. `PG*` environment variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`, `PGPASSWORD`, `PGSERVICE`)
-4. `~/.pg_service.conf` named-service entries
-5. Compiled-in defaults (`localhost`, `5432`, `$USER`)
+Connection strings supplied as the database argument override conflicting `-h`, `-p`, and `-U` flags. Explicit connection parameters override service-file values; service-file values override corresponding environment defaults. Without a host, Unix clients normally use a local Unix-domain socket; Windows normally uses localhost.[^psql18-docs]
 
 Common invocation forms:
 
@@ -103,7 +97,7 @@ Common invocation forms:
     psql -h db.example.com -p 5432 -U app -d mydb
 
     # URI form (preferred for scripts — single quotable string)
-    psql 'postgresql://app:pw@db.example.com:5432/mydb?sslmode=verify-full&channel_binding=require'
+    psql 'postgresql://app@db.example.com:5432/mydb?sslmode=verify-full&channel_binding=require'
 
     # Service file (best for shared scripts; password lives in ~/.pgpass not the URI)
     psql service=production_app
@@ -114,18 +108,18 @@ Common invocation forms:
     # Run a script with strict error handling, suppress stdin echo
     psql -v ON_ERROR_STOP=1 -X -q -f migration.sql
 
-    # Output as CSV with no headers, suitable for piping
-    psql -At -F ',' -P pager=off -c 'SELECT col1, col2 FROM t'
+    # Escaped CSV output with no header:
+    psql -X --csv -t -P pager=off -c 'SELECT col1, col2 FROM t'
 
 Useful flags:
 
 | Flag | Purpose |
 |---|---|
-| `-c 'SQL'` | Execute one statement and exit |
+| `-c 'SQL'` | Execute a SQL command string, which may contain multiple statements, or one backslash command |
 | `-f file.sql` | Execute file and exit |
 | `-X` | Skip `~/.psqlrc` (clean shell, useful in scripts) |
 | `-q` | Quiet — suppress chatty output |
-| `-A` | Unaligned output (CSV-friendly) |
+| `-A` | Unaligned separator-delimited output, without CSV escaping |
 | `-t` | Tuples-only (no header, no row count) |
 | `-At` | Combine — pure data, one row per line |
 | `-F SEP` | Field separator for unaligned output |
@@ -209,7 +203,6 @@ Compact reference. The full PG18 catalog has ~80 commands; this table covers the
 | `\pset format aligned` | Default — column-aligned text |
 | `\pset format unaligned` | One row per line, separator-delimited |
 | `\pset format csv` | CSV format (PG12+) |
-| `\pset format json` | JSON format (PG18+) |
 | `\pset format html` | HTML table |
 | `\pset format latex` | LaTeX tabular |
 | `\pset format wrapped` | Auto-wrap wide columns |
@@ -236,17 +229,19 @@ Re-runs the previous query every N seconds. The canonical "tail -f the catalog" 
 
 PG16+ named options:
 
-    \watch interval=5 count=10        -- every 5 s, stop after 10 runs
+    -- Every 5 seconds, stop after 10 runs.
+    \watch interval=5 count=10
 
 PG17+ early-stop on minimum row count:
 
-    \watch interval=5 min_rows=1      -- stop as soon as the query returns ≥1 row
+    -- Stop when fewer than one row is returned.
+    \watch interval=5 min_rows=1
 
 PG18+ default interval via variable:
 
     \set WATCH_INTERVAL 10
     SELECT count(*) FROM pg_stat_activity WHERE state='active';
-    \watch                            -- uses WATCH_INTERVAL
+    \watch
 
 > [!NOTE] PostgreSQL 16 — `\watch 0` for no-delay
 > Verbatim release-note: *"Detect invalid values for psql `\watch`, and allow zero to specify no delay (Andrey Borodin)."* Useful for tight monitoring loops, but watch out for client-side CPU burn.
@@ -265,7 +260,7 @@ PG18+ default interval via variable:
     \copy events TO PROGRAM 'gzip > /local/events.csv.gz' WITH (FORMAT csv, HEADER true)
 
 > [!WARNING] **`\copy` is single-line only — no continuation, no variable interpolation**
-> Multi-line `\copy` does not work. Variables (`:var`) are not expanded inside `\copy`. For dynamic queries use `psql -c "\copy ($(printf %q ...)) TO ..."` from the shell, or use server-side `COPY` with permissions configured. See [`66-bulk-operations-copy.md`](./66-bulk-operations-copy.md) gotcha #2.
+> Variables (`:var`) are not expanded inside `\copy`. Use SQL `COPY (...) TO STDOUT` terminated by `\g filename` or `\g |command` when psql interpolation or multiline SQL is needed. Shell `printf %q` quotes for a shell, not for SQL, and is not an SQL-injection defense.[^psql18-docs]
 
 ### `\gexec` — generate-then-run
 
@@ -278,6 +273,7 @@ Take the result of the previous query (a result set of SQL strings) and execute 
     JOIN pg_am a       ON a.oid = c.relam
     WHERE c.relkind = 'i'
       AND a.amname = 'btree'
+      AND n.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
       AND pg_relation_size(c.oid) > 100 * 1024 * 1024
     ORDER BY pg_relation_size(c.oid) DESC
     \gexec
@@ -336,7 +332,7 @@ Cross-reference [`13-cursors-and-prepares.md`](./13-cursors-and-prepares.md) for
 
 ## Per-database wrappers
 
-All wrappers are thin shells over SQL commands with two big advantages: (1) `--jobs N` parallelism that the SQL forms lack, (2) cluster-wide iteration via `--all`. Connection arguments (`-h`, `-p`, `-U`, `-d`) work the same as `psql`.
+These utilities wrap SQL commands, but their options differ. `vacuumdb` and `reindexdb` support `--jobs`; PG16 `clusterdb` does not. `createdb`, `dropdb`, `createuser`, and `dropuser` operate on named objects rather than sharing every maintenance option.
 
 ### `createdb` / `dropdb`
 
@@ -356,7 +352,7 @@ All wrappers are thin shells over SQL commands with two big advantages: (1) `--j
         --no-createdb --no-createrole --connection-limit=50 app_user
 
     # PG16+ extended options
-    createuser --valid-until '2026-12-31' --bypassrls=false \
+    createuser --valid-until '2026-12-31' --no-bypassrls \
         --member-of=app_readers app_user
 
 > [!NOTE] PostgreSQL 16 — `--member-of` replaces `--role`
@@ -391,7 +387,7 @@ Common patterns:
     # Cluster-wide nightly maintenance
     vacuumdb --all --analyze --jobs $(nproc) --skip-locked
 
-    # Post-pg_upgrade ANALYZE for PG≤17 (PG18+ pg_upgrade preserves stats)
+    # Post-pg_upgrade ANALYZE for PG≤17 targets:
     vacuumdb --all --analyze-in-stages --jobs $(nproc)
 
     # PG18+: only fill in stats that are missing (e.g., for newly-restored objects)
@@ -403,8 +399,11 @@ Common patterns:
     # Pre-upgrade defensive freeze on a hot table
     vacuumdb -d mydb -t events --freeze
 
-> [!NOTE] PostgreSQL 17 — `--all` for `vacuumdb`/`reindexdb`/`clusterdb` accepts pattern matching
-> Verbatim release-note: *"Allow reindexdb, vacuumdb, and clusterdb to process objects in all databases matching a pattern (Nathan Bossart). The new option `--all` controls this behavior."*
+> [!NOTE] PostgreSQL 17: `--all` with object patterns
+> `--all` takes no argument; it selects every database. PG17+ lets `vacuumdb`, `reindexdb`, and `clusterdb` combine `--all` with object options such as `-t`, `-n`, `-N` (vacuumdb), `-i` (reindexdb), or `-t` (clusterdb), processing the matching objects in every database. Earlier releases reject the combination, for example *"cannot vacuum specific table(s) in all databases"*.[^pg17-all-pattern][^vacuumdb17-docs]
+
+    # PG17+: vacuum public.events in every database; fails if one lacks the table
+    vacuumdb --all -t public.events
 
 > [!NOTE] PostgreSQL 18 — `vacuumdb --missing-stats-only`
 > Verbatim release-note: *"Add vacuumdb option `--missing-stats-only` to compute only missing optimizer statistics (Corey Huinker, Nathan Bossart). This option can only be run by superusers and can only be used with options `--analyze-only` and `--analyze-in-stages`."* Useful when restoring a logical dump (which doesn't carry stats) or when extended statistics objects were added but never ANALYZEd.
@@ -426,7 +425,7 @@ Common patterns:
     # Concurrent cluster-wide reindex with parallelism
     reindexdb --all --concurrently --jobs 4
 
-    # Reindex only B-tree indexes on a specific table, concurrently
+    # Reindex the indexes of events concurrently:
     reindexdb -d mydb --concurrently -t events
 
 > [!WARNING] **`reindexdb --concurrently` is per-table, not per-index parallel**
@@ -436,7 +435,8 @@ Common patterns:
 
 `clusterdb` runs the SQL `CLUSTER` command which physically reorders a table by index. Rare in modern workflows — `pg_repack` (an extension) is preferred because `CLUSTER` takes ACCESS EXCLUSIVE for the duration. See [`26-index-maintenance.md`](./26-index-maintenance.md) for `pg_repack`.
 
-    clusterdb -d mydb -t events_pkey      # Cluster events by its PK index
+    psql -d mydb -c 'CLUSTER events USING events_pkey;'  # first clustering; blocks access
+    clusterdb -d mydb -t events                        # later reuses its recorded index
 
 ## Cluster utilities
 
@@ -463,7 +463,7 @@ The right tool for healthchecks. No authentication, no full session — only sen
 
 ### `pg_controldata`
 
-Inspect the cluster's `pg_control` file (in `$PGDATA/global/pg_control`) to read the WAL state, system identifier, version, checkpoint LSN, etc. Works on a **stopped** cluster only — running cluster will print a warning that the data may be inconsistent.
+Inspect `$PGDATA/global/pg_control` for cluster and checkpoint metadata. The utility can read a running cluster's control file, but this is not an atomic live-state snapshot; use a stopped cluster for offline recovery decisions.[^pg-controldata-docs]
 
     pg_controldata $PGDATA
 
@@ -483,13 +483,10 @@ Used in: pre-restore validation, pg_rewind preflight, disaster-recovery diagnosi
 ### `pg_resetwal`
 
 > [!WARNING] **Last-resort recovery only — destroys data integrity guarantees**
-> `pg_resetwal` rewrites WAL state to allow a cluster to start when WAL is corrupted. It does **not** repair data files; in-flight transactions are lost; the cluster's logical consistency may be compromised. After running `pg_resetwal`, immediately `pg_dumpall` then restore into a fresh `initdb` cluster. See [`88-corruption-recovery.md`](./88-corruption-recovery.md) Recipe 10 + [`29-transaction-id-wraparound.md`](./29-transaction-id-wraparound.md) gotcha #15.
+> Use only for expert-directed salvage when WAL or control-file corruption prevents startup and no usable backup recovery path exists. It does not repair data files or prove consistency. Use same-major binaries against a stopped, isolated salvage copy after preserving the complete cluster, including external WAL and tablespaces. Follow [`88-corruption-recovery.md`](./88-corruption-recovery.md#recipe-8--pg_resetwal-last-resort), then dump and restore into a separate new cluster.[^pg-resetwal-docs]
 
-    # NEVER do this on a working cluster. Cluster MUST be stopped first.
-    pg_resetwal $PGDATA           # Default — uses pg_control + scans for highest WAL segment
-
-    # Force-set XID/MXID/etc when pg_control itself is damaged
-    pg_resetwal -f -x 50000000 $PGDATA
+    # Inspect proposed values only; do not copy an example XID into a real cluster.
+    pg_resetwal --dry-run -D "$SALVAGE_PGDATA"
 
 > [!WARNING] Minor releases 2026-08-13 / 2026-11-12
 > psql: CVE-2026-6464 (CVSS 8.1, 2026-08-13 minors, 18.6 and the matching older branches). When a `COPY ... FROM STDIN` fails early, psql now skips its inline data, so test scripts that intentionally fail need a `\.` terminator. 18.7 fixed a regression so that multiple `COPY ... FROM STDIN` in one command string work again.[^minor-18-6][^minor-18-7] CVE-2026-18408 (CVSS 8.8, 2026-08-13) concerns psql `\unrestrict`.[^minor-aug-announce] `reindexdb`: CVE-2026-116325 (quoting, CVSS 8.0, 2026-11-12).[^minor-nov-announce] Full CVE list: <https://www.postgresql.org/support/security/>.
@@ -501,7 +498,7 @@ Used in: pre-restore validation, pg_rewind preflight, disaster-recovery diagnosi
 | **PG14** | `\dt+`/`\di+`/`\dm+` add access-method column;[^pg14-am-col] `\dt`/`\di` show TOAST tables and indexes;[^pg14-toast] new `\dX` for extended-stats objects;[^pg14-dx] `vacuumdb` `--no-process-toast`.[^pg14-vacuumdb] |
 | **PG15** | New `\dconfig` for server vars;[^pg15-dconfig] new `\getenv`;[^pg15-getenv] `\watch` gets a pager option;[^pg15-watch-pager] all results from multi-statement queries displayed.[^pg15-multi-results] |
 | **PG16** | `\bind` for extended-query protocol;[^pg16-bind] `\watch` `count` + `interval` options + `0` allowed;[^pg16-watch-count][^pg16-watch-zero] `SHELL_ERROR`/`SHELL_EXIT_CODE` variables;[^pg16-shell-vars] `\drg` for role memberships;[^pg16-drg] `\dpS`/`\zS` show system objects;[^pg16-dps] `\df+` no longer shows source;[^pg16-df-source] `xheader_width` `\pset` option;[^pg16-xheader] vacuumdb `--schema`/`--exclude-schema`;[^pg16-vacuumdb-schema] vacuumdb `--no-process-main`;[^pg16-vacuumdb-main] vacuumdb `--buffer-usage-limit`;[^pg16-vacuumdb-bul] createuser `--valid-until`/`--bypassrls`/`--member-of` (deprecates `--role`).[^pg16-createuser-options][^pg16-createuser-deprecate] |
-| **PG17** | `\dp` shows `(none)` for empty privileges;[^pg17-dp-none] backslash commands honor `\pset null`;[^pg17-pset-null] `\watch` adds `min_rows`;[^pg17-watch-minrows] connection attempts cancelable with Ctrl-C;[^pg17-cancel-connect] `FETCH_COUNT` honored for non-SELECT;[^pg17-fetch-count] `vacuumdb`/`reindexdb`/`clusterdb` `--all` accepts pattern matching.[^pg17-all-pattern] |
+| **PG17** | `\dp` shows `(none)` for empty privileges;[^pg17-dp-none] backslash commands honor `\pset null`;[^pg17-pset-null] `\watch` adds `min_rows`;[^pg17-watch-minrows] connection attempts cancelable with Ctrl-C;[^pg17-cancel-connect] broader `FETCH_COUNT` support for result-returning commands;[^pg17-fetch-count] `vacuumdb`/`reindexdb`/`clusterdb` accept `--all` together with object patterns.[^pg17-all-pattern] |
 | **PG18** | New `\parse`/`\bind_named`/`\close_prepared`;[^pg18-prep] full pipeline-mode meta-commands `\startpipeline`/`\sendpipeline`/`\syncpipeline`/`\endpipeline`/`\flushrequest`/`\flush`/`\getresults`;[^pg18-pipeline] `%P` prompt char + `PIPELINE_*` variables;[^pg18-pipeline-vars] connection service name in prompt;[^pg18-svc-prompt] `\conninfo` reformatted to tabular with more info;[^pg18-conninfo] `x` suffix for expanded mode on list commands;[^pg18-x-suffix] `WATCH_INTERVAL` variable;[^pg18-watch-interval] leakproof in `\df+`/`\do+`/`\dAo+`/`\dC+`;[^pg18-leakproof] `default_version` in `\dx`;[^pg18-dx-default] vacuumdb `--missing-stats-only`.[^pg18-missing-stats] |
 
 ## Examples / Recipes
@@ -511,21 +508,21 @@ Used in: pre-restore validation, pg_rewind preflight, disaster-recovery diagnosi
 The single configuration file that improves DBA experience the most:
 
     -- ~/.psqlrc
-    \set QUIET 1                           -- Suppress chatter while loading
-    \pset null '(NULL)'                    -- Make NULLs visible
-    \pset linestyle unicode                -- Pretty box-drawing characters
-    \pset border 2                         -- Full grid
+    \set QUIET 1
+    \pset null '(NULL)'
+    \pset linestyle unicode
+    \pset border 2
 
-    \set HISTSIZE 10000                    -- Bigger history file
-    \set HISTFILE ~/.psql_history-:DBNAME  -- Per-database history
+    \set HISTSIZE 10000
+    \set HISTFILE ~/.psql_history-:DBNAME
 
-    \set COMP_KEYWORD_CASE upper           -- Auto-complete in UPPERCASE
-    \set ECHO_HIDDEN on                    -- Show catalog queries behind \d*
-    \set VERBOSITY verbose                 -- Full error context
-    \set ON_ERROR_ROLLBACK interactive     -- Implicit savepoint per statement
+    \set COMP_KEYWORD_CASE upper
+    \set ECHO_HIDDEN on
+    \set VERBOSITY verbose
+    \set ON_ERROR_ROLLBACK interactive
 
-    \timing on                             -- Show execution time per statement
-    \x auto                                -- Auto-expand wide rows
+    \timing on
+    \x auto
 
     -- Helpful prompt: [user@db:port]
     \set PROMPT1 '%[%033[33;1m%]%n%[%033[0m%]@%[%033[33;1m%]%/%[%033[0m%]:%>%R%# '
@@ -535,53 +532,22 @@ The single configuration file that improves DBA experience the most:
 
 Skip with `psql -X` when scripting (no sourcing of `~/.psqlrc`).
 
-### Recipe 2 — Healthcheck script (Kubernetes liveness probe)
+### Recipe 2 — Connection Readiness Probe
 
     #!/bin/bash
-    # /usr/local/bin/pg-liveness.sh
     set -euo pipefail
+    pg_isready -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
+               -U "${PGUSER:-postgres}" -d "${PGDATABASE:-postgres}" -t 5
 
-    if pg_isready -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
-                  -U "${PGUSER:-postgres}" -d "${PGDATABASE:-postgres}" -t 5 ; then
-        exit 0
-    else
-        echo "Postgres not ready" >&2
-        exit 1
-    fi
+Use this for connection readiness, not as the sole restart-triggering liveness check: an otherwise healthy server may reject connections during crash recovery. Allow adequate startup time and use an operator's PostgreSQL-specific probes when available. A real authenticated query is needed to test application readiness.
 
-In Kubernetes pod spec:
+### Recipe 3 — Cluster-wide Maintenance from an OS Scheduler
 
-    livenessProbe:
-      exec:
-        command: ["/usr/local/bin/pg-liveness.sh"]
-      periodSeconds: 30
-      failureThreshold: 3
+Use an operating-system scheduler to invoke the maintenance wrapper. Choose concurrency from the server's capacity, not automatically from its CPU count:
 
-### Recipe 3 — Cluster-wide nightly VACUUM ANALYZE via pg_cron
+    vacuumdb --all --analyze --jobs=4 --skip-locked --buffer-usage-limit=64MB
 
-    -- Schedule via pg_cron (cross-reference 98-pg-cron.md)
-    -- Runs vacuumdb-equivalent SQL across all databases
-    SELECT cron.schedule(
-        'nightly-vacuum-analyze',
-        '15 2 * * *',                  -- 02:15 every day
-        $$
-        DO $do$
-        DECLARE
-            db RECORD;
-        BEGIN
-            FOR db IN SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate
-            LOOP
-                PERFORM dblink_exec(
-                    format('dbname=%I', db.datname),
-                    'VACUUM (ANALYZE, SKIP_LOCKED, BUFFER_USAGE_LIMIT ''64MB'')'
-                );
-            END LOOP;
-        END
-        $do$;
-        $$
-    );
-
-Or simpler: schedule a system cron job that calls `vacuumdb --all --analyze --jobs $(nproc) --skip-locked --buffer-usage-limit=64MB`.
+This skips relations it cannot lock immediately, so monitor later maintenance and do not use it as a wraparound-emergency runbook. A pg_cron job is database-local SQL; use `cron.schedule_in_database()` for explicitly selected databases rather than constructing libpq connection strings with SQL identifier quoting.[^vacuumdb-docs]
 
 ### Recipe 4 — Bulk-reindex every B-tree index >100 MB via `\gexec`
 
@@ -598,7 +564,7 @@ Or simpler: schedule a system cron job that calls `vacuumdb --all --analyze --jo
     ORDER BY pg_relation_size(c.oid) DESC
     \gexec
 
-The first SELECT prints the SQL strings; `\gexec` then runs each as its own statement. If one fails, subsequent statements still run (no transaction wrap).
+`\gexec` executes each generated statement; it does not first print them as a separate result set. Inspect the SELECT separately before destructive maintenance. Set `ON_ERROR_STOP` to stop after an error, or leave it off only if continuing is intentional.[^psql18-docs]
 
 ### Recipe 5 — Tail active queries with `\watch`
 
@@ -617,14 +583,16 @@ PG17+ early-stop:
     SELECT pid, state, query
     FROM pg_stat_activity
     WHERE wait_event_type = 'Lock' AND pid != pg_backend_pid();
-    \watch interval=1 min_rows=1                 -- stop the moment any lock-wait shows up
+    -- Stop once no lock-wait rows remain.
+    \watch interval=1 min_rows=1
 
 ### Recipe 6 — Stream a huge SELECT to compressed CSV without OOM
 
 Default psql buffers the entire result set client-side. For multi-GB exports:
 
-    psql -At -F ',' -P pager=off \
-         -c 'SELECT * FROM events WHERE created_at > now() - interval ''30 days''' \
+    set -o pipefail
+    psql -X -v ON_ERROR_STOP=1 \
+         -c "\copy (SELECT * FROM events WHERE created_at > now() - interval '30 days') TO STDOUT WITH (FORMAT csv, HEADER true)" \
          | gzip -9 > events_30d.csv.gz
 
 Or interactively, use `FETCH_COUNT`:
@@ -646,26 +614,26 @@ For PG18+ (pg_upgrade preserves per-column stats; extended stats still lost):
 
     vacuumdb --all --analyze-only --missing-stats-only --jobs $(nproc)
 
-This only re-ANALYZEs relations missing stats — typically extended-stats objects.
+PG18's post-upgrade instructions require both missing planner statistics and refreshed cumulative statistics. Follow the missing-stats pass with `vacuumdb --all --analyze-only --jobs=4`; do not assume missing extended statistics are covered by a missing-per-column-statistics filter.[^pg18-upgrade]
 
 ### Recipe 8 — Capture EXPLAIN output to a file (with full plan + buffers)
 
-    psql -X -P pager=off -e -c '
+    psql -X -P pager=off -c "
         EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, FORMAT JSON)
         SELECT u.name, count(o.id)
         FROM users u
         LEFT JOIN orders o ON o.user_id = u.id
-        WHERE u.created_at > now() - interval ''30 days''
+        WHERE u.created_at > now() - interval '30 days'
         GROUP BY u.id, u.name
         ORDER BY count(o.id) DESC
         LIMIT 10
-    ' > plan.json
+    " > plan.json
 
-`-e` echoes the SQL; `FORMAT JSON` produces a machine-parseable plan. Cross-reference [`56-explain.md`](./56-explain.md).
+Keep SQL echoing disabled so the file contains only the JSON plan. `EXPLAIN ANALYZE` executes the query, including any side effects. Cross-reference [`56-explain.md`](./56-explain.md).
 
 ### Recipe 9 — Generate-then-restore role grants script
 
-When migrating between clusters, dump grant statements only:
+This extracts only visible table grants other than PUBLIC and postgres. It omits ownership, default privileges, role memberships, grant options, and other object types; use `pg_dump` and `pg_dumpall --globals-only` for a complete migration rather than this partial report.
 
     psql -X -At -c "
         SELECT format(
@@ -759,13 +727,13 @@ Or grep the binary for documented options:
 
 1. **`\copy` is single-line — no continuation, no variables.** Multi-line `\copy` statements fail to parse. `:var` substitution is not performed inside `\copy`. Workaround: use server-side `COPY` with appropriate role membership, or assemble the `\copy` line in shell first.
 
-2. **`psql -c 'SELECT 1'` as a healthcheck wastes credentials and connection overhead.** Use `pg_isready` instead (no auth, three exit codes).
+2. **`pg_isready` is not an authenticated health check.** It has four exit codes (0–3) and checks connection status, not whether the application can authenticate and run queries.[^pg-isready-docs]
 
-3. **`\d`, `\df`, `\di` honor `search_path` for unqualified names.** If you set `search_path = public, app` and run `\d users`, you might see the `app.users` table even though you expected `public.users`. Use schema-qualified patterns: `\d app.users`.
+3. **Unqualified relation patterns honor visibility in `search_path`.** If both schemas contain `users`, `\d users` shows the first visible one. Use `\d app.users` to select the schema explicitly.[^psql18-docs]
 
-4. **`\dt+` and `\df+` show DIFFERENT details across versions.** PG16+ removed function source from `\df+` and added access method column to `\dt+`. Scripts that grep `\d*+` output may break across major versions.
+4. **Client output changes across versions.** PG16 removed function source from `\df+`; PG14 added access-method output to `\d[i|m|t]+`. Use SQL catalogs or a documented machine-readable format for automation.[^pg16-df-source][^pg14-am-col]
 
-5. **`\watch` does not error on a query that produces zero rows.** It silently re-runs the empty query forever. Use PG17+ `min_rows` to early-stop.
+5. **`\watch min_rows=N` stops when the result has fewer than N rows.** It does not stop when N matching rows first appear. Use it to wait for existing work to disappear, or write a query whose output becomes empty when the desired condition holds.[^psql18-docs]
 
 6. **`vacuumdb --jobs N` opens N connections to the SAME database.** Each connection counts against `max_connections`; if N > available connections, vacuumdb fails. Cap `--jobs` at `max_connections - reserved_connections - actual_app_connections`.
 
@@ -777,21 +745,21 @@ Or grep the binary for documented options:
 
 10. **`dropdb --force` (PG13+) terminates connections via `pg_terminate_backend`.** Same caveats as direct `pg_terminate_backend`: do not use against walsenders or logical-replication apply workers without understanding consequences. Cross-reference [`58-performance-diagnostics.md`](./58-performance-diagnostics.md) Recipe 13.
 
-11. **`pg_isready` exit code `1` does not mean "down"** — it means "rejecting connections," which can happen during startup recovery, in single-user mode, or under `restart_after_crash` recovery. Distinguish from exit code `2` (no response — really down).
+11. **`pg_isready` code 1 means rejecting connections; code 2 means no response.** Single-user mode has no client listener and should not be classified as a normal accepting postmaster.[^pg-isready-docs]
 
 12. **`pg_resetwal` is data-destructive.** It throws away WAL state to allow startup. Always immediately `pg_dumpall` and restore into a fresh `initdb` cluster after using it.
 
-13. **`pg_controldata` against a running cluster prints a warning but reports possibly-stale data.** The control file is only consistent at checkpoint boundaries on a running cluster. Always stop the cluster (or use `pg_basebackup`-style snapshot) for forensic accuracy.
+13. **`pg_controldata` reports stored control metadata.** It does not establish current transaction, replication, or filesystem consistency on a running server. Use it with the server stopped for recovery decisions.[^pg-controldata-docs]
 
 14. **`psql -1` wraps the entire script in one transaction — including any `CREATE INDEX CONCURRENTLY`.** CIC cannot run inside a transaction block; `psql -1 -f migration.sql` will fail at the CIC statement. For migrations with CIC, omit `-1` or split the script. See [`26-index-maintenance.md`](./26-index-maintenance.md) gotcha #1.
 
 15. **`ON_ERROR_STOP=0` (default) silently continues past errors.** A migration script that creates 100 objects and fails on object 50 leaves the database in an inconsistent state. **Always `psql -v ON_ERROR_STOP=1`** in scripts.
 
-16. **`FETCH_COUNT` only kicks in for `SELECT` pre-PG17.** PG17+ extends it to other commands that return result sets (e.g., `INSERT ... RETURNING`, `UPDATE ... RETURNING`). Pre-PG17, those still buffer entirely.
+16. **Use COPY for bounded-memory exports.** `FETCH_COUNT` can batch supported result-returning commands, but is not a universal promise that every SQL result streams. `\copy` uses the COPY protocol and does not buffer the whole table in psql.[^psql18-docs]
 
 17. **`\set ECHO_HIDDEN on` shows the catalog query but does NOT show the catalog query result format.** The output of the backslash command itself is post-formatted. To see the raw query result, copy the `********* QUERY **********` output and run it manually.
 
-18. **`createuser --pwprompt` reads the password interactively.** In a script, use `PGPASSWORD` env var or a `~/.pgpass` entry — never embed passwords in command-line arguments (visible in `ps`).
+18. **`createuser --pwprompt` sets the new role's password.** `PGPASSWORD` and `.pgpass` authenticate the administrative connection; they do not supply that new password. Use a controlled secret-provisioning path or `\password` for the new role.[^createuser-docs]
 
 19. **`psql -e` echoes SQL but `\set ECHO all` echoes ALSO from `\i`-included files.** Both useful in different cases. Use `\set ECHO queries` for SQL-only echo.
 
@@ -799,7 +767,7 @@ Or grep the binary for documented options:
 
 21. **`\dx` shows installed extensions, not available extensions.** Use `SELECT * FROM pg_available_extensions` for the full catalog.
 
-22. **`vacuumdb --all` on PG≤16 re-fetches the database list per `--jobs`.** PG17+ improvements made the iteration order more predictable; pre-PG17, exact ordering of which database gets which worker is not deterministic.
+22. **Utility concurrency and database selection are separate options.** `--all` selects databases and `--jobs` limits concurrent maintenance commands where supported; do not assume that it refetches the database list for each worker.[^vacuumdb-docs]
 
 23. **PG18 `\conninfo` reformatted to tabular** — scripts that parse the old key-value format break. Audit before upgrading. Verbatim release-note: *"Change psql's `\conninfo` to use tabular format and include more information."*
 
@@ -870,7 +838,7 @@ Or grep the binary for documented options:
 
 [^pg17-pset-null]: PostgreSQL 17 release notes. <https://www.postgresql.org/docs/release/17.0/>. Quoted: *"Have backslash commands honor `\pset null` (Erik Wienhold, Laurenz Albe). Previously `\pset null` was ignored."*
 
-[^pg17-watch-minrows]: PostgreSQL 17 release notes. <https://www.postgresql.org/docs/release/17.0/>. Quoted: *"Allow psql's `\watch` to stop after a minimum number of rows returned (Greg Sabino Mullane). The parameter is `min_rows`."*
+[^pg17-watch-minrows]: PostgreSQL 17 adds `min_rows`; `\watch` stops when fewer than the specified number of rows are returned. <https://www.postgresql.org/docs/18/app-psql.html#APP-PSQL-META-COMMAND-WATCH>
 
 [^pg17-cancel-connect]: PostgreSQL 17 release notes. <https://www.postgresql.org/docs/release/17.0/>. Quoted: *"Allow psql connection attempts to be canceled with control-C (Tristan Partin)."*
 
@@ -934,3 +902,9 @@ Or grep the binary for documented options:
 [^minor-aug-announce]: PostgreSQL 18.6, 17.11, 16.15, 15.19, 14.24, and 19 Beta 3 released (2026-08-13). <https://www.postgresql.org/about/news/postgresql-186-1711-1615-1519-1424-and-19-beta-3-released-3365/>
 
 [^minor-nov-announce]: PostgreSQL 18.7, 17.12, 16.16, 15.20, 14.25, and 19 RC 2 released (2026-11-12). <https://www.postgresql.org/about/news/postgresql-187-1712-1616-1520-1425-and-19-rc-2-released-3442/>
+
+[^psql18-docs]: PostgreSQL 18 psql reference: connection precedence, output formats, COPY streaming, variable interpolation, watch termination, and query execution. <https://www.postgresql.org/docs/18/app-psql.html>
+
+[^vacuumdb17-docs]: PostgreSQL 17 vacuumdb reference: database selection and concurrency. <https://www.postgresql.org/docs/17/app-vacuumdb.html>
+
+[^pg18-upgrade]: PostgreSQL 18 pg_upgrade: post-upgrade statistics instructions. <https://www.postgresql.org/docs/18/pgupgrade.html>

@@ -122,18 +122,12 @@ Insert into the deepest level via a PROCEDURE that pulls the next number:
     )
     LANGUAGE plpgsql AS $$
     BEGIN
-        PERFORM fn_assert_not_in_transaction();
         PERFORM pg_advisory_xact_lock(p_customer_no::bigint, p_order_no::bigint);
 
         p_line_no := fn_next_line_no(p_customer_no, p_order_no);
 
         INSERT INTO order_line(customer_no, order_no, line_no, product_no, quantity)
         VALUES (p_customer_no, p_order_no, p_line_no, p_product_no, p_quantity);
-
-        COMMIT;
-    EXCEPTION WHEN OTHERS THEN
-        ROLLBACK;
-        RAISE;
     END;
     $$;
 

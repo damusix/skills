@@ -54,8 +54,8 @@ Five rules:
 | Cross-continent distances + areas | `geography(Point, 4326)` + GiST | Spheroidal math handles global accuracy |
 | Polygons / regions (boundaries, postal codes, zones) | `geometry(MultiPolygon, 4326)` + GiST | Geometry sufficient; pair with ST_DWithin for distance queries |
 | Point-in-polygon "which region?" | `ST_Contains(region, point)` with GiST on region | Fast bbox-filter then exact check |
-| "Nearest N stores" KNN | `ORDER BY geom <-> ST_MakePoint(lon, lat) LIMIT N` | KNN-GiST returns sorted nearest |
-| "All points within X meters" | `ST_DWithin(geom, point, X)` | Uses GiST `&&` then exact check |
+| "Nearest N stores" KNN | `ORDER BY geom <-> ST_SetSRID(ST_MakePoint(lon, lat), 4326) LIMIT N` | Geometry KNN orders in coordinate units, not necessarily ground meters |
+| "All points within X meters" | `ST_DWithin(geog, point_geog, X)` | Geography uses meters; geometry uses its CRS units |
 | Polygon overlap detection | `ST_Intersects(a, b)` with GiST | Bbox-accelerated; falls back to GEOS exact |
 | Compute area / perimeter | `ST_Area(geog)`, `ST_Perimeter(geog)` | Use geography for square meters; geometry returns SRS units |
 | Buffer a point/line into polygon | `ST_Buffer(geom, distance)` | Use geography for meter-radius; geometry for SRS-unit-radius |
@@ -67,7 +67,7 @@ Five rules:
 Smell signals:
 
 - **No `&&` in query plan but using `ST_Intersects`** — index missing or planner thinks bbox filter not selective enough. Run `ANALYZE`.
-- **`geography` everywhere when data is local-scale (one city)** — paying spheroidal-math cost for nothing. Use `geometry(...,3857)` for meter units in local projection.
+- **Using longitude/latitude degrees as meters** — use geography or transform to a suitable local projected CRS. Web Mercator is useful for tiles but distorts ground distances.
 - **`ST_Distance` in `WHERE x < threshold`** — defeats index. Use `ST_DWithin(a, b, threshold)` instead.
 
 ## Syntax / Mechanics
@@ -252,22 +252,22 @@ The `&&` index condition is the bbox filter; the recheck on the heap is exact-ge
 ```sql
 -- DWithin: index-accelerated "within N units"
 SELECT id, name FROM places
-WHERE ST_DWithin(location, ST_MakePoint(-122.4, 37.8)::geometry, 0.01);
+WHERE ST_DWithin(location, ST_SetSRID(ST_MakePoint(-122.4, 37.8), 4326), 0.01);
 -- Note: 0.01 is in SRS units (degrees for 4326); not meters
 
 -- Use geography for meter-radius
 SELECT id, name FROM places
-WHERE ST_DWithin(location::geography, ST_MakePoint(-122.4, 37.8)::geography, 500);
+WHERE ST_DWithin(location::geography, ST_SetSRID(ST_MakePoint(-122.4, 37.8), 4326)::geography, 500);
 -- 500 = 500 meters
 
 -- KNN nearest-N
-SELECT id, name, ST_Distance(location, ST_MakePoint(-122.4, 37.8)::geometry) AS dist
+SELECT id, name, ST_Distance(location, ST_SetSRID(ST_MakePoint(-122.4, 37.8), 4326)) AS dist
 FROM places
-ORDER BY location <-> ST_MakePoint(-122.4, 37.8)::geometry
+ORDER BY location <-> ST_SetSRID(ST_MakePoint(-122.4, 37.8), 4326)
 LIMIT 10;
 ```
 
-**Operator `<->`** = bounding-box centroid distance for GiST KNN; the `ORDER BY` triggers index-only-scan for nearest-N. Pair with `LIMIT` for the index to drive ordering.
+For geometry, `<->` orders by 2D distance and can use GiST KNN. For geography it uses spherical distance, not the default spheroidal `ST_Distance`. See <https://github.com/postgis/postgis/blob/3.7.0/doc/reference_operator.xml>.
 
 `ST_Distance`:
 
@@ -386,14 +386,17 @@ ANALYZE service_areas;
 ### Recipe 2: Find nearest N stores to a point
 
 ```sql
+CREATE INDEX stores_location_geog_gix ON stores USING gist ((location::geography));
+
 SELECT id, name,
-       ST_Distance(location::geography, ST_MakePoint(-122.4, 37.8)::geography) AS meters
+       ST_Distance(location::geography,
+           ST_SetSRID(ST_MakePoint(-122.4, 37.8), 4326)::geography, false) AS meters
 FROM stores
-ORDER BY location <-> ST_SetSRID(ST_MakePoint(-122.4, 37.8), 4326)
+ORDER BY location::geography <-> ST_SetSRID(ST_MakePoint(-122.4, 37.8), 4326)::geography
 LIMIT 10;
 ```
 
-`<->` triggers KNN-GiST index scan. `ORDER BY` + `LIMIT` are required. Cast to `geography` only inside the `ST_Distance` for accurate meters; keep the `ORDER BY` on `geometry` so the index drives ordering.
+The geography expression index supports spherical KNN ordering. Spheroidal distance differs; exact spheroidal nearest neighbors require a query that orders all relevant candidates by spheroidal `ST_Distance`.
 
 ### Recipe 3: Find all stores within 500 meters
 
@@ -402,12 +405,12 @@ SELECT id, name
 FROM stores
 WHERE ST_DWithin(
     location::geography,
-    ST_MakePoint(-122.4, 37.8)::geography,
+    ST_SetSRID(ST_MakePoint(-122.4, 37.8), 4326)::geography,
     500
 );
 ```
 
-Geography variant. Distance in meters. Index-accelerated via `&&` bbox filter on geography (geography GiST supports it).
+Geography distance is in meters. The geography expression GiST index above can accelerate this predicate; a GiST index on the geometry column alone cannot index the cast.
 
 ### Recipe 4: Point-in-polygon — which region contains a point?
 
@@ -572,9 +575,9 @@ WHERE t.typname IN ('geometry', 'geography')
 
 2. **Mixing SRIDs in one query errors** — "Operation on mixed SRID geometries." All arguments must share SRID; use `ST_Transform` to align.
 
-3. **`geometry` `ST_Distance` returns SRS units** — for `geometry(Point, 4326)`, distance is in **degrees** (~111 km per degree at equator, less near poles). Cast to `geography` for meters: `ST_Distance(a::geography, b::geography)`.
+3. **`geometry` `ST_Distance` returns CRS units.** For `geometry(Point, 4326)`, distance is in degrees; cast to geography or use a suitable projected CRS for meters.
 
-4. **`ST_Disjoint` not index-accelerated** — has to compare to all rows. Rewrite as `NOT ST_Intersects(a, b)` which IS index-accelerated.
+4. **`ST_Disjoint` is not automatically index-accelerated.** `NOT ST_Intersects` is equivalent but does not make a negative predicate index-selective; design an appropriate positive spatial restriction when one exists.
 
 5. **`ST_Distance` in `WHERE ... < N` defeats index** — `WHERE ST_Distance(a, point) < 0.01` does seq scan. Rewrite as `ST_DWithin(a, point, 0.01)` for index-accelerated bbox + exact check.
 

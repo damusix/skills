@@ -1,7 +1,7 @@
 # Extensions
 
 > [!WARNING] Extensions are versioned bundles, not loose scripts
-> `CREATE EXTENSION` is NOT `\i some-file.sql`. It tracks owned objects in `pg_extension`, runs version-update scripts on `ALTER EXTENSION ... UPDATE`, and `pg_dump` re-emits a single `CREATE EXTENSION` line instead of every object. **Manually-created functions/types claimed to be "part of" an extension are silently omitted from `pg_dump` output and lost at upgrade/restore time.** Always package as a real extension (`.control` + versioned `.sql`) if you want lifecycle management — even for internal-only code.
+> `CREATE EXTENSION` tracks member objects in `pg_extension` and `pg_depend`, runs update scripts on `ALTER EXTENSION ... UPDATE`, and normally causes `pg_dump` to emit `CREATE EXTENSION` instead of member definitions. Manually created objects are dumped separately unless added to the extension. Changes to member definitions are not dumped, so provide them in extension scripts.
 
 ## Table of Contents
 
@@ -62,7 +62,7 @@ Five rules drive every extension decision.
 
 **Rule 3 — `pg_available_extensions` lists what could be installed; `pg_available_extension_versions` lists every version.** These views read the on-disk control files; they show what `CREATE EXTENSION` would find, not what's installed. Cross-reference [Introspection catalog + views](#introspection-catalog--views).
 
-**Rule 4 — Trusted extensions (PG13+) can be installed by non-superusers.** When `trusted = true` in the control file, any role with `CREATE` privilege on the target database can run `CREATE EXTENSION`. The install script runs as the bootstrap superuser, not the calling role — so trusted extensions can still create operators, types, etc. Untrusted extensions require superuser. **Most managed environments restrict installable extensions to a provider-curated allowlist regardless of the trusted flag** ([`101-managed-vs-baremetal.md`](./101-managed-vs-baremetal.md)).
+**Rule 4 — Trusted extensions (PG13+) can be installed by non-superusers.** If `superuser = true` and `trusted = true`, a role with database `CREATE` can install the extension, and its script runs as the bootstrap superuser. If `superuser = false`, the caller can install when it has the privileges required by the script; the script runs as the caller. Managed environments may restrict extensions to an allowlist.
 
 **Rule 5 — Each extension lives in one schema by default but most can be relocated via `ALTER EXTENSION ... SET SCHEMA`.** Schema fixed at `CREATE EXTENSION` time via `SCHEMA <name>` clause or control-file `schema = ...` (the latter is non-overridable). Relocatable extensions (`relocatable = true`) can be moved later; non-relocatable cannot. PG16 added `no_relocate` clause to require referenced extensions stay put.
 
@@ -105,12 +105,12 @@ Behavior:
 
 - Reads `<extension_name>.control` from share directory (or `extension_control_path` PG18+)
 - Creates a `pg_extension` row with extension OID
-- Runs install script `<extension_name>--<version>.sql` as the bootstrap superuser (regardless of caller)
+- Runs the install script as the caller, except when a non-superuser installs a trusted extension requiring superuser privileges; then it runs as bootstrap superuser
 - Records every object created during script run as owned by the extension (via `pg_depend` rows with `deptype = 'e'`)
 - `CASCADE` automatically installs prerequisite extensions listed in `requires = ...`
 - `IF NOT EXISTS` makes it a no-op when already installed (compare versions manually)
 
-**Privilege rule:** Superuser OR (PG13+) `trusted = true` AND caller has `CREATE` on the target database. The script runs as the bootstrap superuser either way.
+**Privilege rule:** A superuser can install. For `superuser = true`, a non-superuser needs `trusted = true` and database `CREATE`; the script then runs as bootstrap superuser. For `superuser = false`, the caller needs the privileges required by the script.
 
 > [!WARNING] `CREATE EXTENSION` is per-database, not cluster-wide
 > Installing into the `postgres` database does NOT make the extension available in `app_db`. Install into each database that needs the extension. Globally-loaded shared libraries (via `shared_preload_libraries`) are loaded once cluster-wide, but the SQL surface (functions, types, views) requires `CREATE EXTENSION` per database.
@@ -167,9 +167,9 @@ The `<name>.control` file lives in the share directory. Plain text, key=value:
 
 | Parameter | Required | Default | Meaning |
 |---|---|---|---|
-| `default_version` | yes | — | Version installed if `VERSION` omitted in `CREATE EXTENSION` |
+| `default_version` | no | none | Default version if `VERSION` is omitted; installation without either fails |
 | `comment` | no | none | Description (applied only at creation, not at update) |
-| `encoding` | no | UTF-8 | Encoding of the SQL script files |
+| `encoding` | no | database encoding | Encoding of the SQL script files |
 | `module_pathname` | no | none | Path substituted for `MODULE_PATHNAME` in scripts (typically `$libdir/<name>`) |
 | `requires` | no | none | Comma-separated prereq extensions (e.g., `requires = 'cube, earthdistance'`) |
 | `superuser` | no | `true` | If true, only superusers can install/update |
@@ -179,8 +179,8 @@ The `<name>.control` file lives in the share directory. Plain text, key=value:
 | `directory` | no | (share dir) | Directory containing SQL scripts |
 | `no_relocate` | no | none | PG16+ — list of required extensions that cannot change schema |
 
-> [!WARNING] `superuser = false` + `trusted = false` is meaningless
-> Either makes installation work for the caller. `trusted = true` lets non-superusers install; `superuser = false` only matters if `trusted` is also `false` (and is unusual outside legacy contexts). For modern extensions: `trusted = true` is the right choice when safe.
+> [!WARNING] Trusted scripts run with elevated privileges
+> `trusted` has no effect when `superuser = false`. Set it only after auditing installation and update scripts for privilege escalation; it allows qualifying non-superusers to run those scripts as bootstrap superuser.
 
 ### Trusted extensions (PG13+)
 
@@ -206,9 +206,9 @@ In-core extensions NOT trusted (require superuser):
 > The extension author asserts the extension is safe for non-superusers. If the extension has a privilege-escalation bug, every database with `CREATE` privilege granted to PUBLIC becomes vulnerable. **Audit trusted extensions in your cluster** before granting `CREATE` on databases:
 >
 > ```sql
-> SELECT name, default_version, installed_version, trusted, superuser
+> SELECT name, version, installed, trusted, superuser
 >   FROM pg_available_extension_versions
->  WHERE installed_version IS NOT NULL;
+>  WHERE installed;
 > ```
 
 ### Schema placement + relocation
@@ -226,8 +226,8 @@ Examples of fixed-schema extensions: `pgcrypto` (no fixed schema; relocatable), 
 Most contrib extensions are relocatable. Inspect with:
 
 ```sql
-SELECT name, relocatable, schema FROM pg_available_extensions
- WHERE installed_version IS NOT NULL;
+SELECT name, version, relocatable, schema FROM pg_available_extension_versions
+ WHERE installed;
 ```
 
 ### Version updates
@@ -305,7 +305,7 @@ extension_control_path = '$system:/opt/myextensions/share:/home/postgres/dev-ext
 
 ## Contrib Extension Inventory
 
-PG16 ships 50 contrib extensions. The `--contrib` package on most distributions includes all of them. Each is installable via `CREATE EXTENSION <name>`.
+PostgreSQL includes contrib modules. Some provide extensions installable with `CREATE EXTENSION`; others are libraries or output plugins loaded by other mechanisms.
 
 | Extension | Category | Trusted | Purpose |
 |---|---|---|---|

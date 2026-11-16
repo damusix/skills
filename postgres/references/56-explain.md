@@ -37,15 +37,15 @@ If you are looking for *what the cost numbers mean* and how to tune them, see [`
 
 Five rules drive most diagnostic flows:
 
-1. **`EXPLAIN` shows the planner's cost model; `EXPLAIN ANALYZE` actually runs the query.** Verbatim from the docs: *"Keep in mind that the statement is actually executed when the `ANALYZE` option is used. Although `EXPLAIN` will discard any output that a `SELECT` would return, other side effects of the statement will happen as usual."*[^side-effect] For `INSERT`/`UPDATE`/`DELETE`/`MERGE`/`CREATE TABLE AS`, wrap in `BEGIN; ... ROLLBACK;` to inspect without committing.
+1. **`EXPLAIN ANALYZE` executes the query.** A transaction and `ROLLBACK` undo transactional table changes, but not all effects: sequence increments and external effects from functions are not rolled back. Locks, load, and WAL still affect production. Use an isolated representative environment when side effects are unsafe.[^side-effect]
 
-2. **Read plans bottom-up.** Plan-tree leaves execute first (scans), parents execute against their children's output (joins, sorts, aggregates), root produces the final result. The indentation in `text` format is the tree structure. Start at the most-indented node (deepest leaf), understand what it produces, then move up one level at a time to its parent. The root node (least indented, printed last) is the final output step. When diagnosing a slow query, find the first node walking bottom-up where `actual rows` diverges significantly from `rows` (estimated) — that node is where the planner's model broke. Everything above it is operating on bad cardinality estimates.
+2. **Read plans from leaves toward parents.** Text output prints the root first. Start with the scans, then follow their outputs toward the root. Execution is demand-driven, so a parent such as `LIMIT` can stop a child early; do not treat every node as fully executed or every divergence as a proven misestimate.
 
 3. **The `rows` value is the number emitted by the node, not scanned.** Verbatim: *"The `rows` value is a little tricky because it is not the number of rows processed or scanned by the plan node, but rather the number emitted by the node. This is often less than the number scanned, as a result of filtering by any `WHERE`-clause conditions that are being applied at the node."*[^rows-emitted] Compare to "Rows Removed by Filter" in `EXPLAIN ANALYZE` output to see what was scanned vs returned.
 
-4. **`actual rows` × 10 ≠ `estimate` rows is the canonical misestimate signal.** A 10×+ divergence at any plan node almost always indicates stale statistics, missing extended statistics for correlated columns, or a planner-blind expression. Track which node first diverges as you walk up the tree — that node's children are correct; the node itself is where the planner's model breaks.
+4. **A large actual-to-estimated rows ratio is a diagnostic clue.** Compare per-loop values and investigate early termination, parameter skew, statistics, and correlations before concluding where the estimate failed.
 
-5. **`BUFFERS` is the source of truth for I/O.** Cost numbers are estimates; `buffers shared hit/read/dirtied/written` and `temp read/written` are actual. Always use `EXPLAIN (ANALYZE, BUFFERS)` for performance work. `BUFFERS` is automatic with `ANALYZE` in PG18+[^pg18-buffers-auto] but must be requested explicitly on PG17 and earlier.
+5. **`BUFFERS` reports PostgreSQL buffer activity, not necessarily physical disk I/O.** A shared read can be satisfied by the OS cache; use timing and operating-system metrics to investigate storage. `BUFFERS` is automatic with `ANALYZE` in PG18+[^pg18-buffers-auto] but must be requested explicitly on PG17 and earlier.
 
 ### How to Walk a Plan
 
@@ -58,7 +58,7 @@ Gather  (cost=1000.0..2340.1 rows=500 width=32) (actual rows=483 loops=1)
               ->  Index Scan using users_pkey on users u  (cost=0.4..90.0 rows=2000 width=16) (actual rows=1983 loops=1)
 ```
 
-Reading procedure — always bottom-up:
+One way to follow this plan is from leaves toward the root:
 
 1. **Deepest leaf first:** `Index Scan on users` — scans the `users` table via primary key, estimated 2000 rows, actual 1983. Estimate good.
 2. **Its parent:** `Hash` — materializes the index scan result into a hash table. Fine.
@@ -66,14 +66,14 @@ Reading procedure — always bottom-up:
 4. **Their parent:** `Hash Join` — joins orders to the hash table. estimated 500, actual 483. Fine.
 5. **Root:** `Gather` — collects parallel worker output. Fine.
 
-If the Hash Join had shown `rows=500` estimated vs `actual rows=50000`, that node is the first divergence. Its children were correct, so the misestimate is in the join condition's cardinality model — likely correlated columns or stale statistics on `orders`. Fix: `ANALYZE orders;` and/or `CREATE STATISTICS` for correlated columns.
+If the Hash Join showed `rows=500` estimated versus `actual rows=50000`, investigate the join estimate and its inputs. `ANALYZE` may help stale statistics, but extended statistics are per-table and do not generally fix join selectivity across tables.
 
 ## Decision Matrix
 
 | You want to … | Use | Avoid | Why |
 |---|---|---|---|
-| Inspect plan without running the query | `EXPLAIN <stmt>` | `EXPLAIN ANALYZE` for queries with side effects without wrapping in `BEGIN; ... ROLLBACK;` | `ANALYZE` actually executes the statement[^side-effect] |
-| Diagnose a slow `SELECT` | `EXPLAIN (ANALYZE, BUFFERS) <stmt>` | bare `EXPLAIN ANALYZE` | Without `BUFFERS` you cannot distinguish cache-hit from disk-read cost |
+| Inspect plan without running the query | `EXPLAIN <stmt>` | `EXPLAIN ANALYZE` when execution is unsafe | `ANALYZE` executes the statement; rollback does not undo every side effect[^side-effect] |
+| Diagnose a slow `SELECT` | `EXPLAIN (ANALYZE, BUFFERS) <stmt>` | relying only on elapsed time | `BUFFERS` shows PostgreSQL buffer hits and reads, though reads may be served from the OS cache |
 | Diagnose a slow `SELECT` on PG18+ | `EXPLAIN ANALYZE <stmt>` | redundant `BUFFERS` keyword (still works, harmless) | PG18 includes `BUFFERS` automatically[^pg18-buffers-auto] |
 | Verify a parameterized query's generic plan | `EXPLAIN (GENERIC_PLAN) <stmt with $1...>` | `EXPLAIN ANALYZE` (incompatible) | `GENERIC_PLAN` cannot be combined with `ANALYZE`[^generic-plan] |
 | See which GUCs are altered from default | `EXPLAIN (SETTINGS) <stmt>` | guessing from query text alone | Captures session-overridden planner GUCs[^settings] |
@@ -83,11 +83,11 @@ If the Hash Join had shown `rows=500` estimated vs `actual rows=50000`, that nod
 | Get machine-parseable plan | `EXPLAIN (FORMAT JSON) <stmt>` | text format for tooling | JSON/XML/YAML are structured |
 | Capture plans of slow queries already running in prod | enable `auto_explain` | `EXPLAIN ANALYZE`-by-hand-per-query | Background; logs plans of queries exceeding `log_min_duration`[^auto-explain] |
 | Estimate true I/O time | enable `track_io_timing` + `EXPLAIN (ANALYZE, BUFFERS)` | bare `BUFFERS` (counts blocks but no time) | `track_io_timing` adds time spent reading/writing to BUFFERS output[^track-io-timing] |
-| Compute selectivity error of a join | look at `rows` actual/estimated ratio at the join node, walk up | guessing | The first 10×+ divergence node is the misestimate source |
+| Investigate join cardinality | compare actual and estimated rows at the join and its inputs | assuming the first divergence proves a cause | Check early termination and statistics before drawing conclusions |
 
 Three smell signals that something is wrong before you even read the plan:
 
-- `actual rows=N loops=M` where `M × estimated_rows ≠ N`: the planner mis-cardinality-estimated; check pg_stats for the relevant columns.
+- `actual rows=N loops=M`: compare `N` directly with estimated rows; both are per-loop values. Multiply by `M` only to estimate total output.
 - `Rows Removed by Filter:` very large fraction of scanned rows: the index or predicate-push-down opportunity is being missed; cross-reference [`22-indexes-overview.md`](./22-indexes-overview.md).
 - `Heap Fetches:` non-zero on an Index Only Scan: visibility map is behind; the table needs `VACUUM` more frequently; cross-reference [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md).
 
@@ -95,7 +95,7 @@ Three smell signals that something is wrong before you even read the plan:
 
 ### Grammar
 
-The PG16 grammar (PG17 and PG18 added `SERIALIZE` and `MEMORY` respectively):
+The PG16 grammar, with `SERIALIZE` and `MEMORY` added in PG17:
 
 ```sql
 EXPLAIN [ ( option [, ...] ) ] statement
@@ -369,8 +369,8 @@ Interpretation:
 Three patterns to recognize:
 
 1. **`shared read` dominates `shared hit`** → working set exceeds `shared_buffers`, page cache, or both. Time to scale memory or rewrite the query.
-2. **`temp read/written` non-zero on a `Sort` or `Hash`** → `work_mem` is too small for this query. Raise per-session (`SET work_mem = '256MB'`) or per-role (`ALTER ROLE reporter SET work_mem = '512MB'`); never raise cluster-wide on a connection-heavy server — cross-reference [`54-memory-tuning.md`](./54-memory-tuning.md) gotcha #4.
-3. **`written` non-zero on a SELECT** → backend was forced to write a dirty buffer to make room. Indicates checkpointer or bgwriter is falling behind. Cross-reference [`34-checkpoints-bgwriter.md`](./34-checkpoints-bgwriter.md).
+2. **`temp read/written` non-zero on a `Sort` or `Hash`** → `work_mem` is too small for this query. Raise per-session (`SET work_mem = '256MB'`) or per-role (`ALTER ROLE reporter SET work_mem = '512MB'`); never raise cluster-wide on a connection-heavy server — cross-reference [`54-memory-tuning.md`](./54-memory-tuning.md) Recipe 3 for per-role overrides and gotchas #3 and #4 for how `work_mem` multiplies across operations and sessions.
+3. **`written` non-zero on a SELECT** → this backend evicted previously dirty buffers during the query. The counter alone does not establish that the checkpointer or background writer is falling behind; investigate workload and writeback metrics.
 
 > [!NOTE] PostgreSQL 16+ I/O timing alternative
 > If you enable `track_io_timing`[^track-io-timing], the `BUFFERS` output also includes `I/O Timings: shared/local read=N.NNN ms write=N.NNN ms` and `I/O Timings: temp read=N.NNN ms write=N.NNN ms`. Beware the overhead warning on slow-clock systems; verify with `pg_test_timing` before enabling cluster-wide.
@@ -380,8 +380,8 @@ Three patterns to recognize:
 The canonical diagnostic flow for "the planner picked a bad plan":
 
 1. Run `EXPLAIN (ANALYZE, BUFFERS)`.
-2. Find the lowest node where `(estimated rows) × (actual loops)` diverges from `(actual rows) × (actual loops)` by 10× or more.
-3. That node's *inputs* are correctly estimated; the *node itself* (or its predicate) is where the planner's model breaks.
+2. Compare estimated and actual per-loop rows at each node; flag large divergences.
+3. Check whether the node ran to completion, and investigate statistics and correlated inputs before attributing a cause.
 
 Common root causes:
 
@@ -478,12 +478,12 @@ Checklist for the output:
 
 1. Walk leaves-to-root.
 2. At each node, compare `rows actual` vs `rows estimated`. Flag any 10×+ divergence.
-3. In `BUFFERS` lines, look for `read` dominating `hit` (working-set > cache), `temp read/written` (spill), `dirtied/written` on a SELECT (write-back pressure).
+3. In `BUFFERS` lines, inspect shared-buffer reads and hits, temp I/O, and backend writes. A shared-buffer read may be served by the OS cache, and backend writes alone do not prove background-writer pressure.
 4. In `Sort Method:`, look for `external merge` (spilled) vs `top-N heapsort` (in-memory).
 5. In `HashAggregate`, look for `Batches: > 1` (spilled to disk).
 6. Bottom of plan: `Settings:` lists overridden planner GUCs. `Planning Time:` should be small (<5% of execution time); if not, the plan cache may be churning — cross-ref [`13-cursors-and-prepares.md`](./13-cursors-and-prepares.md).
 
-### Recipe 2: EXPLAIN ANALYZE on a mutating statement without side effects
+### Recipe 2: EXPLAIN ANALYZE with transactional rollback
 
 ```sql
 BEGIN;
@@ -492,7 +492,7 @@ UPDATE users SET last_seen = now() WHERE id = ANY (ARRAY[1,2,3,4,5]);
 ROLLBACK;
 ```
 
-`ROLLBACK` reverts the actual modification. The WAL records reported are accurate measurements of what the operation would generate if committed. Same pattern works for `INSERT`/`DELETE`/`MERGE`/`CREATE TABLE AS`.
+`ROLLBACK` reverts transactional table changes, not sequence increments or external side effects. It still creates load and WAL, and commit-related WAL is not included in the displayed statement metrics. Use an isolated environment when execution is unsafe.
 
 ### Recipe 3: Verify a parameterized query's generic plan (PG16+)
 
@@ -595,10 +595,10 @@ SELECT id, payload FROM events WHERE id = 42;
 --   Buffers: shared hit=4
 -- Serialization: time=120.123 ms  output=15234kB  format=text
 -- Planning Time: 0.123 ms
--- Execution Time: 0.567 ms
+-- Execution Time: 120.567 ms
 ```
 
-The query execution took 0.567 ms but serializing one TOASTed JSONB to text took 120 ms. The hot fix is to project only the keys you need:
+The reported execution time includes the serialization work. The serialization breakdown shows that most time was spent converting the TOASTed JSONB to text. One option is to project only the keys you need:
 
 ```sql
 SELECT id, payload->>'event_type' AS event_type FROM events WHERE id = 42;
@@ -644,9 +644,9 @@ WHERE c.name = 'electronics' AND o.created_at >= now() - '7 days'::interval
 GROUP BY u.email;
 ```
 
-Walk each join node bottom-to-top. The lowest node with `rows estimated=100` but `rows actual=1000000` is the source. Common pattern: a filter on `c.name = 'electronics'` returns 50 categories estimated → 1 actual; later joins explode because the planner expects fewer products. Fix:
+Walk the join nodes and investigate large estimate differences, accounting for early termination and per-loop averages. A difference is a clue, not proof of a root cause. For example, if a category filter estimate is wrong, inspect its statistics:
 
-1. `CREATE STATISTICS ON name FROM categories;` — useless, statistics already include name.
+1. Skip `CREATE STATISTICS ON name FROM categories;`: it fails, because extended statistics need two or more columns or one expression, and per-column statistics on `name` already exist.
 2. Inspect with `SELECT * FROM pg_stats WHERE tablename='categories' AND attname='name';` — is `most_common_vals` populated? Is `n_distinct` reasonable?
 3. If `categories` is small (<1000 rows), raise `default_statistics_target` for that column: `ALTER TABLE categories ALTER COLUMN name SET STATISTICS 1000;` then `ANALYZE categories;`
 
@@ -700,7 +700,7 @@ PG18 marks plan nodes that were forced into the plan despite a relevant `enable_
 
 ## Gotchas / Anti-patterns
 
-1. **`EXPLAIN ANALYZE` actually executes the query.**[^side-effect] `INSERT`/`UPDATE`/`DELETE`/`MERGE`/`CREATE TABLE AS` without `BEGIN; ... ROLLBACK;` will modify your data. The docs even quote the workaround verbatim.
+1. **`EXPLAIN ANALYZE` actually executes the query.**[^side-effect] A transaction followed by rollback undoes transactional table changes, but not sequence increments or external effects. Avoid executing unsafe statements in production.
 
 2. **`EXPLAIN` (no `ANALYZE`) shows estimates only.** A query with cost = 0.42..1.23 may take an hour. Always run `EXPLAIN ANALYZE` for performance work.
 
@@ -712,11 +712,11 @@ PG18 marks plan nodes that were forced into the plan despite a relevant `enable_
 
 6. **`Heap Fetches: > 0` on an Index Only Scan means visibility map is stale.** The index has all the columns but the planner cannot trust the all-visible bits. `VACUUM` the table; cross-reference [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md).
 
-7. **`Sort Method: external merge` means `work_mem` is too small for this query.** Raise per-session, not cluster-wide; cross-reference [`54-memory-tuning.md`](./54-memory-tuning.md) gotcha #4.
+7. **`Sort Method: external merge` means `work_mem` is too small for this query.** Raise per-session, not cluster-wide; cross-reference [`54-memory-tuning.md`](./54-memory-tuning.md) Recipe 3 for per-role overrides and gotchas #3 and #4 for how `work_mem` multiplies across operations and sessions.
 
 8. **`Batches: > 1` on HashAggregate / Hash Join means hash table spilled.** Same fix as Sort. Use `hash_mem_multiplier` PG13+ to break the symmetric work_mem assumption (default 2.0 since PG15).
 
-9. **`written` non-zero on a SELECT means the backend wrote a dirty buffer.** Indicates checkpointer/bgwriter pressure; cross-reference [`34-checkpoints-bgwriter.md`](./34-checkpoints-bgwriter.md).
+9. **`written` non-zero on a SELECT means the backend evicted previously dirty buffers.** This alone does not diagnose checkpointer or background-writer pressure; correlate it with workload and writeback metrics.[^buffers]
 
 10. **`GENERIC_PLAN` cannot be combined with `ANALYZE`.**[^generic-plan] Trying to do so raises an error. Use `force_generic_plan` GUC + `EXPLAIN ANALYZE EXECUTE` instead.
 
@@ -724,7 +724,7 @@ PG18 marks plan nodes that were forced into the plan despite a relevant `enable_
 
 12. **`auto_explain.log_analyze=on` adds per-query overhead.** Use `sample_rate < 1.0` in production. Verbatim from docs: *"In case of nested statements, either all will be explained or none."*
 
-13. **Plan output is verbose; the *first* misestimating node is what matters.** Walk leaves-up. The first node where actual ≠ estimate is the root cause; nodes above it are downstream symptoms.
+13. **Investigate estimate differences in context.** A leaf-to-root walk helps, but early termination can explain a low actual row count and the first difference is not necessarily the cause of a poor plan.
 
 14. **`EXPLAIN ANALYZE` on a transaction-mode pgBouncer connection does not see session GUCs from other transactions.** If your `SET work_mem` happened in a prior transaction, the next pooled query may not have it. Cross-reference [`81-pgbouncer.md`](./81-pgbouncer.md).
 

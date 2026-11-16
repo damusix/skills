@@ -118,10 +118,10 @@ A condensed seven-row comparison. The "Multicolumn?" column reflects the officia
 | Range / order | yes | no | yes (via opclass) | yes (via opclass) | no | yes | no |
 | `IS NULL` | yes | no | depends | depends | no | no | no |
 | Multicolumn keys | yes | no | yes | no | yes | yes | yes |
-| `INCLUDE` (payload columns) | PG11+ | no | PG14+ | PG14+ | no | no | no |
-| Lossy (bitmap recheck required) | no | no | yes (signature opclasses) | partial | yes (with `RECHECK`) | yes | yes |
+| `INCLUDE` (payload columns) | PG11+ | no | PG12+ | PG14+ | no | no | no |
+| Lossy (recheck may be required) | no | yes | depends on opclass | depends on opclass | depends on opclass | yes | yes |
 | WAL-logged & crash-safe | yes | PG10+ | yes | yes | yes | yes | yes |
-| Supports unique constraint | yes (default) | no (PG18: non-btree unique allowed as PK / matview)[^pg18-nonbtree-unique] | no | no | no | no | no |
+| Supports unique constraint | yes | no | no | no | no | no | no |
 | Parallel build | PG11+[^pg11-parallel] | no | no | no | PG18+[^pg18-parallel-gin] | PG17+[^pg17-parallel-brin] | no |
 | Size vs B-tree on the same data | 1× | ~1× | 0.8–1.5× | ~1× | 0.5–2× (varies) | ~1/1000× | ~0.1–0.3× |
 | Drives `ORDER BY distance LIMIT N` (KNN) | no | no | yes | yes | no | no | no |
@@ -143,7 +143,7 @@ The full PG16 grammar:[^createindex]
 
 Eight orthogonal options apply to most index types:
 
-1. `UNIQUE` — only valid for B-tree (and PG18+ for any opclass that supports equality)
+1. `UNIQUE` — supported by the built-in B-tree access method. PG18 lets a non-B-tree unique index (from an extension access method that supports uniqueness) serve as a partition key or a materialized view's unique index; equality support alone does not make an access method unique.[^pg18-nonbtree-unique]
 2. `CONCURRENTLY` — non-blocking build at the cost of a longer build time; see [`26-index-maintenance.md`](./26-index-maintenance.md)
 3. `USING method` — the access method (`btree` is the default if omitted)
 4. `( expression )` — wrap any expression in parentheses to build a functional index
@@ -184,8 +184,8 @@ In psql: `\dAc` lists operator classes, `\dAf` lists operator families.
 
 Three real rules for picking column order in a multicolumn B-tree:
 
-1. **Equality columns first, range columns last.** A B-tree can use the index for predicates on the leading columns; once a range predicate is seen, lower-order columns are useful only for `ORDER BY`.
-2. **High-selectivity columns before low-selectivity.** Same logic as picking the first key in a composite key on paper.
+1. **Equality columns first, range columns last** is often useful. Conditions after the first range can still be checked in the index, even when they do not narrow the scanned range.
+2. **Choose equality-column order for the workload.** If all equality columns are constrained, selectivity alone does not determine the best order; consider queries using prefixes and ordering.
 3. **PG18+ skip scan partly relaxes this** for the case where the leading column has few distinct values and a non-leading column has a strong predicate.[^pg18-skip] Still — design the index for the common predicate, not for skip scan.
 
 A multicolumn GIN index is *not* the same as multiple single-column GIN indexes. GIN combines them at the index level; multiple single-column indexes get combined later via bitmap AND (and the planner often picks the multicolumn shape when both columns are filtered together).
@@ -206,10 +206,10 @@ The predicate must use only columns of the target table and only `IMMUTABLE` ope
 
 *"An index column need not be just a column of the underlying table, but can be a function or scalar expression computed from one or more columns of the table … the index expressions are not recomputed during an indexed search, since they are already stored in the index. Thus, indexes on expressions are useful when retrieval speed is more important than insertion and update speed."*[^expr]
 
-The function in an expression index must be marked `IMMUTABLE` ([`06-functions.md`](./06-functions.md)). The canonical examples:
+The function in an expression index must be marked `IMMUTABLE` ([`06-functions.md`](./06-functions.md)). In the second example `created_at` is `timestamptz`; the three-argument `date_trunc(text, timestamptz, text)` is immutable only on PG16+, so the index fails to build on PG14–15. The canonical examples:
 
     CREATE INDEX users_email_lower ON users (lower(email));
-    CREATE INDEX orders_day ON orders (date_trunc('day', created_at));
+    CREATE INDEX orders_day ON orders (date_trunc('day', created_at, 'UTC'));
 
 Match the query's expression *exactly* — `WHERE lower(email) = $1` will use the first index, but `WHERE email ILIKE $1` will not.
 
@@ -237,9 +237,9 @@ Use `INCLUDE` to drive index-only scans for read-hot lookups that need a few ext
 Two prerequisites that often surprise people:
 
 1. **All referenced columns** in the query must be either index key columns or `INCLUDE` columns. Even `SELECT count(*) WHERE indexed_col = $1` needs index-only scan eligibility on indexed_col; an unrelated `WHERE another_col > 0` defeats it.
-2. **The visibility map must report the heap page as all-visible.** Otherwise the executor must visit the heap to recheck visibility. Pages get marked all-visible by VACUUM. A table with stale autovacuum will lose index-only scans even when the index would otherwise qualify. Run `VACUUM (VERBOSE)` and check the all-visible page count; see [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md).
+2. **All-visible pages avoid heap fetches.** If a visibility-map bit is unset, an index-only scan can still run but fetches the heap for visibility checks.[^index-only]
 
-EXPLAIN shows index-only eligibility as `Index Only Scan using …` and the heap fetches needed because of the visibility map as `Heap Fetches: N`. Non-zero `Heap Fetches` indicates VACUUM is behind.
+EXPLAIN reports these as `Heap Fetches: N`. Recently modified pages or snapshots that delay vacuum can cause nonzero fetches; this alone does not prove autovacuum is behind.
 
 ### Ordering: ASC/DESC and NULLS FIRST/LAST
 
@@ -253,7 +253,7 @@ A B-tree can be scanned in either direction at the same cost. You need an explic
 
 ### Unique Indexes and NULLS NOT DISTINCT (PG15+)
 
-*"Currently, only B-tree indexes can be declared unique."*[^unique] (PG18 relaxes this for any opclass that supports equality, but only as a partition key or in a materialized view — see version notes.)
+*"Currently, only B-tree indexes can be declared unique."*[^unique] PG18 lets a unique index from an extension access method serve as a partition key or a materialized view's unique index, but does not make built-in hash or GiST indexes unique.[^pg18-nonbtree-unique]
 
 *"By default, null values in a unique column are not considered equal, allowing multiple nulls in the column. The `NULLS NOT DISTINCT` option modifies this and causes the index to treat nulls as equal."*[^unique]
 
@@ -340,7 +340,7 @@ Indexes with zero scans are good candidates for removal, but read the caveats fi
       AND NOT i.indisprimary               -- never drop a PK
     ORDER BY pg_relation_size(s.indexrelid) DESC;
 
-Caveats: `pg_stat_user_indexes` is per-server. A standby that runs read queries has its own counters; an index "unused" on the primary may be hot on a replica. Reset counters with `pg_stat_reset()` and let representative traffic flow before deciding.
+Caveats: statistics are per-server and can reset. A standby has its own counters, and constraint or replica-identity indexes can matter even with zero scans. Observe representative traffic on all servers and inspect dependencies before removal.
 
 ### Recipe 3 — Audit: foreign keys missing a covering index
 
@@ -358,19 +358,25 @@ A foreign key without an index on the referencing column makes `DELETE` on the p
       AND NOT EXISTS (
           SELECT 1
           FROM pg_index i
+          JOIN pg_class ic ON ic.oid = i.indexrelid
+          JOIN pg_am am ON am.oid = ic.relam
           WHERE i.indrelid = c.conrelid
-            AND (i.indkey::int[])[0:array_length(c.conkey, 1) - 1] @> c.conkey::int[]
+            AND i.indisvalid AND i.indisready AND i.indpred IS NULL
+            AND am.amname = 'btree'
+            AND i.indnkeyatts >= cardinality(c.conkey)
+            AND (i.indkey::int[])[0:cardinality(c.conkey) - 1] @> c.conkey::int[]
       )
     ORDER BY child_table, fk_column;
 
-The `(indkey::int[])[0:N-1] @> conkey::int[]` test ensures the FK columns are a leading subset of an existing index — a covering index must lead with the FK column(s).
+This identifies full, valid B-tree indexes whose leading key columns include the FK columns in any order. It is a candidate audit, not proof of planner usability: verify operator classes, collations and representative plans.
 
 ### Recipe 4 — Audit: duplicate or overlapping indexes
 
-A common bloat source. The query finds indexes whose key columns are an exact prefix of another index's key columns:
+A common bloat source. The query pairs indexes on the same table whose key-column sets are equal or where one contains the other, ignoring column order and `INCLUDE` columns. Expression columns appear as `0` in `indkey`, so two different expression indexes can match. Review order, operator classes, predicates, included columns, uniqueness, constraints and replica identity before removing anything.
 
     WITH idx AS (
-        SELECT indexrelid, indrelid, indkey::int[] AS keys,
+        SELECT indexrelid, indrelid,
+               (indkey::int[])[0:indnkeyatts - 1] AS keys,
                pg_get_indexdef(indexrelid) AS def
         FROM pg_index
     )
@@ -428,7 +434,7 @@ A read-hot lookup that needs a few payload columns:
     FROM orders
     WHERE user_id = $1 AND status = 'paid';
 
-Verify with `EXPLAIN (ANALYZE, BUFFERS)` that you see `Index Only Scan` and `Heap Fetches: 0`. Non-zero `Heap Fetches` means autovacuum is behind on this table.
+Verify with `EXPLAIN (ANALYZE, BUFFERS)` that you see `Index Only Scan` and `Heap Fetches: 0`. Non-zero `Heap Fetches` means some heap pages are not all-visible: recent writes or a snapshot that delays vacuum, not only autovacuum lag.
 
 ### Recipe 8 — `LIKE 'prefix%'` index under a non-C collation
 
@@ -549,7 +555,7 @@ See [`26-index-maintenance.md`](./26-index-maintenance.md) for the full operatio
 
 11. **Partial-index predicate must use only IMMUTABLE expressions.** `WHERE created_at > now() - interval '7 days'` is not a valid partial-index predicate — `now()` is `STABLE`, not `IMMUTABLE`. Use a fixed timestamp instead, and rebuild the index periodically.
 
-12. **Index-only scan still does heap fetches if VACUUM is behind.** `Heap Fetches: N` in EXPLAIN means the visibility map is stale. Tune autovacuum; see §Index-Only Scans above and [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md).
+12. **Index-only scan still does heap fetches on pages that are not all-visible.** `Heap Fetches: N` in EXPLAIN counts rows whose heap page lacks the all-visible bit, from recent writes, snapshots that delay vacuum, or autovacuum lag. Check for long-running transactions before tuning autovacuum; see §Index-Only Scans above and [`28-vacuum-autovacuum.md`](./28-vacuum-autovacuum.md).
 
 13. **B-tree deduplication requires REINDEX after pg_upgrade from PG12 or earlier.** *"Users upgrading with pg_upgrade will need to use `REINDEX` to make an existing index use this feature."*[^pg13-dedup]
 
@@ -567,9 +573,9 @@ See [`26-index-maintenance.md`](./26-index-maintenance.md) for the full operatio
 
 20. **Building an index without `CONCURRENTLY` takes `SHARE` lock and blocks writes.** Use `CREATE INDEX CONCURRENTLY` in production. See [`26-index-maintenance.md`](./26-index-maintenance.md).
 
-21. **Indexes can prevent HOT updates.** *"Indexes can also prevent the creation of heap-only tuples. Therefore indexes that are seldom or never used in queries should be removed."*[^intro] A HOT update requires that no indexed column be modified; every extra index narrows that condition. See [`30-hot-updates.md`](./30-hot-updates.md).
+21. **Indexes can prevent HOT updates.** *"Indexes can also prevent the creation of heap-only tuples. Therefore indexes that are seldom or never used in queries should be removed."*[^intro] A HOT update requires that no column covered by a non-summarizing index be modified, so every extra B-tree, GIN, GiST, or hash index narrows that condition. On PG16+, changing only BRIN-indexed (summarizing) columns can still be HOT if the other conditions hold. See [`30-hot-updates.md`](./30-hot-updates.md).
 
-22. **An invalid index (build failed under `CONCURRENTLY`) still costs writes.** PostgreSQL maintains entries in invalid indexes during writes but does not use them for reads. Drop and recreate.
+22. **An invalid index may still cost writes.** Investigate build state, partitioned index attachment, constraints and dependencies before dropping an invalid index. For one left by a failed `CREATE INDEX CONCURRENTLY`, the docs recommend dropping it and running the concurrent build again, or rebuilding it with `REINDEX INDEX CONCURRENTLY`.
 
 23. **`NULLS NOT DISTINCT` is not allowed on a primary key in PG16+.** Use it on a uniqueness index/constraint that allows the column to be NULL.[^pg16-nnd]
 

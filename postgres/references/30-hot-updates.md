@@ -57,7 +57,7 @@ Skip this file if you only need the tuple-header bit layout ([`27-mvcc-internals
 
 4. **`fillfactor` is the only knob.** There is no `enable_hot_updates` GUC. The single lever is the per-table `fillfactor` storage parameter (10–100, default **100**) which reserves free space on each heap page for HOT chains.[^createtable] Index columns and query patterns are the other levers, but they're schema-level, not runtime tuning.
 
-5. **Indexes on hot-update columns kill HOT for that column.** This is the silent footgun: a partial index on `status WHERE status = 'pending'` makes *every* `UPDATE` that touches `status` non-HOT — even updates that change `status` from `'done'` to `'done'` (no-op semantically) still trip the indexed-column-changed check. The check is on `pg_index.indkey`, not on whether the value actually changed.
+5. **Indexes on frequently changed columns can prevent HOT.** PostgreSQL compares old and new values of index-referenced attributes, including expression and predicate dependencies. A no-op assignment does not necessarily prevent HOT.[^hot] See <https://raw.githubusercontent.com/postgres/postgres/REL_16_STABLE/src/backend/access/heap/heapam.c>.
 
 
 ## Decision Matrix
@@ -102,7 +102,7 @@ HOT has no SQL syntax — it's a behind-the-scenes optimization decided per-upda
     -- Reset to default:
     ALTER TABLE events RESET (fillfactor);
 
-`ALTER TABLE ... SET (fillfactor = N)` is a metadata-only operation taking `SHARE UPDATE EXCLUSIVE` (does not block reads or writes); it does **not** rewrite existing pages. New pages and inserts on existing under-filled pages honor the new setting; an existing page already at 100% won't be released without `VACUUM FULL` or `CLUSTER` (which is rarely worth it just for fillfactor).
+`ALTER TABLE ... SET (fillfactor = N)` is metadata-only and does not rewrite existing pages. It takes `SHARE UPDATE EXCLUSIVE`, which does not block reads or writes; subsequent inserts and updates follow the new setting.[^createtable] See <https://www.postgresql.org/docs/16/sql-altertable.html>.
 
 
 ### The two preconditions for HOT
@@ -114,7 +114,7 @@ From `storage-hot.html` verbatim:[^hot]
 > - The update does not modify any columns referenced by the table's indexes, not including summarizing indexes. The only summarizing index method in the core PostgreSQL distribution is BRIN.
 > - There is sufficient free space on the page containing the old row for the updated row."
 
-**Condition 1 — no indexed column changed:** the executor compares the bitmap of columns referenced by *any* index (from `pg_index.indkey` across all the table's indexes) against the bitmap of columns in the `UPDATE` target list. Any overlap → non-HOT. This check is purely structural; it doesn't care whether the new value equals the old value. `UPDATE events SET status = status` will still be non-HOT if `status` is indexed.
+**Condition 1 — no non-summarizing index-referenced column changed:** PostgreSQL compares old and new values for attributes used by indexes, including expression and predicate dependencies. A no-op assignment can remain HOT-eligible. See <https://raw.githubusercontent.com/postgres/postgres/REL_16_STABLE/src/backend/access/heap/heapam.c>.
 
 **Condition 2 — sufficient free space:** the new tuple version must fit on the same page as the old. "Sufficient" means after subtracting the existing live tuples, dead tuples (which might be pruned in this same update — see [Opportunistic HOT pruning](#opportunistic-hot-pruning)), and the new tuple's row size, the page can still hold the result. Page size is 8KB by default; if your `events` rows average 200 bytes, a page holds ~40 tuples, and you need roughly one row's worth of free space for each potential HOT update before the page fills.
 
@@ -190,7 +190,7 @@ And from the docs:[^hot]
 
 > "The update does not modify any columns referenced by the table's indexes, *not including summarizing indexes*. The only summarizing index method in the core PostgreSQL distribution is BRIN."
 
-How this works structurally: BRIN indexes summarize block ranges (default 128 pages per range), not individual tuples. When a tuple is HOT-updated, the BRIN summary covering that block range may need to be invalidated and rebuilt, but the BRIN index has no per-tuple entries to maintain. So a HOT update of a BRIN-indexed column is allowed — the summary will be lazily refreshed by `brin_summarize_new_values()` or by autovacuum, not at every UPDATE.
+BRIN summarizes block ranges rather than individual tuples. PG16 permits HOT when only summarizing-index columns change; the summarizing index still needs maintenance to keep its summaries safe for queries.[^pg16-brin]
 
 > [!NOTE] PostgreSQL 16
 > Pre-PG16, any column with a BRIN index on it still broke HOT just like a B-tree-indexed column. The PG16 carve-out is what makes BRIN-on-frequently-updated-columns operationally viable.
@@ -360,14 +360,7 @@ A queue / session / hot-status table where most updates touch non-indexed column
     -- consider a partial index WHERE status = 'expired' (small) or a
     -- BRIN index on last_seen (PG16+, HOT-safe).
 
-The reasoning: with `fillfactor=80`, each page reserves 20% free for HOT-update successors. Updates to `last_seen` and `request_count` (the hot columns) are guaranteed HOT because no index references them. The PK (session_id) and FK (user_id) are stable, so HOT eligibility is preserved.
-
-Result on a 1M-row workload with ~10K updates/sec on `last_seen`:
-
-- Heap size: stable at ~140 MB.
-- Index size: stable at ~40 MB (the two B-trees).
-- HOT ratio: 99.8%.
-- Autovacuum: only needed for periodic freeze, not for bloat.
+The lower fillfactor reserves space and improves the chance of HOT updates to `last_seen` and `request_count`; available space on the original page is still required. Measure the HOT ratio and vacuum behavior on the actual workload.[^hot]
 
 
 ### Recipe 2 — Diagnose low HOT ratio
@@ -585,7 +578,7 @@ When you need to do a large UPDATE on existing data and want HOT to apply maxima
         rows_done int;
     BEGIN
         LOOP
-            UPDATE big_table SET counter = counter + 1
+            UPDATE big_table SET counter = counter + 1, updated_at = now()
             WHERE id IN (
                 SELECT id FROM big_table WHERE updated_at IS NULL
                 LIMIT batch_size FOR UPDATE SKIP LOCKED
@@ -599,7 +592,7 @@ When you need to do a large UPDATE on existing data and want HOT to apply maxima
     -- Step 4 (optional): if HOT was very effective, you can raise fillfactor
     -- back if the table is normally read-mostly. Or leave it for future updates.
 
-Avoid raising fillfactor back to 100 just to "save space" — the natural turnover that grew the table also pulls average density back toward fillfactor over time. Leave the setting where it works.
+`SKIP LOCKED` can temporarily return no rows while eligible rows remain locked. After concurrent workers finish, recheck without skipping locks before declaring the backfill complete. Run the `DO` block as a top-level command, not inside an explicit transaction, because it commits between batches. See <https://www.postgresql.org/docs/16/plpgsql-transactions.html>.
 
 
 ### Recipe 8 — Detect index bloat from broken HOT
@@ -690,7 +683,7 @@ Expect HOT pct to jump significantly if the dropped index was the HOT-killer. If
 
 1. **`fillfactor=100` is the default and is usually wrong for OLTP tables.** Every reference / tutorial / sample uses defaults; this leaves no room for HOT on busy tables. Audit non-trivial UPDATE workloads with Recipe 9 and set fillfactor explicitly.
 
-2. **An index on a frequently-updated column kills HOT for *every* UPDATE that touches that column** — even an UPDATE that sets the column to its current value. The check is structural (column appears in target list), not semantic (value actually changed). If you must index a hot column, accept the index-bloat cost or switch to BRIN on PG16+.
+2. **Changes to columns referenced by non-summarizing indexes prevent HOT.** Merely naming an indexed column in `SET` does not necessarily prevent HOT when the stored value remains unchanged. BRIN is the core summarizing-index exception on PG16+. See <https://www.postgresql.org/docs/16/storage-hot.html>.
 
 3. **`ALTER TABLE SET (fillfactor = ...)` does not rewrite existing pages.** It only affects new pages and the existing under-filled tail. To force the new setting onto existing pages, use `pg_repack` (online) or `VACUUM FULL` / `CLUSTER` (locking).
 
@@ -704,9 +697,9 @@ Expect HOT pct to jump significantly if the dropped index was the HOT-killer. If
 
 8. **TOAST tables cannot have `fillfactor`.** From `sql-createtable.html` verbatim: *"This parameter cannot be set for TOAST tables."*[^createtable] If a row's TOASTed columns change, the TOAST table gets new tuples but the main heap entry can still be HOT-updated if the main-heap columns are unchanged.
 
-9. **An expression index on `lower(name)` counts as an index on `name`.** The expression-index column is built from the underlying column; an UPDATE on the underlying column will break HOT. Same for INCLUDE columns — every column referenced by any index counts, regardless of whether it's a key column or a payload-only INCLUDE.
+9. **Expression and INCLUDE indexes matter to HOT.** A change to a referenced base or included column can prevent HOT, even when it is not a key column. See <https://www.postgresql.org/docs/16/storage-hot.html>.
 
-10. **A partial index counts as an index on its columns *and* on the columns in its WHERE clause.** `CREATE INDEX ... ON tbl (a) WHERE b > 0` means an UPDATE that touches either `a` or `b` breaks HOT — including UPDATEs that don't affect whether the row satisfies the partial-index predicate.
+10. **Partial-index predicate columns matter to HOT.** A changed value in a predicate column can prevent HOT even when the row's predicate result remains the same. See <https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/access/heap/heapam.c>.
 
 11. **HOT failure cascades.** Once a chain has been broken by an indexed-column change, subsequent HOT-eligible updates on the same row build chains off the new (non-HOT) successor, not off the original root. Long-term, the page may end up with multiple non-overlapping HOT chains.
 
@@ -716,7 +709,7 @@ Expect HOT pct to jump significantly if the dropped index was the HOT-killer. If
 
 14. **Bottom-up index deletion is not VACUUM.** It mitigates index bloat at write time but does not free index pages back to the FSM the way `VACUUM` does. A table with HOT consistently failing will still benefit from periodic `REINDEX CONCURRENTLY` even with bottom-up deletion working.
 
-15. **Reading `n_tup_hot_upd` without a time bound is misleading.** Cumulative stats reset only when the cluster is restarted, autovacuum touches the table, or `pg_stat_reset_*` is called. A table that had bad HOT pct under an old index might show good HOT pct on the current schema if you don't reset stats after the index change. Recipe 10's stats reset is the right ritual.
+15. **Reading `n_tup_hot_upd` without a time bound is misleading.** Use differences between snapshots of cumulative counters, accounting for `stats_reset`, rather than assuming autovacuum resets them. See <https://www.postgresql.org/docs/16/monitoring-stats.html>.
 
 16. **HOT ratio depends on workload mix; the *current* ratio is more diagnostic than the *all-time* ratio.** Reset stats periodically (weekly via pg_cron) to keep recent measurements meaningful. See [`98-pg-cron.md`](./98-pg-cron.md).
 
@@ -730,7 +723,7 @@ Expect HOT pct to jump significantly if the dropped index was the HOT-killer. If
 
 21. **`SELECT ... FOR UPDATE` does not itself break HOT** — it only takes a row lock and writes the tuple's `xmax`, which is part of the standard tuple header and not an indexed column. The followup UPDATE is HOT-eligible per the usual rules.
 
-22. **A trigger on `BEFORE UPDATE` that re-assigns an indexed column re-arms the HOT-failure check.** If your trigger does `NEW.status := NEW.status` defensively, it counts as setting `status`. Drop unnecessary defensive assignments.
+22. **A BEFORE UPDATE trigger can change HOT eligibility.** The values it actually changes, including indexed columns, matter; a no-op assignment alone does not necessarily break HOT. See <https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/access/heap/heapam.c>.
 
 
 ## See Also

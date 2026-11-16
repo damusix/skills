@@ -3,7 +3,7 @@
 Row-level change replication via WAL decoding. Publisher emits changes per table; subscriber applies. DDL not replicated. Schema sync = manual.
 
 > [!WARNING]
-> **Logical replication ships row changes, not DDL.** Schema changes on publisher do NOT propagate. Adding a column on the publisher without first adding it on the subscriber breaks the apply worker. Use `--no-schema-only` `pg_dump` or hand-managed migrations to sync DDL ahead of the publisher writes.
+> **Logical replication ships row changes, not DDL.** Coordinate schema changes on publisher and subscriber; use `pg_dump --schema-only` or managed migrations to prepare the target schema.
 
 ## Table of Contents
 
@@ -43,7 +43,7 @@ Five rules:
    > [!NOTE] PostgreSQL 19
    > PostgreSQL 19 replicates sequences: `CREATE PUBLICATION` / `ALTER PUBLICATION ... ALL SEQUENCES` publishes them and `ALTER SUBSCRIPTION ... REFRESH SEQUENCES` refreshes them. Sequence synchronization also happens on `ALTER SUBSCRIPTION ... [ADD|SET|REFRESH|DROP] PUBLICATION`. The "sequence data is not replicated" quote above is the PG16 documentation.[^pg19-lr-seq]
 
-3. **Conflicts BLOCK the apply worker. No automatic resolution.** Subscriber-side row missing where publisher expects it = log message + retry forever. Subscriber-side row violates a constraint = apply worker stops. Fix manually (advance LSN via `ALTER SUBSCRIPTION ... SKIP`, edit subscriber row, or replay carefully). PG18 logs the conflicting tuple values into `pg_stat_subscription_stats`.
+3. **Conflicts can block apply.** Constraint violations stop apply and retry by default; an UPDATE or DELETE whose target row is missing is skipped. Investigate divergence and reconcile it explicitly. [PG16 conflicts](https://www.postgresql.org/docs/16/logical-replication-conflicts.html)
 
 4. **REPLICA IDENTITY decides what identifies a row over the wire.** Default = PK. No PK = need explicit `REPLICA IDENTITY USING INDEX <unique_not_null_index>` or `REPLICA IDENTITY FULL` (slow — sends every column to find matches). `REPLICA IDENTITY NOTHING` blocks `UPDATE` and `DELETE` replication.
 
@@ -309,7 +309,7 @@ Subscriber (`postgresql.conf`):
 ```ini
 max_replication_slots = 5               # for receiving (origin tracking)
 max_logical_replication_workers = 8     # apply + tablesync + parallel-apply
-max_worker_processes = 16               # must accommodate above + autovacuum
+max_worker_processes = 16               # must accommodate logical, parallel and extension workers
 max_sync_workers_per_subscription = 4   # parallelism for initial COPY
 max_parallel_apply_workers_per_subscription = 4   # PG16+
 ```
@@ -324,7 +324,7 @@ Each worker counts against `max_worker_processes`. Budget:
 ```
 max_worker_processes >=
     max_logical_replication_workers
-    + autovacuum_max_workers
+    + extension background workers
     + max_parallel_workers
     + 1   (logical replication launcher)
 ```
@@ -483,26 +483,13 @@ CREATE SUBSCRIPTION sub_from_a
 
 ### Recipe 5 — Zero-downtime major-version upgrade via logical replication
 
-1. Spin up new-major-version cluster (e.g., PG18) with identical schema.
-2. Copy globals: `pg_dumpall --globals-only | psql -h new-host`.
-3. Copy schema: `pg_dump --schema-only app | psql -h new-host`.
-4. On old cluster: `CREATE PUBLICATION pub_all FOR ALL TABLES;`
-5. On new cluster: `CREATE SUBSCRIPTION sub_all CONNECTION '...' PUBLICATION pub_all;` — initial COPY runs.
-6. Wait for `pg_stat_subscription.received_lsn` to catch up to `pg_current_wal_lsn()` on old cluster.
-7. Stop application. Final drain. Sync sequences manually:
-   ```sql
-   -- on old:
-   SELECT 'SELECT setval(''' || sequence_name || ''', ' || last_value || ');'
-     FROM information_schema.sequences;
-   -- pipe output, execute on new
-   ```
+1. Create the new-major cluster, copy globals and schema, and create a publication and subscription with initial data copy. Logical replication does not copy DDL, large objects, or sequence state.
+2. Wait for all tables to reach the ready state and inspect apply errors. A received LSN alone does not prove changes were applied.
+3. Stop and fence all writes and sequence consumers on the publisher; drain transactions. Insert and commit a barrier row in a replicated table, and wait until that row is visible on the subscriber. Verify table sync and apply health again.
+4. With sequence consumers still stopped, transfer every sequence's actual state, including schema, `last_value`, and `is_called`, and validate the target. Sequence caches and application-side allocations require an application-specific cutover plan.
+5. Repoint applications only after data and sequence validation. Keep the old publisher fenced until the cutover is accepted; drop the subscription and its slot only after they are no longer needed.
 
-   > [!NOTE] PostgreSQL 19
-   > The manual `setval()` sync above is needed when the source is PG18 or earlier. A PG19 publication with `ALL SEQUENCES` replicates sequences, and `ALTER SUBSCRIPTION ... REFRESH SEQUENCES` refreshes them.[^pg19-lr-seq]
-8. Repoint application to new cluster.
-9. `DROP SUBSCRIPTION sub_all;` on new cluster. Decommission old.
-
-PG17+ can use `pg_createsubscriber` to skip steps 4-6 by converting a physical standby in place.
+PG17+ `pg_createsubscriber` can prepare a same-major logical replica without an initial data copy; it does not support converting a different-major physical standby. For an upgrade built on it, follow [`87-major-version-upgrade.md` Strategy D](./87-major-version-upgrade.md#strategy-d--pg_createsubscriber-pg17). [PG16 logical replication restrictions](https://www.postgresql.org/docs/16/logical-replication-restrictions.html); [PG17 pg_createsubscriber](https://www.postgresql.org/docs/17/app-pgcreatesubscriber.html).
 
 ### Recipe 6 — pg_createsubscriber (PG17+)
 
@@ -515,13 +502,13 @@ pg_ctl -D /var/lib/postgresql/18/main stop
 # Convert
 pg_createsubscriber \
     --pgdata=/var/lib/postgresql/18/main \
-    --publisher-server='host=primary dbname=app user=repl_user password=...' \
+    --publisher-server='host=primary dbname=app user=postgres' \
     --database=app \
     --subscription=sub_app \
     --publication=pub_app
 ```
 
-Tool drops the physical replication slot, promotes the standby, creates the publication on the (now-former) primary, and subscription on the (now-)subscriber. Standby's existing data becomes the starting point — no initial COPY needed.
+The utility creates publications and logical slots, promotes the standby and creates subscriptions without initial COPY. It drops the physical slot if `primary_slot_name` was configured, then stops the converted target; start it explicitly. Source, target, and utility must have the same major version.
 
 ### Recipe 7 — Failover slot (PG17+)
 
@@ -543,7 +530,7 @@ CREATE SUBSCRIPTION sub_failover
     WITH (failover = true);
 ```
 
-Verbatim PG17 release-note: *"Enable the failover of logical slots (Hou Zhijie, Shveta Malik, Ajin Cherian)."*[^pg17-failover] After promotion of the physical standby, the logical slot is already on the new primary; subscriber reconnects and resumes apply without manual slot recreation. Cross-reference [`75-replication-slots.md`](./75-replication-slots.md).
+Before failover, verify the target standby's slot is synchronized and usable; configure the required physical slot, feedback, and synchronization settings. Fence the old primary and account for possible replay and asynchronous data loss. Cross-reference [`75-replication-slots.md`](./75-replication-slots.md) and [PG17 slot synchronization](https://www.postgresql.org/docs/17/logicaldecoding-explanation.html#LOGICALDECODING-REPLICATION-SLOTS-SYNCHRONIZATION).
 
 ### Recipe 8 — Handle a stuck apply worker (conflict)
 
@@ -645,7 +632,7 @@ SELECT slot_name, active, wal_status, safe_wal_size,
  WHERE slot_type = 'logical';
 ```
 
-If `received_lsn` is current but `latest_end_lsn` is behind: apply worker is the bottleneck. Try `streaming = parallel` and raise `max_parallel_apply_workers_per_subscription`. If both are behind: network or publisher CPU bound.
+`received_lsn` is the last WAL location received, and `latest_end_lsn` is the last WAL location reported to the origin WAL sender; their difference is not an apply backlog measurement. Investigate publisher-side slot retention, subscriber worker state, and transaction visibility together. See [PG16 subscription statistics](https://www.postgresql.org/docs/16/monitoring-stats.html#MONITORING-PG-STAT-SUBSCRIPTION).
 
 ### Recipe 13 — Drop subscription when publisher unreachable
 
@@ -655,12 +642,13 @@ ALTER SUBSCRIPTION sub_orders DISABLE;
 ALTER SUBSCRIPTION sub_orders SET (slot_name = NONE);
 DROP SUBSCRIPTION sub_orders;
 
--- THEN if publisher comes back, drop the orphaned slot manually:
--- on publisher:
+-- On the publisher after it returns, identify the orphaned main and
+-- unfinished table synchronization slots and confirm they belong to this subscription.
+-- Drop each confirmed orphan; the main slot name below is an example:
 SELECT pg_drop_replication_slot('sub_orders');
 ```
 
-Verbatim docs warn: leaving the slot intact retains WAL on the publisher and "might eventually cause the disk to fill up."[^dropsub]
+The publisher may also retain table synchronization slots if synchronization was unfinished. Identify and drop only the slots belonging to this removed subscription. Otherwise they retain WAL and can fill the disk.[^dropsub]
 
 ### Recipe 14 — Generated column replication (PG18+)
 
@@ -692,7 +680,7 @@ Pre-PG18 the subscriber had to recompute generated column values locally (and AL
 
 4. **REPLICA IDENTITY NOTHING blocks UPDATE/DELETE replication.** Silent on INSERT, errors on UPDATE/DELETE: `ERROR: cannot update table "x" because it does not have a replica identity and publishes updates`. Fix: `ALTER TABLE x REPLICA IDENTITY DEFAULT;` (if PK exists) or USING INDEX or FULL.
 
-5. **Row filter columns must be covered by REPLICA IDENTITY for UPDATE/DELETE.** Row filter `WHERE (status = 'active')` on an UPDATE-publishing publication where REPLICA IDENTITY is the PK and `status` is not in the PK → silent acceptance, but UPDATEs that touch `status` are not properly filtered. Always test the matrix.
+5. **Row filter columns must be covered by REPLICA IDENTITY for UPDATE/DELETE.** An UPDATE or DELETE on a table with an invalid filter fails on the publisher; configure an appropriate identity or publish only supported operations.[^lr-rowfilter]
 
 6. **DROP SUBSCRIPTION in transaction block errors if slot attached.** Use `DISABLE` + `SET (slot_name = NONE)` + `DROP` outside any explicit BEGIN/COMMIT.
 
@@ -706,7 +694,7 @@ Pre-PG18 the subscriber had to recompute generated column values locally (and AL
 
 11. **`max_replication_slots` and `max_wal_senders` on the publisher both need raising.** Each subscriber consumes one slot AND one walsender. Slots persist across restarts; walsenders do not.
 
-12. **`max_logical_replication_workers` does NOT include tablesync workers in PG14.** PG15+: tablesync workers count against the limit. Subscriber's `max_worker_processes` must accommodate everyone.
+12. **`max_logical_replication_workers` includes table synchronization workers.** Budget apply and synchronization workers along with parallel and extension workers in `max_worker_processes`. [PG14 subscription configuration](https://www.postgresql.org/docs/14/logical-replication-config.html)
 
 13. **`streaming = parallel` (PG16+) + functions with side effects = wrong results.** Parallel apply workers may apply changes out of strict commit order across transactions but within a transaction they apply in order. Volatile functions in BEFORE triggers can see different orderings than they would on the publisher.
 
@@ -716,7 +704,7 @@ Pre-PG18 the subscriber had to recompute generated column values locally (and AL
 
 16. **`publish_via_partition_root` (off by default) sends per-partition writes.** Subscriber needs identical partition hierarchy. Turn on if subscriber has a different (or no) partition layout.
 
-17. **Origin filtering (PG16+) only filters at the apply level; the slot still receives all changes.** Network traffic for bidirectional setups is not reduced — the subscriber just ignores echoes.
+17. **Origin filtering happens on the publisher.** `origin = none` requests only changes with no replication origin. Initial synchronization has separate caveats; consult [PG16 subscription options](https://www.postgresql.org/docs/16/sql-createsubscription.html).
 
 18. **`run_as_owner` default flip (PG16+) breaks pre-existing subscriptions on upgrade.** Pre-PG16 apply ran as subscription owner. PG16+ runs as table owner per-DML. Subscription owners that previously could write to all tables may now lack permission. Set `run_as_owner = true` to restore old behavior — or grant table-level permissions properly.
 

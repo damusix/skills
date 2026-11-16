@@ -64,15 +64,15 @@ Five rules.
 | Multi-cloud (S3 + Azure + GCS) target | WAL-G or pgBackRest | Barman | Both have first-class multi-cloud; Barman is rsync-first |
 | Encryption with KMS | WAL-G (libsodium / SSE-KMS) or pgBackRest (AES-256) | Barman (limited) | WAL-G has best KMS story |
 | Want to use `pg_basebackup --incremental` (PG17+) | `pg_basebackup` + `pg_combinebackup` directly (cross-reference 84) | Any backup tool | Tools have their own incremental mechanisms predating PG17 |
-| Need parallel restore | pgBackRest | Barman, WAL-G | pgBackRest restore-side parallelism is mature |
+| Need parallel restore | pgBackRest, Barman, or WAL-G | (none) | Compare tool-specific restore concurrency |
 | Need backup-from-standby | All three | (none) | All support; configure per docs |
-| Need scheduled backup with retention | All three with cron | (none) | Schedule via `pg_cron` (cross-reference 98), systemd timer, or external scheduler |
+| Need scheduled backup with retention | All three with OS or external scheduler | pg_cron shell commands | pg_cron executes SQL, not shell commands |
 | Need to roll your own | `pg_basebackup` + `archive_command` | All three | Only do this if you have a strong reason — see Recipe 12 |
 
 Three smell signals:
 
-- **Building your own backup script around `pg_dump | gzip > backup.sql.gz` for a production database** — that's a logical export, not a backup. Cross-reference [`83-backup-pg-dump.md`](./83-backup-pg-dump.md) gotcha #25 (pg_dump does NOT dump WAL/bytes).
-- **`archive_command` does not retry on failure** — server logs `archive command failed` but no alert fires. Means no alerting on `pg_stat_archiver.failed_count` (cross-reference [`82-monitoring.md`](./82-monitoring.md) Recipe 4).
+- **Relying only on logical dumps when PITR is required** — `pg_dump` is a logical backup, but cannot replay WAL to a recovery target.
+- **Archive failures without alerts** — PostgreSQL retries a failing `archive_command`; monitor `pg_stat_archiver` for sustained failures. See <https://www.postgresql.org/docs/16/continuous-archiving.html>.
 - **Backups stored on the same host as primary** — cluster fails, backups gone. Off-host (preferably off-region) destination mandatory.
 
 ## Tool Comparison
@@ -121,9 +121,9 @@ Single config file: `/etc/pgbackrest/pgbackrest.conf` (and optional `/etc/pgback
 
 [global]
 repo1-path=/var/lib/pgbackrest
-repo1-retention-full=2
+repo1-retention-full-type=time
+repo1-retention-full=14
 repo1-retention-diff=7
-repo1-retention-archive=14
 repo1-cipher-type=aes-256-cbc
 repo1-cipher-pass=<long-passphrase-from-vault>
 
@@ -135,8 +135,8 @@ repo2-s3-region=us-east-1
 repo2-s3-endpoint=s3.amazonaws.com
 repo2-s3-key=<access-key>
 repo2-s3-key-secret=<secret-key>
-repo2-retention-full=8
-repo2-retention-archive=30
+repo2-retention-full-type=time
+repo2-retention-full=30
 
 process-max=8
 compress-type=zstd
@@ -197,7 +197,7 @@ pgBackRest performs **block-level** incremental backup since version 2.46 (beta 
 
 ### Multi-repository (redundancy)
 
-Configure `repo1-*` and `repo2-*`. Each backup goes to all configured repos. Retention applies per-repo. Object storage repos can have different retention than local.
+Configure `repo1-*` and `repo2-*`, then schedule a separate backup for each repository using `--repo=1` and `--repo=2`. Without `--repo`, a backup goes only to the highest-priority repository, not both. Retention applies per repository. See <https://pgbackrest.org/user-guide.html#multi-repo>.
 
 ### Restore-side parallelism
 
@@ -448,7 +448,7 @@ None of the three tools have built-in scheduling. Pick one:
 
 - **cron**: `0 2 * * 0 /usr/bin/pgbackrest --stanza=main --type=full backup` (Sunday 2am full; daily diff/incr in separate entries).
 - **systemd timer**: `pgbackrest-full.service` + `pgbackrest-full.timer`.
-- **pg_cron** (cross-reference [`98-pg-cron.md`](./98-pg-cron.md)): in-database cron via SQL. Works if backup-tool command is wrapped in a SECURITY DEFINER function that can call `pg_catalog.pg_terminate_backend(0)` (a hack) or via `LOAD 'cron'` calling external script. Less common in production.
+- **pg_cron** executes SQL, not shell commands. Use an external scheduler for backup executables unless you have separately designed and secured a server-side execution mechanism.
 - **K8s CronJob**: `apiVersion: batch/v1, kind: CronJob`. Standard pattern in CNPG / Zalando operator deployments.
 
 ### Verification
@@ -492,7 +492,7 @@ All three support backup from a standby. Reduces I/O load on primary.
 - Barman: native via `backup_options = concurrent_backup`.
 - WAL-G: connect to standby; ensure replication is current.
 
-Caveat: a stale standby means a stale backup. Verify `pg_stat_replication.replay_lag` near zero before initiating standby backup.
+Monitor replication and ensure all WAL required for the backup is retained. `replay_lag` is a recent delay measurement and can be NULL when idle; it is not a guarantee of recoverability. Verify the backup and perform restore drills.
 
 ### Encryption key management
 
@@ -536,9 +536,9 @@ Single primary, local + S3 dual-repo, daily incremental + weekly full, 14-day re
 # /etc/pgbackrest/pgbackrest.conf
 [global]
 repo1-path=/var/lib/pgbackrest
-repo1-retention-full=2
+repo1-retention-full-type=time
+repo1-retention-full=14
 repo1-retention-diff=7
-repo1-retention-archive=14
 repo1-cipher-type=aes-256-cbc
 repo1-cipher-pass=<from-vault>
 
@@ -549,8 +549,8 @@ repo2-s3-region=us-east-1
 repo2-s3-endpoint=s3.amazonaws.com
 repo2-s3-key=<from-vault>
 repo2-s3-key-secret=<from-vault>
-repo2-retention-full=8
-repo2-retention-archive=30
+repo2-retention-full-type=time
+repo2-retention-full=30
 repo2-cipher-type=aes-256-cbc
 repo2-cipher-pass=<from-vault>
 
@@ -581,18 +581,24 @@ Init + first backup:
 
 ```bash
 sudo -u postgres pgbackrest --stanza=main stanza-create
-sudo -u postgres pgbackrest --stanza=main --type=full backup
+sudo -u postgres pgbackrest --stanza=main --repo=1 --type=full backup
+sudo -u postgres pgbackrest --stanza=main --repo=2 --type=full backup
 sudo -u postgres pgbackrest --stanza=main info
 ```
 
 Cron (Sunday 2am full, daily 2am incremental):
 
 ```cron
-0 2 * * 0 postgres /usr/bin/pgbackrest --stanza=main --type=full backup
-0 2 * * 1-6 postgres /usr/bin/pgbackrest --stanza=main --type=incr backup
+0 2 * * 0 postgres /usr/bin/pgbackrest --stanza=main --repo=1 --type=full backup
+30 2 * * 0 postgres /usr/bin/pgbackrest --stanza=main --repo=2 --type=full backup
+0 2 * * 1-6 postgres /usr/bin/pgbackrest --stanza=main --repo=1 --type=incr backup
+30 2 * * 1-6 postgres /usr/bin/pgbackrest --stanza=main --repo=2 --type=incr backup
 0 4 * * * postgres /usr/bin/pgbackrest --stanza=main check
-0 5 * * 0 postgres /usr/bin/pgbackrest --stanza=main verify
+0 5 * * 0 postgres /usr/bin/pgbackrest --stanza=main --repo=1 verify
+30 5 * * 0 postgres /usr/bin/pgbackrest --stanza=main --repo=2 verify
 ```
+
+Separate entries keep a repo1 failure from skipping the repo2 backup. `verify` checks one repository, the default repo1 unless `--repo` is given, so each repository gets its own entry. The 30-minute offset spreads backup load on the primary; alert on each entry's exit status.
 
 ### Recipe 2 — Barman centralized backup for 10 clusters
 
@@ -652,8 +658,7 @@ spec:
   postgresql:
     parameters:
       max_wal_senders: "10"
-      archive_mode: "on"
-      archive_command: "wal-g wal-push %p"
+      # The operator manages WAL archiving for its configured backup method.
   bootstrap:
     initdb:
       database: app
@@ -676,78 +681,58 @@ spec:
     retentionPolicy: "30d"
 ```
 
-(Note: CNPG natively uses *barman-cloud*, not WAL-G binary, despite the YAML being similar. For WAL-G specifically, deploy as a sidecar container with shared volume mount of `PGDATA` and configure `archive_command` to invoke the sidecar's `wal-g`.)
+(Note: CNPG uses barman-cloud for this deprecated in-tree form. Follow the operator's plugin documentation for supported configurations; do not override its archive command with WAL-G.)
 
 ### Recipe 4 — Restore to specific point in time (pgBackRest)
 
-```bash
-# Stop PG
-sudo systemctl stop postgresql@16-main
+Use a fresh, isolated restore host with its own pgBackRest stanza configuration, data directory, tablespace mappings, port, and service. Preserve the existing cluster, external tablespaces, and unarchived WAL.
 
-# Wipe data dir
-sudo -u postgres rm -rf /var/lib/postgresql/16/main/*
+```bash
+# Run only on the isolated restore host.
+sudo systemctl stop postgresql@16-drill
 
 # Restore with PITR target
 sudo -u postgres pgbackrest --stanza=main \
     --type=time \
     --target='2026-05-13 12:00:00 UTC' \
     --target-action=pause \
+    --archive-mode=off \
     restore
 
 # Start PG (it will be in recovery, paused at target)
-sudo systemctl start postgresql@16-main
+sudo systemctl start postgresql@16-drill
 
 # Verify state of data
-sudo -u postgres psql -c "SELECT pg_is_in_recovery();"
-sudo -u postgres psql -c "SELECT count(*) FROM orders WHERE created_at > '2026-05-13';"
+sudo -u postgres psql -p 55432 -c "SELECT pg_is_in_recovery();"
+sudo -u postgres psql -p 55432 -c "SELECT count(*) FROM orders WHERE created_at > '2026-05-13';"
 
-# If data correct, promote
-sudo -u postgres psql -c "SELECT pg_wal_replay_resume();"
-sudo -u postgres psql -c "SELECT pg_promote();"
+# If data correct, resume: at a paused recovery target this ends recovery
+sudo -u postgres psql -p 55432 -c "SELECT pg_wal_replay_resume();"
 ```
+
+`--archive-mode=off` writes `archive_mode = off` into the restored cluster, so its new timeline's WAL and `.history` files never reach the production stanza. The default, `preserve`, keeps the production `archive_command`. Calling `pg_promote()` after the resume fails, because recovery has already ended.
 
 Same pattern works for Barman (`barman recover --target-time`) and WAL-G (`wal-g backup-fetch` + `restore_command`).
 
 ### Recipe 5 — Verify backup is restorable (weekly disposable-host pattern)
 
 ```bash
-#!/bin/bash
-# /usr/local/bin/pg-restore-drill.sh
-set -euo pipefail
+# On a disposable host, configure the backup's stanza and an empty PGDATA.
+# Map every tablespace to a disposable location and isolate production.
+sudo -u postgres pgbackrest --stanza=main --type=immediate \
+    --target-action=promote --archive-mode=off restore
+sudo systemctl start postgresql@16-drill
 
-DRILL_HOST=pg-restore-drill.internal
-STANZA=main
-
-# 1. Wipe disposable host
-ssh root@${DRILL_HOST} 'systemctl stop postgresql@16-main && rm -rf /var/lib/postgresql/16/main/*'
-
-# 2. Restore from latest
-ssh postgres@${DRILL_HOST} "pgbackrest --stanza=${STANZA} --type=immediate restore"
-
-# 3. Start PG
-ssh root@${DRILL_HOST} 'systemctl start postgresql@16-main'
-
-# 4. Wait for recovery to finish
-sleep 30
-
-# 5. Verify
-RESULT=$(ssh postgres@${DRILL_HOST} 'psql -tAc "SELECT 'OK' WHERE NOT pg_is_in_recovery();"')
-if [ "$RESULT" != "OK" ]; then
-    echo "RESTORE FAILED — alert oncall"
-    exit 1
-fi
-
-# 6. Smoke test
-ssh postgres@${DRILL_HOST} 'psql -c "SELECT count(*) FROM critical_table;"'
-
-echo "Restore drill OK"
+# Wait for recovery to complete, then query the drill instance explicitly.
+sudo -u postgres psql -p 55432 -c "SELECT pg_is_in_recovery();"
+sudo -u postgres psql -p 55432 -c "SELECT count(*) FROM critical_table;"
 ```
 
 Run weekly via cron. Alert on failure. Cross-reference [`90-disaster-recovery.md`](./90-disaster-recovery.md) for full DR drill procedure.
 
 ### Recipe 6 — Speed up pgBackRest WAL archiving with async archive-push
 
-pgBackRest archives through `archive_command`; its user guide documents no `archive_library` module. When WAL is generated faster than one `archive-push` per segment can ship it, enable asynchronous archiving: `archive-push` returns as soon as the segment is queued in a local spool directory, and a background process pushes segments in parallel.
+pgBackRest archives through `archive_command`. Asynchronous archiving looks ahead and transfers ready WAL in parallel, but normally acknowledges a segment only after it is safely stored in the archive. Review queue-limit settings and their data-loss implications. See <https://pgbackrest.org/user-guide.html#async-archiving>.
 
 ```ini
 # /etc/pgbackrest/pgbackrest.conf
@@ -824,25 +809,9 @@ Cross-reference [`82-monitoring.md`](./82-monitoring.md) Recipe 4 for full Prome
 
 For pgBackRest:
 
-```bash
-# Old key in repo1-cipher-pass; need to re-encrypt with new key
-# Cannot rotate in place — generate new repo with new key, copy data, swap
+Create a separate repository with the new key and configure backups and WAL archiving to it. Take and test a new full backup. Keep the old repository and its key until its recovery window expires; test restore using each key before removing either. See <https://pgbackrest.org/user-guide.html>.
 
-# 1. Create repo2 with new key
-# 2. pgbackrest --stanza=main info  → confirm both repos active
-# 3. Wait one full retention cycle for new repo to have all backups
-# 4. Remove old repo, rename new repo
-```
-
-WAL-G + libsodium:
-
-```bash
-# Generate new key
-WALG_LIBSODIUM_KEY_NEW=$(openssl rand -base64 32)
-
-# Re-encrypt requires fresh backup with new key; old backups are still readable
-# with old key (keep both keys until old backups expire from retention)
-```
+WAL-G + libsodium: configure the new key for new backups and keep the old key with the backups that need it. Test restoration with both keys, and retain the old key until every backup requiring it has expired.
 
 Barman: encryption is typically filesystem-level (LUKS, ZFS) or via pre-stage encrypt; rotation = standard filesystem-rotate procedure.
 
@@ -859,7 +828,7 @@ grep retention /etc/pgbackrest/pgbackrest.conf
 # If repo grows unbounded:
 # 1. Confirm retention policy is set per repo (repo1-retention-full, repo2-retention-full)
 # 2. Confirm there is enough archive-retention to clean WAL
-# 3. Manual cleanup: pgbackrest --stanza=main --type=full expire (forces retention apply)
+# 3. After reviewing retention, run: pgbackrest --stanza=main expire
 ```
 
 ### Recipe 12 — Why NOT to roll your own (and when you might)
@@ -881,36 +850,23 @@ Common hand-roll failure modes:
 - No encryption → compliance violation.
 - No test-restore → first time you try to restore, you find out it doesn't work.
 
-### Recipe 13 — Pair backup tool with pg_cron for scheduled verification
+### Recipe 13 — Schedule verification
 
-Schedule weekly `verify` from inside PG via [`98-pg-cron.md`](./98-pg-cron.md):
-
-```sql
--- Wrap external command in a SECURITY DEFINER function (or use cron.schedule + shell command)
-SELECT cron.schedule(
-    'pgbackrest-weekly-verify',
-    '0 4 * * 0',  -- Sunday 4am
-    $$SELECT pg_catalog.notify('pgbackrest_verify', 'now');$$
-);
-```
-
-Then have an external listener (systemd unit listening on the NOTIFY channel) trigger `pgbackrest verify`. Cross-reference [`45-listen-notify.md`](./45-listen-notify.md) for the notify-broadcast pattern.
-
-(In practice most teams use systemd timer or K8s CronJob, not pg_cron, for tool invocation — pg_cron is awkward for shell-out work. Listed here for completeness.)
+Schedule `pgbackrest --stanza=main verify` with a systemd timer, system cron, or a Kubernetes CronJob under an appropriately privileged operating-system account. Alert on a nonzero exit status and periodically perform a full isolated test restore.
 
 ## Gotchas / Anti-patterns
 
-1. **`archive_command` failure does not retry automatically.** If `pgbackrest archive-push` fails (S3 down, disk full, network blip), PG retries forever but does NOT alert. Monitor `pg_stat_archiver.failed_count`. Cross-reference [`82-monitoring.md`](./82-monitoring.md) Recipe 4.
+1. **`archive_command` failures retry but do not alert.** PostgreSQL retries failed archive attempts; monitor `pg_stat_archiver` and alert on sustained failures. See <https://www.postgresql.org/docs/16/continuous-archiving.html>.
 2. **PG16+: `archive_library` and `archive_command` mutually exclusive.** Server refuses to start with both set. If migrating from one to the other, `ALTER SYSTEM SET archive_command = ''` first.
 3. **`archive_command = 'cp %p /archive/%f'` is unsafe.** No fsync, no retry, no verification. Even for non-production, this loses data on power loss. Use a tool.
 4. **Backups stored on the same host as primary = no backup.** Always replicate off-host. Ideally off-region.
 5. **No test-restore = no backup.** Verify integrity weekly; do a full test-restore monthly.
 6. **Encryption key in same bucket as encrypted data = no encryption.** Store keys in Vault/KMS, not next to backups.
-7. **Retention policy interaction with PITR window.** If retention drops WAL older than the oldest full backup, you cannot PITR back to the start of the oldest full. Always set `repo*-retention-archive` to at least the retention window of the oldest backup you intend to PITR from.
+7. **Retention policy interaction with PITR window.** `repo*-retention-archive` counts backups, not days; setting it independently can expire WAL needed by retained backups. With time-based full retention, leave archive retention unset to follow the oldest retained full backup, and test the actual recovery window. See <https://pgbackrest.org/configuration.html#section-repository/option-repo-retention-archive>.
 8. **WAL summarization (PG17+) is opt-in.** `summarize_wal = on` must be set BEFORE you want incremental backups via `pg_basebackup --incremental`. None of pgBackRest/Barman/WAL-G use this feature as of 2026 — they have their own mechanisms.
 9. **Cross-version restore is impossible.** Physical backups cannot be restored to a different PG major. For that, use `pg_dump` ([`83-backup-pg-dump.md`](./83-backup-pg-dump.md)) or logical replication ([`74-logical-replication.md`](./74-logical-replication.md)) for the upgrade path.
 10. **Cross-architecture restore is impossible.** x86_64 backup will not restore on aarch64. For that, use `pg_dump`.
-11. **Backup from standby with `replay_lag > 0` produces a stale-data backup.** Check `pg_stat_replication.replay_lag` is zero before initiating standby backup, or accept that the backup reflects the replay-lag-old state.
+11. **Standby backups depend on retained WAL and standby replay.** A standby can lag or be promoted during a backup; monitor replication and backup failures, and test recovery to the required target. See <https://www.postgresql.org/docs/16/app-pgbasebackup.html>.
 12. **pgBackRest stanza name should be stable for the life of the cluster.** Renaming a stanza requires re-initialization. Pick a name like `main` or `prod-cluster-name` and stick with it.
 13. **Barman ssh keys must be passwordless and rotated.** Document the rotation. Barman cannot prompt for a password mid-cron.
 14. **WAL-G env vars are not encrypted at rest in `/etc/wal-g/wal-g.env`.** Use systemd `EnvironmentFile=` with file mode 0600, or fetch from Vault on service start.
